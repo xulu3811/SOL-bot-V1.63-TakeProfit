@@ -1,0 +1,29 @@
+[Unit]
+Description=SOL-bot P4 independent Guardian (LIVE disabled)
+After=local-fs.target
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/sol-bot/p4
+Environment=PYTHONPATH=/opt/sol-bot/p4/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.p4_runtime --database /var/lib/sol-bot/database/sui-guardian-p4.sqlite --status-path /var/lib/sol-bot/guardian-status.json --live-control /var/lib/sol-bot/database/sui-live-control.sqlite
+Restart=on-failure
+RestartSec=15
+MemoryHigh=64M
+MemoryMax=128M
+CPUQuota=10%
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/sol-bot
+InaccessiblePaths=-/var/lib/sol-bot/secrets -/opt/sol-bot/secrets
+[Install]
+WantedBy=multi-user.target

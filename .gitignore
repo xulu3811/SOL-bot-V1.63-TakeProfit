@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Android / Gradle
+android/.gradle/
+android/**/build/
+android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.jks
+*.keystore
+
+# Secrets and machine-local credentials
+FCM-Serv/*.txt
+FCM-Serv/*.json
+**/*adminsdk*.json
+.env
+.env.*
+credentials.json
+
+# Local market data and delivery dumps (kept on disk, not in git)
+data/*.sqlite
+data/*.sqlite-*
+data/*.pkl
+data/*.tar.gz
+data/*.json
+data/*.jsonl
+data/*.txt
+data/p*-server/
+
+# OS / IDE
+desktop.ini
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+*.iml

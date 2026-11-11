@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "44197934417",
+    "project_id": "crypto-bot-860db",
+    "storage_bucket": "crypto-bot-860db.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:44197934417:android:9222b93c839e611ca30f70",
+        "android_client_info": {
+          "package_name": "com.lu.cryptobot"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCyXExycN8zNunvAEupFYNWKYfzfe5mueI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

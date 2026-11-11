@@ -1,0 +1,135 @@
+"""Persistent four-stage research protection with irreversible trigger/stop latches."""
+from dataclasses import dataclass,replace,field
+from decimal import Decimal
+from .contracts import DecisionContext,DecisionBase,bind_context
+from .decimal_utils import D,ceil_step,json_safe
+from .protective_stop import initial_stop,profit_floor,stop_limit_price
+from .trend_exhaustion import TrendEvidence,classify
+from .volatility_regime import trailing_distance
+
+
+@dataclass(frozen=True)
+class APTSState:
+    context: DecisionContext
+    entry_price: Decimal
+    quantity: Decimal
+    high_price: Decimal
+    stop_price: Decimal
+    floor_price: Decimal
+    entry_fee_rate: Decimal
+    exit_fee_rate: Decimal
+    slippage_rate: Decimal
+    stage: str='S0_INITIAL_PROTECTION'
+    trigger_latched: bool=False
+    trigger_reason: str=''
+    last_decision_time_ms: int=0
+    scheme: str='APTS'
+
+    @classmethod
+    def create(cls,context,entry_price,quantity,tick_size,entry_fee_rate='0.001',exit_fee_rate='0.001',slippage_rate='0.001',scheme='APTS'):
+        entry,qty=D(entry_price,positive=True),D(quantity,positive=True)
+        fees=[D(x,nonnegative=True) for x in (entry_fee_rate,exit_fee_rate,slippage_rate)]
+        if max(fees)>=Decimal('.1'):raise ValueError('invalid cost assumptions')
+        if scheme not in ('APTS','FIXED_0_5','FIXED_1_0','ATR'):raise ValueError('unknown scheme')
+        stop=initial_stop(entry,tick_size)
+        return cls(context,entry,qty,entry,stop,stop,*fees,last_decision_time_ms=context.decision_time_ms,scheme=scheme)
+
+    def asdict(self):return json_safe(self)
+
+    @classmethod
+    def from_dict(cls,value):
+        data=dict(value)
+        data['context']=DecisionContext(**data['context'])
+        for key in ('entry_price','quantity','high_price','stop_price','floor_price','entry_fee_rate','exit_fee_rate','slippage_rate'):
+            data[key]=D(data[key],nonnegative=True)
+        return cls(**data)
+
+
+@dataclass(frozen=True,kw_only=True)
+class ProtectionDecision(DecisionBase):
+    state: APTSState
+    stop_price: Decimal
+    limit_price: Decimal
+    quantity: Decimal
+    fee_estimate: Decimal
+    risk_estimate: Decimal
+    exit_required: bool
+    protection_status: str
+    market_regime: str
+    trailing_distance: Decimal
+
+
+def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,native_supported=False):
+    bid,tick=D(bid,positive=True),D(tick_size,positive=True)
+    qty=state.quantity if quantity is None else D(quantity,nonnegative=True)
+    identity=('symbol','account_id','strategy_id','signal_id')
+    if any(getattr(state.context,k)!=getattr(context,k) for k in identity):raise ValueError('protection context ownership mismatch')
+    version=context.symbol+'-apts-research-1'
+    context=bind_context(context,{'state':state,'bid':bid,'evidence':evidence,'tick_size':tick,
+                                 'remaining_quantity':qty,'native_supported':native_supported},version)
+    regime=classify(evidence)
+    distance=trailing_distance(regime,evidence.atr,bid,scheme=state.scheme)
+    current=replace(state,quantity=qty)
+    reasons=[]
+    if not native_supported:reasons.append('NATIVE_ORDER_UNSUPPORTED_LOCAL_SIMULATION_ONLY')
+    status='PROTECTION_MATH_ONLY'
+    protection='SIMULATED_LOCAL_STOP' if not native_supported else 'NATIVE_INTENT_NOT_ACKNOWLEDGED'
+    fresh=(context.book_time_ms is not None and 0<=context.decision_time_ms-context.book_time_ms<=3000
+           and context.decision_time_ms<context.valid_until_ms)
+    if qty==0:
+        status,protection='CLOSED','NO_REMAINING_QUANTITY'
+    elif context.decision_time_ms<=state.last_decision_time_ms:
+        status='DUPLICATE_OR_OLD_EVENT'
+    elif not fresh:
+        status='DATA_UNAVAILABLE'
+        reasons.append('KEEP_LAST_PROTECTION_NO_FABRICATED_FILL')
+    elif state.trigger_latched:
+        status='EXIT_LATCHED'
+    elif bid<=state.stop_price:
+        # Test the already-effective stop BEFORE any attempt to widen a band.
+        current=replace(current,trigger_latched=True,trigger_reason='PROTECTIVE_STOP_TOUCHED')
+        status='EXIT_REQUIRED'
+    elif not evidence.ready:
+        status='DATA_UNAVAILABLE'
+        reasons.append('KEEP_LAST_STOP_TREND_INPUTS_UNAVAILABLE')
+    else:
+        high=max(state.high_price,bid)
+        gross=bid/state.entry_price-1
+        stage=state.stage
+        if gross>Decimal('.015') and stage!='S3_TREND_EXHAUSTION':stage='S2_ADAPTIVE_TRAILING'
+        elif gross>=Decimal('.01') and stage=='S0_INITIAL_PROTECTION':stage='S1_PROFIT_PROTECTION'
+        floor=state.floor_price
+        candidate=state.stop_price
+        if stage!='S0_INITIAL_PROTECTION':
+            floor=max(floor,profit_floor(state.entry_price,state.entry_fee_rate,state.exit_fee_rate,state.slippage_rate,tick))
+            if floor>=bid:
+                current=replace(current,trigger_latched=True,trigger_reason='PROFIT_FLOOR_NOT_EXECUTABLE')
+                reasons.append('POSITIVE_NET_PROFIT_NOT_LOCKED')
+                status='EXIT_REQUIRED'
+            else:candidate=max(candidate,floor)
+        if stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION'):
+            candidate=max(candidate,high*(1-distance))
+        if regime in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE'):
+            stage='S3_TREND_EXHAUSTION'
+            current=replace(current,trigger_latched=True,trigger_reason=regime)
+            status='EXIT_REQUIRED'
+        candidate=ceil_step(candidate,tick)
+        if candidate>=bid:
+            current=replace(current,trigger_latched=True,trigger_reason=current.trigger_reason or 'TRAILING_STOP_TOUCHED')
+            status='EXIT_REQUIRED'
+        # A stop that cannot be newly established below the current market is
+        # not advertised as newly effective. Preserve the previous valid stop.
+        effective=max(state.stop_price,candidate) if candidate<bid else state.stop_price
+        current=replace(current,stage=stage,high_price=high,floor_price=floor,stop_price=effective)
+    if context.decision_time_ms>state.last_decision_time_ms and fresh:
+        current=replace(current,last_decision_time_ms=context.decision_time_ms)
+    assert current.stop_price>=state.stop_price
+    limit=stop_limit_price(current.stop_price,tick)
+    if current.trigger_reason in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE','PROFIT_FLOOR_NOT_EXECUTABLE'):
+        limit=stop_limit_price(bid,tick)
+    return ProtectionDecision(context=context,status=status,parameter_version=version,reasons=tuple(reasons),
+        state=current,stop_price=current.stop_price,limit_price=limit,quantity=qty,
+        fee_estimate=qty*bid*current.exit_fee_rate,
+        risk_estimate=max(Decimal(0),(current.entry_price-current.stop_price)*qty),
+        exit_required=bool(current.trigger_latched and qty),protection_status=protection,
+        market_regime=regime,trailing_distance=distance)

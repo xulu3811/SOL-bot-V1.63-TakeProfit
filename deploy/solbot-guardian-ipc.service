@@ -1,0 +1,29 @@
+[Unit]
+Description=SOL-bot authenticated local Guardian IPC
+After=solbot-guardian.service
+[Service]
+User=solbot
+Group=solbot-exec
+SupplementaryGroups=solbot
+WorkingDirectory=/opt/sol-bot/p5
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.risk.p5_ipc --database /var/lib/sol-bot/database/sui-guardian-p4.sqlite --socket /run/solbot-guardian-p5/guardian.sock --client-user solbot-exec
+RuntimeDirectory=solbot-guardian-p5
+RuntimeDirectoryMode=0750
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/sol-bot/database /run/solbot-guardian-p5
+MemoryMax=128M
+CPUQuota=10%
+Restart=on-failure
+RestartSec=15
+UMask=0027
+[Install]
+WantedBy=multi-user.target

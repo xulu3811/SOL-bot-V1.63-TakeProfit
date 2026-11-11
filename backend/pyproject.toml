@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solbot-market"
+version = "0.1.0"
+description = "Read-only SOLUSDT public market data collector and local API"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "uvicorn>=0.34,<1",
+    "websockets>=15,<18",
+]
+
+[project.scripts]
+solbot-market = "solbot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,56 @@
+[Unit]
+Description=SOL-bot public SOLUSDT market data collector and local API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/sol-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sol-bot/backend/src
+Environment=SOLBOT_DB_PATH=/var/lib/sol-bot/database/market.sqlite
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.main
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+UMask=0027
+StateDirectory=sol-bot
+StateDirectoryMode=0750
+LogsDirectory=sol-bot
+LogsDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solbot-market
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
+MemoryHigh=550M
+MemoryMax=850M
+TasksMax=64
+LimitNOFILE=4096
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/sol-bot
+ReadWritePaths=/var/lib/sol-bot /var/log/sol-bot
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

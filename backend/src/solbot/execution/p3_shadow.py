@@ -1,0 +1,316 @@
+"""P3 extension of the P2 virtual ledger, with versioned protection and partial fills.
+
+No exchange client is imported or constructed. Depth participation/slippage are
+research assumptions, not real queue simulation. The account hard lock never
+liquidates positions by itself; protective exits remain independently active.
+"""
+from contextlib import closing
+from dataclasses import replace
+from decimal import Decimal
+import json
+from pathlib import Path
+import sqlite3
+import zlib
+
+from .shadow import ShadowExecutor,ShadowRejected
+from ._storage import verify_existing_store
+from .models import timestamp
+from solbot.mathematics.contracts import make_context,SymbolRules
+from solbot.mathematics.decimal_utils import D,floor_step,ceil_step,canonical_hash,json_safe
+from solbot.mathematics.apts_exit import APTSState,update_protection
+from solbot.mathematics.protective_stop import initial_stop
+
+
+class P3ShadowExecutor(ShadowExecutor):
+    storage_kind='SHADOW_P3'
+    risk_policy='BLOCK_ENTRIES_KEEP_PROTECTION_V1'
+
+    def __init__(self,path,*,rules:SymbolRules,symbol='SOLUSDT',account_id='SOL-shadow',fee_rate='0.001',
+                 participation='0.10',slippage_rate='0.0005'):
+        if symbol!='SOLUSDT' or account_id!='SOL-shadow' or rules.symbol!=symbol:
+            raise ValueError('P3 simulation belongs only to SOL-shadow/SOLUSDT')
+        self.rules=rules
+        self.participation=D(participation,positive=True)
+        self.slippage_rate=D(slippage_rate,nonnegative=True)
+        if self.participation>Decimal('.1') or self.slippage_rate>Decimal('.01'):
+            raise ValueError('simulation assumptions outside conservative bounds')
+        path=Path(path).resolve()
+        kind=None
+        if path.exists():
+            with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)) as db:
+                tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if tables:
+                    if 'execution_owner' not in tables:raise ValueError('foreign database')
+                    kind=db.execute('SELECT kind FROM execution_owner').fetchone()[0]
+        if kind!='SHADOW_P3':
+            # Base schema creation/ownership validation is reused; migration only
+            # adds extension fields and changes the owner to block P2 writers.
+            legacy=ShadowExecutor(path,symbol=symbol,account_id=account_id,fee_rate=fee_rate)
+            with legacy._transaction() as db:
+                for name,definition in (
+                    ('executed_quantity',"TEXT NOT NULL DEFAULT '0'"),
+                    ('executed_notional',"TEXT NOT NULL DEFAULT '0'"),
+                    ('executed_fee',"TEXT NOT NULL DEFAULT '0'"),
+                    ('protection_order',"INTEGER NOT NULL DEFAULT 0")):
+                    db.execute(f'ALTER TABLE shadow_orders ADD COLUMN {name} {definition}')
+                db.execute('CREATE TABLE shadow_protection(position_id TEXT PRIMARY KEY,state_json TEXT NOT NULL,status TEXT NOT NULL,updated_at INTEGER NOT NULL)')
+                db.execute('CREATE TABLE shadow_fills(fill_id TEXT PRIMARY KEY,order_id TEXT NOT NULL,position_id TEXT NOT NULL,event_time INTEGER NOT NULL,side TEXT NOT NULL,quantity TEXT NOT NULL,price TEXT NOT NULL,fee TEXT NOT NULL,input_hash TEXT NOT NULL,assumptions TEXT NOT NULL)')
+                db.execute('CREATE TABLE shadow_math_audit(id INTEGER PRIMARY KEY,input_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,input_json TEXT NOT NULL,output_json TEXT NOT NULL)')
+                db.execute('CREATE TABLE shadow_p3_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+                # Existing filled orders remain historical records, not newly
+                # eligible fills. Existing balances/locks/positions are retained.
+                for old_order in db.execute("SELECT order_id,quantity,fill_price,fee FROM shadow_orders WHERE status='FILLED'").fetchall():
+                    actual_notional=D(old_order['quantity'])*D(old_order['fill_price'],positive=True)
+                    db.execute('UPDATE shadow_orders SET executed_quantity=quantity,executed_notional=?,executed_fee=? WHERE order_id=?',
+                        (str(actual_notional),old_order['fee'] or '0',old_order['order_id']))
+                db.execute("UPDATE execution_owner SET kind='SHADOW_P3'")
+                for key,value in [('risk_policy',self.risk_policy),('participation',str(self.participation)),('slippage_rate',str(self.slippage_rate))]:
+                    db.execute('INSERT INTO shadow_p3_metadata VALUES (?,?)',(key,value))
+        verify_existing_store(path,'SHADOW_P3',account_id,symbol)
+        super().__init__(path,symbol=symbol,account_id=account_id,fee_rate=fee_rate)
+        with self._transaction() as db:
+            config=dict(db.execute("SELECT key,value FROM shadow_p3_metadata WHERE key IN ('risk_policy','participation','slippage_rate')"))
+            if config!={'risk_policy':self.risk_policy,'participation':str(self.participation),'slippage_rate':str(self.slippage_rate)}:
+                raise ValueError('persisted P3 policy/assumptions mismatch; explicit migration required')
+
+    def _quantity(self,size,price):
+        quantity=floor_step(size/price,self.rules.step_size)
+        if quantity*price<300 or quantity<self.rules.min_qty:
+            raise ShadowRejected('DENY_ROUNDED_SIZE','rounded order falls below required size')
+        if quantity>self.rules.max_qty:raise ShadowRejected('DENY_QUANTITY','quantity exceeds exchange rule')
+        initial_stop(price,self.rules.tick_size)
+        return quantity
+
+    def submit_candidate(self,candidate,*,notional='300',now_ms=None,limit_price=None):
+        if not isinstance(candidate,dict):raise ValueError('candidate must be a mapping')
+        price=D(limit_price if limit_price is not None else candidate.get('entry_high'),positive=True)
+        quantity=self._quantity(D(notional,positive=True),price)
+        reasons=self.rules.validate_order(price,quantity,'BUY',reference_price=candidate.get('p3_reference_price'),
+                                          reference_minutes=candidate.get('p3_reference_minutes'))
+        if reasons:raise ShadowRejected('DENY_EXCHANGE_RULES',','.join(reasons))
+        return super().submit_candidate(candidate,notional=notional,now_ms=now_ms,limit_price=limit_price)
+
+    @staticmethod
+    def _occupied_slots(db):
+        keys={r[0] for r in db.execute("SELECT position_id FROM shadow_positions WHERE status='OPEN'")}
+        keys.update('p-'+r[0] for r in db.execute("SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'"))
+        return len(keys)
+
+    def _before_sell(self,db,position,price):
+        reasons=self.rules.validate_order(price,position['quantity'],'SELL')
+        if reasons:raise ShadowRejected('DENY_EXCHANGE_RULES',','.join(reasons))
+        buys=db.execute("SELECT order_id,reserved FROM shadow_orders WHERE side='BUY' AND status='PENDING' AND ('p-'||order_id)=?",(position['position_id'],)).fetchall()
+        account=self._account(db)
+        release=sum((D(row['reserved']) for row in buys),Decimal(0))
+        db.execute('UPDATE shadow_account SET reserved=?',(str(D(account['reserved'])-release),))
+        db.executemany("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='explicit_exit_entry_cancel' WHERE order_id=?",[(r['order_id'],) for r in buys])
+
+    @staticmethod
+    def _expire(db,now_ms):
+        rows=db.execute("SELECT order_id,reserved FROM shadow_orders WHERE status='PENDING' AND protection_order=0 AND expires_at<=?",(now_ms,)).fetchall()
+        if rows:
+            account=ShadowExecutor._account(db)
+            release=sum((D(r['reserved']) for r in rows),Decimal(0))
+            db.execute('UPDATE shadow_account SET reserved=?',(str(D(account['reserved'])-release),))
+            db.executemany("UPDATE shadow_orders SET status='EXPIRED',reserved='0',close_reason='timeout' WHERE order_id=?",[(r['order_id'],) for r in rows])
+
+    def _mark_risk(self,db,bid,now_ms):
+        account=self._account(db)
+        equity=D(account['cash'])+sum((D(r[0])*bid*(1-self.fee_rate) for r in db.execute("SELECT quantity FROM shadow_positions WHERE status='OPEN'")),Decimal(0))
+        peak=max(D(account['peak_equity']),equity)
+        locked=bool(account['hard_locked']) or equity<=peak*Decimal('.95')
+        db.execute('UPDATE shadow_account SET peak_equity=?,last_equity=?,hard_locked=?,lock_reason=?',
+                   (str(peak),str(equity),int(locked),'maximum_drawdown_5_percent' if locked else None))
+        if locked:
+            # Existing protective/manual SELL orders survive a drawdown lock.
+            buys=db.execute("SELECT reserved FROM shadow_orders WHERE side='BUY' AND status='PENDING'").fetchall()
+            release=sum((D(r[0]) for r in buys),Decimal(0))
+            db.execute("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='hard_lock_entry_cancel' WHERE side='BUY' AND status='PENDING'")
+            db.execute('UPDATE shadow_account SET reserved=?',(str(D(account['reserved'])-release),))
+        return locked
+
+    def _context(self,position,features,now_ms,inputs):
+        return make_context(symbol=self.symbol,account_id=self.account_id,strategy_id=position['strategy_id'],
+            strategy_version='p3-math-research-1',signal_id=position['signal_id'],decision_time_ms=now_ms,
+            features=features,inputs=inputs,parameter_version=self.symbol+'-apts-research-1')
+
+    def _audit(self,db,inputs,outputs,now_ms):
+        digest=canonical_hash(inputs)
+        db.execute('INSERT OR IGNORE INTO shadow_math_audit(input_hash,created_at,input_json,output_json) VALUES (?,?,?,?)',
+                   (digest,now_ms,zlib.compress(json.dumps(json_safe(inputs),sort_keys=True).encode(),9),
+                    zlib.compress(json.dumps(json_safe(outputs),sort_keys=True).encode(),9)))
+        return digest
+
+    def _protection(self,db,features,evidence,now_ms):
+        outputs=[]
+        for raw in db.execute("SELECT * FROM shadow_positions WHERE status='OPEN'").fetchall():
+            position=dict(raw)
+            context=self._context(position,features,now_ms,{'position':position,'evidence':evidence})
+            previous=db.execute('SELECT state_json FROM shadow_protection WHERE position_id=?',(position['position_id'],)).fetchone()
+            if previous:
+                state=APTSState.from_dict(json.loads(previous[0]))
+                changed=(state.entry_price!=D(position['entry_price']) or state.quantity!=D(position['quantity']))
+                # Added entry partial fills can tighten but never lower the stop.
+                state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
+                    stop_price=max(state.stop_price,initial_stop(position['entry_price'],self.rules.tick_size)),
+                    last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
+            else:
+                state=APTSState.create(context,position['entry_price'],position['quantity'],self.rules.tick_size,
+                    entry_fee_rate=self.fee_rate,exit_fee_rate=self.fee_rate,slippage_rate=self.slippage_rate)
+                # Evaluate the first fresh post-fill quote, including an adverse
+                # spread crossing the initial stop at the moment of entry.
+                state=replace(state,last_decision_time_ms=now_ms-1)
+            decision=update_protection(state,context,features['bid'],evidence,tick_size=self.rules.tick_size,quantity=position['quantity'])
+            outputs.append(decision.asdict())
+            db.execute('INSERT INTO shadow_protection VALUES (?,?,?,?) ON CONFLICT(position_id) DO UPDATE SET state_json=excluded.state_json,status=excluded.status,updated_at=excluded.updated_at',
+                (position['position_id'],json.dumps(decision.state.asdict(),sort_keys=True),decision.status,now_ms))
+            if decision.exit_required:
+                # No new entry remainder may re-open a position after its exit
+                # trigger. Other positions are unaffected unless account-locked.
+                buys=db.execute("SELECT order_id,reserved FROM shadow_orders WHERE side='BUY' AND status='PENDING' AND ('p-'||order_id)=?",(position['position_id'],)).fetchall()
+                account=self._account(db)
+                release=sum((D(r['reserved']) for r in buys),Decimal(0))
+                db.execute('UPDATE shadow_account SET reserved=?',(str(D(account['reserved'])-release),))
+                db.executemany("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='protection_triggered' WHERE order_id=?",[(r['order_id'],) for r in buys])
+                pending=db.execute("SELECT * FROM shadow_orders WHERE side='SELL' AND status='PENDING' AND position_id=?",(position['position_id'],)).fetchone()
+                if pending and not pending['protection_order']:
+                    db.execute("UPDATE shadow_orders SET status='CANCELLED',close_reason='replaced_by_protective_exit' WHERE order_id=?",(pending['order_id'],))
+                    pending=None
+                if not pending:
+                    key='P3_PROTECT:'+position['position_id']
+                    order_id=self._id(key)
+                    db.execute("""INSERT OR IGNORE INTO shadow_orders(order_id,request_key,fingerprint,account_id,symbol,strategy_id,signal_id,side,status,limit_price,quantity,notional,reserved,position_id,created_at,expires_at,candidate_json,protection_order)
+                        VALUES (?,?,?,?,?,?,?,'SELL','PENDING',?,?,?,'0',?,?,?,?,1)""",
+                        (order_id,key,self._id(key),self.account_id,self.symbol,position['strategy_id'],position['signal_id'],
+                         str(decision.limit_price),position['quantity'],str(decision.limit_price*D(position['quantity'])),
+                         position['position_id'],now_ms,now_ms+86_400_000,json.dumps(decision.asdict(),sort_keys=True)))
+        return outputs
+
+    def _fill(self,db,order,quantity,price,now_ms,input_hash):
+        side=order['side']
+        account=self._account(db)
+        notional,fee=quantity*price,quantity*price*self.fee_rate
+        position_id=order['position_id'] or 'p-'+order['order_id']
+        previous_qty=D(order['executed_quantity'])
+        total_qty=previous_qty+quantity
+        total_cost=D(order['executed_notional'])+notional
+        total_fee=D(order['executed_fee'])+fee
+        remaining=D(order['quantity'])-total_qty
+        if side=='BUY':
+            reserve=remaining*D(order['limit_price'])*(1+self.fee_rate)
+            cash=D(account['cash'])-notional-fee
+            if cash<0:raise ShadowRejected('DENY_AVAILABLE_CASH','fill exceeds cash')
+            db.execute('UPDATE shadow_account SET cash=?,reserved=?',
+                (str(cash),str(D(account['reserved'])-D(order['reserved'])+reserve)))
+            position=db.execute('SELECT * FROM shadow_positions WHERE position_id=?',(position_id,)).fetchone()
+            if position:
+                if position['status']!='OPEN':raise ValueError('closed position cannot accept another buy fill')
+                qty=D(position['quantity'])+quantity
+                cost=D(position['entry_cost'])+notional
+                db.execute('UPDATE shadow_positions SET quantity=?,entry_price=?,entry_cost=?,entry_fee=? WHERE position_id=?',
+                    (str(qty),str(cost/qty),str(cost),str(D(position['entry_fee'])+fee),position_id))
+            else:
+                db.execute("""INSERT INTO shadow_positions(position_id,account_id,symbol,strategy_id,signal_id,quantity,entry_price,entry_cost,entry_fee,status,opened_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,'OPEN',?)""",(position_id,self.account_id,self.symbol,order['strategy_id'],order['signal_id'],str(quantity),str(price),str(notional),str(fee),now_ms))
+        else:
+            reserve=Decimal(0)
+            position=db.execute("SELECT * FROM shadow_positions WHERE position_id=? AND status='OPEN'",(position_id,)).fetchone()
+            if position is None or quantity>D(position['quantity']):raise ValueError('sell exceeds remaining position')
+            ratio=quantity/D(position['quantity'])
+            cost,entry_fee=D(position['entry_cost'])*ratio,D(position['entry_fee'])*ratio
+            qty=D(position['quantity'])-quantity
+            pnl=D(position['realized_pnl'] or '0')+notional-fee-cost-entry_fee
+            db.execute('UPDATE shadow_account SET cash=?',(str(D(account['cash'])+notional-fee),))
+            db.execute('UPDATE shadow_positions SET quantity=?,entry_cost=?,entry_fee=?,status=?,closed_at=?,exit_price=?,exit_fee=?,realized_pnl=?,close_reason=? WHERE position_id=?',
+                (str(qty),str(D(position['entry_cost'])-cost),str(D(position['entry_fee'])-entry_fee),'OPEN' if qty else 'CLOSED',
+                 None if qty else now_ms,str(price),str(D(position['exit_fee'] or '0')+fee),str(pnl),
+                 'protective_exit' if order['protection_order'] else 'limit_exit',position_id))
+        status='PENDING' if remaining else 'FILLED'
+        db.execute('UPDATE shadow_orders SET status=?,reserved=?,position_id=?,executed_quantity=?,executed_notional=?,executed_fee=?,fill_at=?,fill_price=?,fee=?,close_reason=? WHERE order_id=?',
+            (status,str(reserve),position_id,str(total_qty),str(total_cost),str(total_fee),now_ms,str(total_cost/total_qty),str(total_fee),'partial_fill' if remaining else 'full_fill',order['order_id']))
+        fill_id=self._id(f"{order['order_id']}:{input_hash}")
+        db.execute('INSERT INTO shadow_fills VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (fill_id,order['order_id'],position_id,now_ms,side,str(quantity),str(price),str(fee),input_hash,'ASSUMED_10_PERCENT_DISPLAYED_DEPTH_WITH_SLIPPAGE'))
+        return {'fill_id':fill_id,'side':side,'quantity':str(quantity),'price':str(price),'fee':str(fee),'remaining':str(remaining),'order_id':order['order_id']}
+
+    def process_quote(self,*args,**kwargs):
+        raise ValueError('P3 requires synchronized depth inputs via process_market; P2 quote-only execution disabled')
+
+    def process_market(self,features,evidence,*,now_ms):
+        now_ms=timestamp(now_ms)
+        if features.get('symbol')!=self.symbol:raise ValueError('market/account symbol mismatch')
+        stamp=features.get('exchange_time_ms')
+        received=features.get('received_time_ms')
+        fresh=(features.get('synced') is True and type(stamp) is int and type(received) is int
+            and 0<=now_ms-stamp<=3000 and 0<=now_ms-received<=3000)
+        if not fresh:
+            with self._transaction() as db:self._expire(db,now_ms)
+            return {'processed':False,'code':'DATA_UNAVAILABLE_KEEP_PROTECTION','fills':[]}
+        bid,ask=D(features['bid'],positive=True),D(features['ask'],positive=True)
+        if bid>=ask:raise ValueError('invalid/crossed depth quote')
+        if not features.get('ready'):
+            evidence=replace(evidence,ready=False)
+        digest=canonical_hash({'features':features,'evidence':evidence,'now_ms':now_ms})
+        with self._transaction() as db:
+            had_exposure=bool(db.execute("SELECT 1 FROM shadow_positions WHERE status='OPEN' UNION SELECT 1 FROM shadow_orders WHERE status='PENDING' LIMIT 1").fetchone())
+            last=db.execute("SELECT value FROM shadow_p3_metadata WHERE key='last_update_id'").fetchone()
+            if last and int(features['update_id'])<=int(last[0]):return {'processed':False,'code':'DUPLICATE_OR_OLD_DEPTH','fills':[]}
+            self._expire(db,now_ms)
+            db.execute('UPDATE shadow_account SET last_quote_ms=?,bid=?,ask=?',(stamp,str(bid),str(ask)))
+            locked=self._mark_risk(db,bid,now_ms)
+            protections=self._protection(db,features,evidence,now_ms)
+            fills=[]
+            # Shared per-event liquidity budget prevents each order reusing the
+            # same displayed depth. No quantity exists beyond the observed book.
+            levels={side:[[D(p,positive=True),floor_step(D(q,nonnegative=True)*self.participation,self.rules.step_size)]
+                           for p,q in features['asks' if side=='BUY' else 'bids']] for side in ('BUY','SELL')}
+            orders=db.execute("SELECT * FROM shadow_orders WHERE status='PENDING' AND created_at<? ORDER BY protection_order DESC,created_at,order_id",(now_ms,)).fetchall()
+            for row in orders:
+                order=dict(row)
+                if order['side']=='BUY' and (self._account(db)['hard_locked'] or not features.get('ready')):continue
+                remaining=D(order['quantity'])-D(order['executed_quantity'])
+                available=[]
+                for level in levels[order['side']]:
+                    p,q=level
+                    adjusted=p*(1+self.slippage_rate if order['side']=='BUY' else 1-self.slippage_rate)
+                    # Entry/exit is still a protected LIMIT: modeled slippage may
+                    # prevent a fill; it may never violate the stated limit.
+                    price=(ceil_step(adjusted,self.rules.tick_size)
+                           if order['side']=='BUY' else floor_step(adjusted,self.rules.tick_size))
+                    if (order['side']=='BUY' and price>D(order['limit_price'])) or (order['side']=='SELL' and price<D(order['limit_price'])):break
+                    take=min(remaining,q)
+                    if take<=0:continue
+                    available.append((level,take,price))
+                    remaining-=take
+                    if remaining<=0:break
+                total=sum((v[1] for v in available),Decimal(0))
+                if total<=0:continue
+                price=sum((q*p for _,q,p in available),Decimal(0))/total
+                for level,q,_ in available:level[1]-=q
+                fills.append(self._fill(db,order,total,price,now_ms,digest))
+                locked=self._mark_risk(db,bid,now_ms)
+                protections=self._protection(db,features,evidence,now_ms)
+            db.execute("INSERT INTO shadow_p3_metadata VALUES ('last_update_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(features['update_id']),))
+            result={'processed':True,'code':'HARD_LOCKED_PROTECTION_ACTIVE' if locked else 'PROCESSED','fills':fills,'protection':protections,
+                    'risk_policy':self.risk_policy,'simulation_model':'conservative displayed-depth participation, no true queue position'}
+            if had_exposure or protections or fills:
+                self._audit(db,{'features':features,'evidence':evidence,'now_ms':now_ms},result,now_ms)
+            return result
+
+    def cancel(self,order_id):
+        with closing(self._connect()) as db:
+            row=db.execute('SELECT protection_order,status FROM shadow_orders WHERE order_id=?',(order_id,)).fetchone()
+            if row and row[0] and row[1]=='PENDING':raise ShadowRejected('DENY_PROTECTION_CANCEL','protective exits cannot be removed by ordinary cancel')
+        return super().cancel(order_id)
+
+    def snapshot(self):
+        result=super().snapshot()
+        result.update(apts_status='RESEARCH_MATH_AND_SIMULATED_PROTECTION',risk_policy=self.risk_policy,
+                      fee_model='research proportional fee plus bounded partial depth participation/slippage')
+        with closing(self._connect()) as db:
+            result['protection']=[{'position_id':r['position_id'],'state':json.loads(r['state_json']),'status':r['status']}
+                for r in db.execute("SELECT p.* FROM shadow_protection p JOIN shadow_positions s USING(position_id) WHERE s.status='OPEN'")]
+            result['fill_count']=db.execute('SELECT count(*) FROM shadow_fills').fetchone()[0]
+        for order in result['pending_orders']:
+            order['fill_state']='PARTIALLY_FILLED' if D(order['executed_quantity']) else 'NO_FILL'
+        return result

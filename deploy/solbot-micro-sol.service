@@ -1,0 +1,29 @@
+[Unit]
+Description=SOL-bot P3 public SOL orderbook research
+After=network-online.target
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/sol-bot/p3
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.market.depth_collector --symbol SOLUSDT --database /var/lib/sol-bot/database/sol-micro.sqlite --status-path /var/lib/sol-bot/sol-micro-status.json
+Environment=PYTHONPATH=/opt/sol-bot/p3/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=20
+MemoryHigh=128M
+MemoryMax=220M
+CPUQuota=25%
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/sol-bot
+ReadWritePaths=/var/lib/sol-bot
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=SOL-bot P7 local authenticated app API
+After=network.target
+
+[Service]
+User=solbot-app
+Group=solbot-app
+SupplementaryGroups=solbot
+WorkingDirectory=/opt/sol-bot/p5
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.app_api.application --state-dir /var/lib/sol-bot-app --port 8016 --require-enrollment
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+ReadWritePaths=/var/lib/sol-bot-app
+ReadOnlyPaths=/opt/sol-bot/p5 /var/lib/sol-bot/database /var/lib/sol-bot-execution
+MemoryMax=256M
+CPUQuota=20%
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
