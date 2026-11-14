@@ -64,7 +64,7 @@ class OrderRequest:
             raise ValueError("unsupported execution mode or symbol")
         identifier(self.account_id, "account_id")
         identifier(self.request_id, "request_id")
-        if self.strategy_id not in ("T1", "R1") or self.side not in ("BUY", "SELL"):
+        if self.strategy_id not in ("T1", "R1", "T2") or self.side not in ("BUY", "SELL"):
             raise ValueError("unsupported strategy or side")
         amount(self.limit_price, "limit_price")
         if self.side == "BUY":

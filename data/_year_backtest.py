@@ -21,19 +21,22 @@ import numpy as np
 sys.path.insert(0, r"D:\SOL-Bot\backend\src")
 
 from solbot.mathematics.decimal_utils import ceil_step, floor_step
+from solbot.mathematics.execution_cost import FeeSchedule
+from solbot.mathematics.profit_trail import trail_line
 from solbot.mathematics.protective_stop import initial_stop, profit_floor
 from solbot.strategy import evaluate, indicators, market_regime, r1_reversal, signal_scoring, t1_pullback
 
 DB = Path(r"D:\SOL-Bot\data\solusdt_1y.sqlite")
-OUT = Path(r"D:\SOL-Bot\data\solusdt_1y_backtest.json")
+OUT = Path(r"D:\SOL-Bot\data\solusdt_1y_backtest_bnb.json")
 STEPS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 FIELDS = ("open_time", "high", "low", "close", "volume", "quote_volume")
-FEE = Decimal("0.001")
+FEE = FeeSchedule(bnb_discount_enabled=True).rate("TAKER")
 TICK = Decimal("0.01")
 STEP = Decimal("0.001")
 APTS_SLIP = Decimal("0.0005")
 START = Decimal("2000")
-LOSS_FRACTION = Decimal("0.012")  # 0.8% stop + 0.1% entry + 0.1% exit + 0.2% sizing slippage
+LOSS_FRACTION = Decimal("0.008") + FEE + FEE + Decimal("0.002")
+CUTOFF_DAY = "2026-05-10"
 N_SCORE = Decimal("580")  # 300 + 400 * (92.5 - 75) / 25
 MODULES = (("T1", t1_pullback), ("R1", r1_reversal))
 BINDING = {
@@ -559,7 +562,24 @@ def evidence_at(frames, decision):
     return ev
 
 
+def step_price(book, pos, o, h, l):
+    """0.8% protective stop, then the research profit line. No RVOL input."""
+    if l <= pos["stop"]:
+        price = o if o <= pos["stop"] else pos["stop"]
+        return price, "PROTECTIVE_STOP_TOUCHED"
+    high = max(pos["high"], h)
+    pos["high"] = high
+    pos["mfe"] = max(pos["mfe"], float(h / pos["entry"] - 1))
+    pos["mae"] = min(pos["mae"], float(l / pos["entry"] - 1))
+    line = trail_line(pos["entry"], high)
+    if line is not None and l <= line:
+        return (o if o <= line else line), "PROFIT_TRAIL"
+    return None, None
+
+
 def step_exit(book, pos, o, h, l, c, ev):
+    if book.mode == "price":
+        return step_price(book, pos, o, h, l)
     if l <= pos["stop"]:
         price = o if o <= pos["stop"] else pos["stop"]
         if o < pos["stop"] * Decimal("0.997"):
@@ -611,6 +631,7 @@ def step_exit(book, pos, o, h, l, c, ev):
 def simulate(frames, signals, start, end):
     books = [
         Book("T1_APTS", ("T1",), "apts", True),
+        Book("T1_PRICE", ("T1",), "price", True),
         Book("T1R1_APTS", ("T1", "R1"), "apts", True),
         Book("T1_FIXED", ("T1",), "fixed", True),
         Book("T1_APTS_NOLOCK", ("T1",), "apts", False),
@@ -853,23 +874,24 @@ def main():
     sol_closes = np.array([row["sol"] for row in hold["days"]])
     sol_ret = np.diff(np.log(sol_closes))
     vol = float(sol_ret.std(ddof=1) * np.sqrt(365)) if len(sol_ret) > 1 else None
+    round_trip = float(FEE * 2)
     event = {
-        "all_5m_60m": summarize(baseline["all"], 0.002),
-        "all_5m_60m_nonoverlap": summarize(baseline["all"], 0.002, 60),
-        "uptrend_60m": summarize(baseline["UPTREND"], 0.002),
-        "uptrend_60m_nonoverlap": summarize(baseline["UPTREND"], 0.002, 60),
-        "range_60m": summarize(baseline["RANGE"], 0.002),
-        "range_60m_nonoverlap": summarize(baseline["RANGE"], 0.002, 60),
-        "T1_60m_close": summarize(baseline["T1"], 0.002),
-        "T1_60m_nonoverlap": summarize(baseline["T1"], 0.002, 60),
-        "R1_60m_close": summarize(baseline["R1"], 0.002),
-        "R1_60m_nonoverlap": summarize(baseline["R1"], 0.002, 60),
+        "all_5m_60m": summarize(baseline["all"], round_trip),
+        "all_5m_60m_nonoverlap": summarize(baseline["all"], round_trip, 60),
+        "uptrend_60m": summarize(baseline["UPTREND"], round_trip),
+        "uptrend_60m_nonoverlap": summarize(baseline["UPTREND"], round_trip, 60),
+        "range_60m": summarize(baseline["RANGE"], round_trip),
+        "range_60m_nonoverlap": summarize(baseline["RANGE"], round_trip, 60),
+        "T1_60m_close": summarize(baseline["T1"], round_trip),
+        "T1_60m_nonoverlap": summarize(baseline["T1"], round_trip, 60),
+        "R1_60m_close": summarize(baseline["R1"], round_trip),
+        "R1_60m_nonoverlap": summarize(baseline["R1"], round_trip, 60),
     }
     for label, key in (("T1", "T1"), ("R1", "R1")):
         for horizon in ("15", "60", "240", "1440"):
             pairs = [(n, row["horizons"][horizon]["limit"]) for n, row in enumerate(signals)
                      if row["strategy"] == label and horizon in row["horizons"]]
-            event[f"{label}_limit_{horizon}m"] = summarize([(i, v) for i, v in pairs], 0.002)
+            event[f"{label}_limit_{horizon}m"] = summarize([(i, v) for i, v in pairs], round_trip)
     book_report = {}
     dates = [row["date"] for row in hold["days"]]
     series = {"SOL price": [], "Buy and hold": []}
@@ -897,8 +919,24 @@ def main():
                 points.append(values[i])
         weekly_series[name] = points
         week_dates = labels
+
+    def half(book):
+        prior = [row["equity"] for row in book.equity_day if row["date"] < CUTOFF_DAY]
+        cutoff_equity = prior[-1] if prior else float(START)
+        final = float(book.cash)
+        return {"cutoff": CUTOFF_DAY, "equity_at_cutoff": cutoff_equity,
+                "first_return": cutoff_equity / float(START) - 1,
+                "second_return": final / cutoff_equity - 1}
+
+    halves = {book.name: half(book) for book in books}
+    price_second = halves["T1_PRICE"]["second_return"]
+    apts_second = halves["T1_APTS"]["second_return"]
+    accepted = price_second > 0 and price_second > apts_second
     payload = {
         "strategy_version": "p2-research-1",
+        "fee_rate": str(FEE),
+        "profit_trail_accepted": accepted,
+        "promotion": "SECOND_HALF_BEAT_CASH_AND_APTS" if accepted else "RESEARCH_ONLY",
         "window": {"start": iso(int(m1["close_time"][start])), "end": iso(int(m1["close_time"][end])),
                    "start_ms": int(m1["close_time"][start]), "end_ms": int(m1["close_time"][end])},
         "audit": audit,
@@ -908,6 +946,7 @@ def main():
                    "annual_vol": vol, "buyhold_return": hold["return"], "buyhold_max_dd": hold["max_dd"],
                    "buyhold_final": hold["final"], **sharpe_block([row["equity"] for row in hold["days"]])},
         "books": book_report,
+        "walk_forward": halves,
         "weekly": {"dates": week_dates, "series": weekly_series},
         "months": {
             "sol": monthly_returns(hold["days"], "sol"),
@@ -917,8 +956,9 @@ def main():
             "Signals are the production evaluate gates: T1 pullback and R1 reversal, version p2-research-1.",
             "One accepted intent per 5m candidate. R1 remains live-disabled in the product; T1_APTS is the relevant book.",
             "Limit buy at close*1.001, filled only on a later 1m bar whose low trades at or below the limit and whose close is before expiry. No price improvement.",
-            "Size follows size_position at score 92.5: notional min(580, equity*risk/0.012, cash), floor 300, cap 700. T1 risk budget 0.4%, R1 0.25%. Step 0.001, tick 0.01.",
-            "Fee 0.10% per side. Account starts at 2000 USDT, maximum two slots.",
+            "Size follows size_position at score 92.5: notional min(580, equity*risk/loss_fraction, cash), floor 300, cap 700. T1 risk budget 0.4%, R1 0.25%. Step 0.001, tick 0.01.",
+            "Fee is the BNB taker rate 0.075% per side from FeeSchedule(bnb_discount_enabled=True). See docs/回测准则.md.",
+            "T1_PRICE uses profit_trail.trail_line. It does not read RVOL. It is not wired into update_protection.",
             "APTS is translated from update_protection onto 1m OHLC. Intrabar low can touch the stop. Trail ratchets on the close. Flow buy_ratio is the 5m taker-buy quote ratio because the file has no trade tape.",
             "A 5% peak-equity lock cancels new entries and stays on. It does not flatten positions. T1_APTS_NOLOCK removes only that lock.",
             "T1_FIXED keeps the initial 0.8% stop and never trails.",
@@ -930,9 +970,12 @@ def main():
     print(json.dumps({
         "window": payload["window"], "signals": signal_report["by_strategy"],
         "setups": signal_report["setup_candidates"], "regimes": signal_report["regimes"],
+        "fee": str(FEE),
         "books": {k: {"ret": v["return"], "dd": v["max_dd"], "trades": v["closed_trades"], "win": v["win"],
-                      "pf": v["profit_factor"], "fill": v["fill_rate"], "lock": v["lock_at"], "final": v["final"]}
+                      "pf": v["profit_factor"], "fill": v["fill_rate"], "lock": v["lock_at"], "final": v["final"],
+                      "reasons": v["exit_reasons"]}
                   for k, v in book_report.items()},
+        "walk_forward": halves, "promotion": payload["promotion"],
         "bh": hold["return"], "sol": hold["price_return"], "seconds": round(time.perf_counter() - t0, 1),
     }, indent=2))
 

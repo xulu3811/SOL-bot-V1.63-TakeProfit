@@ -3,10 +3,11 @@ from decimal import Decimal
 from .decimal_utils import D,ceil_step,floor_step
 
 
-def initial_stop(entry,tick):
-    entry,tick=D(entry,positive=True),D(tick,positive=True)
-    price=ceil_step(entry*Decimal('.992'),tick)
-    if price<=0 or price>=entry:raise ValueError('tick prevents valid 0.8% initial protection')
+def initial_stop(entry,tick,stop_distance=Decimal('.008')):
+    entry,tick,dist=D(entry,positive=True),D(tick,positive=True),D(stop_distance,positive=True)
+    if dist>=Decimal('.1'):raise ValueError('stop_distance too wide')
+    price=ceil_step(entry*(1-dist),tick)
+    if price<=0 or price>=entry:raise ValueError('tick prevents valid initial protection')
     return price
 
 

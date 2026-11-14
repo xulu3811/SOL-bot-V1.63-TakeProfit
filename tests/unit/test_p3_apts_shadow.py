@@ -87,10 +87,17 @@ class APTSTests(unittest.TestCase):
 
     def test_volume_alone_and_exhaustion_combinations(self):
         self.assertEqual(classify(TrendEvidence(ready=True,rvol=Dec(10))),'NORMAL_UPTREND')
-        evidence=replace(NORMAL,structure_broken=True,buy_ratio=Dec('.3'),previous_buy_ratio=Dec('.7'))
+        evidence=replace(NORMAL,structure_broken=True,buy_ratio=Dec('.3'),previous_buy_ratio=Dec('.7'),rsi=Dec('40'),previous_rsi=Dec('50'))
         result=self.step(self.state(),'101.2',1,evidence)
         self.assertTrue(result.exit_required)
         self.assertEqual(result.state.stage,'S3_TREND_EXHAUSTION')
+        held_state=APTSState.create(context(),'83.12','0.6','.01')
+        held=self.step(held_state,'82.90',1,evidence)
+        self.assertFalse(held.exit_required)
+        self.assertEqual(held.state.stage,'S0_INITIAL_PROTECTION')
+        self.assertEqual(held.stop_price,initial_stop('83.12','.01'))
+        self.assertIn('REVERSAL_OBSERVED_S0_STOP_RETAINED',held.reasons)
+        self.assertTrue(self.step(self.state(),'99.20',2,evidence).exit_required)
         weak=replace(NORMAL,failed_new_high=True,rvol=Dec(4),rsi=Dec(45),previous_rsi=Dec(70))
         self.assertEqual(classify(weak),'WEAKENING')
 

@@ -24,15 +24,23 @@ class APTSState:
     trigger_reason: str=''
     last_decision_time_ms: int=0
     scheme: str='APTS'
+    entry_time_ms: int=0
+    reversal_hits: int=0
+    reversal_confirm_ticks: int=1
 
     @classmethod
-    def create(cls,context,entry_price,quantity,tick_size,entry_fee_rate='0.001',exit_fee_rate='0.001',slippage_rate='0.001',scheme='APTS'):
+    def create(cls,context,entry_price,quantity,tick_size,entry_fee_rate='0.001',exit_fee_rate='0.001',slippage_rate='0.001',scheme='APTS',stop_distance=None,entry_time_ms=0,reversal_confirm_ticks=1):
         entry,qty=D(entry_price,positive=True),D(quantity,positive=True)
         fees=[D(x,nonnegative=True) for x in (entry_fee_rate,exit_fee_rate,slippage_rate)]
         if max(fees)>=Decimal('.1'):raise ValueError('invalid cost assumptions')
         if scheme not in ('APTS','FIXED_0_5','FIXED_1_0','ATR'):raise ValueError('unknown scheme')
-        stop=initial_stop(entry,tick_size)
-        return cls(context,entry,qty,entry,stop,stop,*fees,last_decision_time_ms=context.decision_time_ms,scheme=scheme)
+        stop=initial_stop(entry,tick_size) if stop_distance is None else initial_stop(entry,tick_size,stop_distance=stop_distance)
+        return cls(
+            context,entry,qty,entry,stop,stop,*fees,
+            last_decision_time_ms=context.decision_time_ms,scheme=scheme,
+            entry_time_ms=int(entry_time_ms or 0),reversal_hits=0,
+            reversal_confirm_ticks=max(1,int(reversal_confirm_ticks or 1)),
+        )
 
     def asdict(self):return json_safe(self)
 
@@ -109,10 +117,20 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
             else:candidate=max(candidate,floor)
         if stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION'):
             candidate=max(candidate,high*(1-distance))
+        reversal_hits=0
         if regime in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE'):
-            stage='S3_TREND_EXHAUSTION'
-            current=replace(current,trigger_latched=True,trigger_reason=regime)
-            status='EXIT_REQUIRED'
+            # S0 keeps the resting -0.8%/-1.0% stop. A 5m pullback must not sell above it.
+            if stage=='S0_INITIAL_PROTECTION' and bid>state.stop_price:
+                reasons.append('REVERSAL_OBSERVED_S0_STOP_RETAINED')
+            else:
+                reversal_hits=state.reversal_hits+1
+                confirm_needed=1 if regime=='SEVERE_ADVERSE_MOVE' else max(1,state.reversal_confirm_ticks)
+                if reversal_hits>=confirm_needed:
+                    stage='S3_TREND_EXHAUSTION'
+                    current=replace(current,trigger_latched=True,trigger_reason=regime)
+                    status='EXIT_REQUIRED'
+                else:
+                    reasons.append('REVERSAL_PENDING_CONFIRMATION')
         candidate=ceil_step(candidate,tick)
         if candidate>=bid:
             current=replace(current,trigger_latched=True,trigger_reason=current.trigger_reason or 'TRAILING_STOP_TOUCHED')
@@ -120,12 +138,12 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
         # A stop that cannot be newly established below the current market is
         # not advertised as newly effective. Preserve the previous valid stop.
         effective=max(state.stop_price,candidate) if candidate<bid else state.stop_price
-        current=replace(current,stage=stage,high_price=high,floor_price=floor,stop_price=effective)
+        current=replace(current,stage=stage,high_price=high,floor_price=floor,stop_price=effective,reversal_hits=reversal_hits)
     if context.decision_time_ms>state.last_decision_time_ms and fresh:
         current=replace(current,last_decision_time_ms=context.decision_time_ms)
     assert current.stop_price>=state.stop_price
     limit=stop_limit_price(current.stop_price,tick)
-    if current.trigger_reason in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE','PROFIT_FLOOR_NOT_EXECUTABLE'):
+    if current.trigger_reason in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE','PROFIT_FLOOR_NOT_EXECUTABLE','STAGNATION_12H_EXIT'):
         limit=stop_limit_price(bid,tick)
     return ProtectionDecision(context=context,status=status,parameter_version=version,reasons=tuple(reasons),
         state=current,stop_price=current.stop_price,limit_price=limit,quantity=qty,

@@ -15,6 +15,7 @@ class Settings(private val context: Context) {
 @Entity data class AlertRecord(@PrimaryKey val eventId: String,val title: String,val message: String,val route: String,val receivedAt: Long)
 @Dao interface AlertDao {
     @Insert(onConflict=OnConflictStrategy.IGNORE) suspend fun insert(value: AlertRecord): Long
+    @Query("SELECT COUNT(*) FROM AlertRecord") suspend fun count(): Int
     @Query("SELECT * FROM AlertRecord ORDER BY receivedAt DESC LIMIT 100") fun watch(): Flow<List<AlertRecord>>
     @Query("DELETE FROM AlertRecord WHERE eventId NOT IN (SELECT eventId FROM AlertRecord ORDER BY receivedAt DESC LIMIT 1000)") suspend fun prune()
 }

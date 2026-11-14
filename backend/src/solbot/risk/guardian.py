@@ -34,7 +34,7 @@ class Guardian:
                 if condition: reasons.append(reason)
             deny(intent.account_id!=self.ledger.account_id or intent.symbol!=self.ledger.symbol,'DENY_ACCOUNT_SYMBOL')
             deny(intent.side!='BUY','DENY_ENTRY_ONLY')
-            deny(intent.strategy_id!='T1','DENY_R1_NOT_APPROVED')
+            deny(intent.strategy_id!='T1' and intent.strategy_id!='T2','DENY_R1_NOT_APPROVED')
             deny(intent.strategy_version!=p.STRATEGY_VERSION,'DENY_STRATEGY_VERSION')
             deny(not 0<=at-intent.created_at<=60000 or not at<intent.expires_at<=intent.created_at+60000,'DENY_EXPIRED')
             deny(not 0<=at-intent.market_at<=2000 or not 0<=at-intent.math_at<=5000,'PAUSE_STALE_DATA')

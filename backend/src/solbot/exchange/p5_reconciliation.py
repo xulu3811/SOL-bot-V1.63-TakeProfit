@@ -3,18 +3,22 @@ import json
 import time
 import uuid
 from solbot.mathematics.decimal_utils import D
+from solbot.storage.models import resolve_live_account
 from .account_reader import AccountReader
 from .commission_service import CommissionService
 
 class PrivateHandshake:
-    def __init__(self,reader,store,guardian,*,recover,protection_checker,filters_checker,clock=None):
+    def __init__(self,reader,store,guardian,*,recover,protection_checker,filters_checker,clock=None,account_id=None,symbols=None):
         self.reader,self.store,self.guardian=reader,store,guardian
         self.recover,self.protection_checker,self.filters_checker=recover,protection_checker,filters_checker
         self.clock=clock or (lambda:time.time_ns()//1000000)
+        self.account_id=account_id
+        self.symbols=tuple(symbols) if symbols is not None else None
         self.last_evidence=None
 
     def __call__(self,session):
-        session.require('PRIVATE_READ','SUI-live')
+        account_id=self.account_id or getattr(session,'account_id','SUI-live')
+        session.require('PRIVATE_READ',account_id)
         try:
             return self._check(session)
         except BaseException:
@@ -23,6 +27,8 @@ class PrivateHandshake:
             raise
 
     def _check(self,session):
+        account_id,primary_symbol,_=resolve_live_account(self.account_id or getattr(session,'account_id','SUI-live'))
+        symbols=self.symbols or (primary_symbol,'BNBUSDT')
         self.recover()
         account=self.reader.account(); balances=self.reader.normalize_account(account)
         permissions=self.reader.validate_permissions(self.reader.api_permissions())
@@ -32,7 +38,7 @@ class PrivateHandshake:
         by_client={r['client_id']:r for r in rows}
         unknown=pending_outbox or any(r['state'] in ('UNKNOWN','SUBMITTING','CREATED','RISK_APPROVED') for r in rows)
         known=[]; manual=[]; commissions={}
-        for symbol in ('SUIUSDT','BNBUSDT'):
+        for symbol in symbols:
             for order in self.reader.open_orders(symbol):
                 local=by_client.get(order['clientOrderId'])
                 if local is None:
@@ -83,7 +89,7 @@ class PrivateHandshake:
         protection=self.protection_checker(known) is True
         filters=self.filters_checker() is True
         observed=self.clock()
-        event={'event_id':'p5-reconcile:'+str(uuid.uuid4()),'account_id':'SUI-live','balances':balances,'observed_at':observed,'unknown_orders':unknown,'manual_orders':manual,'known_orders':known,'commissions':commissions,'protection_verified':protection}
+        event={'event_id':'p5-reconcile:'+str(uuid.uuid4()),'account_id':account_id,'balances':balances,'observed_at':observed,'unknown_orders':unknown,'manual_orders':manual,'known_orders':known,'commissions':commissions,'protection_verified':protection}
         outcome=self.guardian.reconcile(event)
         reconciled=outcome=='RECONCILED' or (isinstance(outcome,dict) and outcome.get('status')=='RECONCILED')
         evidence={'account':True,'permissions':permissions,'orders':not unknown,'balances':enough and reconciled,'protection':protection,'guardian':reconciled,'filters':filters}

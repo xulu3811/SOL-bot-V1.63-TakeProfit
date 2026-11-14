@@ -4,6 +4,9 @@ import hmac
 from .binance_private import AuthorizationDenied, Credentials, MockTransport, HTTPTransport
 from solbot.mathematics.decimal_utils import D
 
+BOT_ORDER_PREFIXES = ('sb5-', 'p5p-', 'p5x-', 'cbotby', 'cbotsl', 'cbotex', 'cbot2s', 'cbot2x')
+
+
 class UserStream:
     def __init__(self,client): self.client=client; self.subscription_id=None; self.connected=False
     def subscribe_request(self,request_id):
@@ -30,8 +33,10 @@ class UserStream:
         if typ in ('eventStreamTerminated','serverShutdown'):
             self.connected=False; return {'kind':'RECONCILE_REQUIRED','reason':typ}
         if typ=='executionReport':
-            if event['s'] not in ('SUIUSDT','BNBUSDT'): return {'kind':'MANUAL_ORDER','raw':event}
-            return {'kind':'ORDER','symbol':event['s'],'client_order_id':event['c'],'order_id':event['i'],'status':event['X'],'execution_type':event['x'],'trade_id':event.get('t',-1),'event_time':event['E'],'transaction_time':event['T'],'quantity':str(D(event['q'],nonnegative=True)),'cumulative_quantity':str(D(event['z'],nonnegative=True)),'cumulative_quote':str(D(event['Z'],nonnegative=True)),'last_quantity':str(D(event['l'],nonnegative=True)),'last_price':str(D(event['L'],nonnegative=True)),'commission':str(D(event.get('n','0'),nonnegative=True)),'commission_asset':event.get('N'),'raw':event}
+            symbol=event['s']
+            robot=symbol in ('SUIUSDT','BNBUSDT') or (symbol=='SOLUSDT' and (str(event.get('c','')).startswith(BOT_ORDER_PREFIXES) or str(event.get('C','')).startswith(BOT_ORDER_PREFIXES)))
+            if not robot: return {'kind':'MANUAL_ORDER','symbol':symbol,'client_order_id':event.get('c'),'status':event.get('X'),'raw':event}
+            return {'kind':'ORDER','symbol':symbol,'client_order_id':event['c'],'order_id':event['i'],'status':event['X'],'execution_type':event['x'],'trade_id':event.get('t',-1),'event_time':event['E'],'transaction_time':event['T'],'quantity':str(D(event['q'],nonnegative=True)),'cumulative_quantity':str(D(event['z'],nonnegative=True)),'cumulative_quote':str(D(event['Z'],nonnegative=True)),'last_quantity':str(D(event['l'],nonnegative=True)),'last_price':str(D(event['L'],nonnegative=True)),'commission':str(D(event.get('n','0'),nonnegative=True)),'commission_asset':event.get('N'),'raw':event}
         if typ=='outboundAccountPosition': return {'kind':'BALANCE_PARTIAL','observed_at':event['u'],'balances':{x['a']:{'free':str(D(x['f'],nonnegative=True)),'locked':str(D(x['l'],nonnegative=True))} for x in event['B']}}
         if typ in ('balanceUpdate','externalLockUpdate'): return {'kind':'RECONCILE_REQUIRED','reason':typ,'raw':event}
         return {'kind':'UNRECOGNIZED_EVENT','raw':event}

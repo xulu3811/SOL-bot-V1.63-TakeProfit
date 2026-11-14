@@ -9,6 +9,20 @@ from typing import Any, Mapping, Sequence
 INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000,
                "1h": 3_600_000, "4h": 14_400_000}
 SYMBOL_BASE_ASSETS = {"SOLUSDT": "SOL", "SUIUSDT": "SUI"}
+LIVE_ACCOUNTS = {"SUI-live": "SUIUSDT", "SOL-live": "SOLUSDT"}
+LIVE_ACCOUNT_BY_SYMBOL = {"SUIUSDT": "SUI-live", "SOLUSDT": "SOL-live"}
+LIVE_SYMBOLS = frozenset(("SOLUSDT", "SUIUSDT", "BNBUSDT"))
+
+
+def resolve_live_account(account_id: str = "SUI-live", symbol: str | None = None) -> tuple[str, str, str]:
+    """Validate and resolve (account_id, symbol, base_asset) for P4/P5 live custody."""
+    if account_id not in LIVE_ACCOUNTS:
+        raise ValueError("unsupported live account")
+    expected_symbol = LIVE_ACCOUNTS[account_id]
+    resolved_symbol = expected_symbol if symbol is None else symbol
+    if resolved_symbol != expected_symbol:
+        raise ValueError("account/symbol mismatch")
+    return account_id, resolved_symbol, SYMBOL_BASE_ASSETS[resolved_symbol]
 
 
 def validate_symbol(value: str) -> str:

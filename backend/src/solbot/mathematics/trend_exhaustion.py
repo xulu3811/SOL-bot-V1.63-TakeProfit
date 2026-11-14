@@ -37,7 +37,8 @@ def classify(evidence: TrendEvidence):
     momentum=evidence.rsi<evidence.previous_rsi-Decimal(8)
     severe=evidence.previous_atr>0 and evidence.atr>evidence.previous_atr*2 and evidence.adverse_move and selling
     if severe:return 'SEVERE_ADVERSE_MOVE'
-    if evidence.structure_broken and (selling or momentum):return 'CONFIRMED_REVERSAL'
+    # A one-bar 5m dip is a normal pullback. Reversal needs a deep break plus both flow and momentum.
+    if evidence.structure_broken and selling and momentum:return 'CONFIRMED_REVERSAL'
     if ((selling or momentum) and evidence.failed_new_high) or evidence.structure_broken:
         return 'WEAKENING'
     if (evidence.trend_4h and evidence.trend_1h and evidence.trend_15m
@@ -83,14 +84,16 @@ def from_closed_inputs(symbol,candles,features,as_of_ms):
     prior=five[-2]
     prior_quote=D(prior['quote_volume'])
     average=sum((D(r['volume']) for r in five[-21:-1]),Decimal(0))/20
+    atr=decimal_atr(five)
+    broken_low=min(D(r['low']) for r in five[-4:-1])
     return TrendEvidence(ready=True,trend_4h=trends['4h'],trend_1h=trends['1h'],trend_15m=trends['15m'],
         higher_low_1m=D(one[-1]['low'])>=D(one[-2]['low'])>D(one[-3]['low']),
         higher_low_5m=D(five[-1]['low'])>=D(five[-2]['low'])>D(five[-3]['low']),
-        structure_broken=D(five[-1]['close'])<min(D(r['low']) for r in five[-4:-1]),
+        structure_broken=D(five[-1]['close'])<broken_low-atr*Decimal('0.5'),
         failed_new_high=D(five[-1]['high'])>=max(D(r['high']) for r in five[-4:-1]) and D(five[-1]['close'])<=D(prior['close']),
         adverse_move=D(five[-1]['close'])<D(prior['close']),
         rvol=D(five[-1]['volume'])/average if average else Decimal(0),
         buy_ratio=D(features['buy_ratio']),
         previous_buy_ratio=D(prior['taker_buy_quote_volume'])/prior_quote if prior_quote else Decimal('.5'),
         rsi=_rsi(values),previous_rsi=_rsi(values[:-1]),
-        atr=decimal_atr(five),previous_atr=decimal_atr(five[:-1]))
+        atr=atr,previous_atr=decimal_atr(five[:-1]))

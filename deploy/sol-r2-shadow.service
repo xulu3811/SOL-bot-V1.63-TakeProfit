@@ -1,0 +1,27 @@
+[Unit]
+Description=SOL R2 isolated rebound paper worker
+After=network-online.target solbot-market.service solbot-micro-sol.service
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/sol-bot/r2-v2-100
+Environment=PYTHONPATH=/opt/sol-bot/r2-v2-100/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.r2_runtime --market-db /var/lib/sol-bot/database/market.sqlite --micro-db /var/lib/sol-bot/database/sol-micro.sqlite --state-db /var/lib/sol-bot/r2/r2-v2-state.sqlite --shadow-db /var/lib/sol-bot/r2/r2-v2-shadow.sqlite --status-path /var/lib/sol-bot/r2/status.json
+Restart=on-failure
+RestartSec=10
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sol-bot/r2 /var/lib/sol-bot/database
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=300M
+CPUQuota=25%
+[Install]
+WantedBy=multi-user.target
+

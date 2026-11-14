@@ -80,6 +80,12 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(request['method'],'userDataStream.subscribe.signature')
         stream.acknowledge({'status':200,'result':{'subscriptionId':1}})
         self.assertEqual(stream.receive({'subscriptionId':1,'event':{'e':'balanceUpdate','d':'10'}})['kind'],'RECONCILE_REQUIRED')
+    def test_sol_manual_fill_stays_out_of_robot_orders(self):
+        stream=UserStream(self.client); stream.acknowledge({'status':200,'result':{'subscriptionId':1}})
+        manual=stream.receive({'subscriptionId':1,'event':{'e':'executionReport','s':'SOLUSDT','c':'web-1','X':'FILLED'}})
+        self.assertEqual((manual['kind'],manual['symbol'],manual['client_order_id']),('MANUAL_ORDER','SOLUSDT','web-1'))
+        robot=stream.receive({'subscriptionId':1,'event':{'e':'executionReport','s':'SOLUSDT','c':'sb5-abc','X':'FILLED','i':9,'x':'TRADE','t':3,'E':1,'T':1,'q':'1','z':'1','Z':'100','l':'1','L':'100','n':'0','N':'BNB'}})
+        self.assertEqual(robot['kind'],'ORDER');self.assertEqual(robot['symbol'],'SOLUSDT')
         self.assertEqual(stream.disconnected()['kind'],'RECONCILE_REQUIRED')
     def test_actual_fee_asset_needs_price(self):
         with self.assertRaises(ValueError): CommissionService.quote_value('0.01','BNB',{})

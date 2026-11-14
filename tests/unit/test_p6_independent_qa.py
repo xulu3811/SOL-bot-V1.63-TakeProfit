@@ -60,12 +60,15 @@ class DeviceAuthenticationQA(unittest.TestCase):
         body=json.dumps({'public_key_pem':key.public_key().public_bytes(serialization.Encoding.PEM,serialization.PublicFormat.SubjectPublicKeyInfo).decode(),'device_passphrase':secrets.token_urlsafe(12),'role':'admin'}).encode()
         result=self.store.pair(body,self.sign('POST','/api/v1/app/devices/pair',body,key=key))
         with self.store.tx() as db:self.assertEqual(db.execute('SELECT role FROM devices WHERE id=?',(result['device_id'],)).fetchone()[0],'operator')
-    def test_passphrase_binds_one_device_permanently(self):
+    def test_passphrase_rebinds_the_same_slot(self):
         secret='hardware-pass'
-        self.pair(ec.generate_private_key(ec.SECP256R1()),passphrase=secret)
-        with self.assertRaises(AuthError):self.pair(ec.generate_private_key(ec.SECP256R1()),passphrase=secret)
-        self.now+=10*365*86400*1000
-        self.auth()
+        first=self.pair(ec.generate_private_key(ec.SECP256R1()),passphrase=secret)
+        second=self.pair(ec.generate_private_key(ec.SECP256R1()),passphrase=secret)
+        self.assertNotEqual(first['device_id'],second['device_id'])
+        with self.store.tx() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM devices WHERE passphrase_hash=?',(hashed(secret),)).fetchone()[0],1)
+            self.assertEqual(db.execute('SELECT revoked FROM sessions WHERE hash=?',(hashed(first['session_token']),)).fetchone()[0],1)
+            self.assertEqual(db.execute('SELECT revoked FROM sessions WHERE hash=?',(hashed(second['session_token']),)).fetchone()[0],0)
     def test_enrollment_rejects_other_passphrase(self):
         store=AuthStore(Path(self.tmp.name)/'enroll.sqlite',clock=lambda:self.now,enrollment_sha256=hashed('correct-passphrase'))
         key=ec.generate_private_key(ec.SECP256R1())
@@ -134,7 +137,10 @@ class AppBoundaryQA(unittest.TestCase):
         on=self.request('POST','/api/v1/app/live/request-enable',b'{"risk_confirmed":true}')
         self.assertEqual(on.status_code,200);self.assertFalse(on.json()['accepted']);self.assertEqual(on.json()['state'],'LIVE_OFF')
         off=self.request('POST','/api/v1/app/live/disable',b'{}')
-        self.assertEqual(off.json()['state'],'LIVE_OFF');self.assertEqual(off.json()['private_calls'],0)
+        self.assertEqual(off.json()['state'],'LIVE_OFF')
+        self.assertTrue(off.json()['accepted'])
+        self.assertEqual(off.json()['buy_orders'],0)
+        self.assertEqual(off.json()['protection'],'RETAINED')
     def test_hardlock_enable_never_reaches_control(self):
         self.reader.live_status=lambda:{'available':True,'state':'HARD_LOCKED'}
         result=self.request('POST','/api/v1/app/live/request-enable',b'{"risk_confirmed":true}')
@@ -153,6 +159,9 @@ class AppBoundaryQA(unittest.TestCase):
         path='/api/v1/app/live/disable';body=b'{}';h=self.fixture.sign('POST',path,body,session=self.fixture.session)
         self.assertEqual(self.client.post(path,content=body,headers=h).status_code,200)
         self.assertEqual(self.client.post(path,content=body,headers=h).status_code,401)
-        self.assertEqual(self.control.calls,['disable'])
+        self.assertEqual(self.control.calls,[])
+        with self.fixture.store.tx() as db:
+            count=db.execute("SELECT COUNT(*) FROM control_requests WHERE action='disable'").fetchone()[0]
+        self.assertEqual(count,1)
 
 if __name__=='__main__':unittest.main()

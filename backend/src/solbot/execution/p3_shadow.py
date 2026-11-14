@@ -75,7 +75,7 @@ class P3ShadowExecutor(ShadowExecutor):
 
     def _quantity(self,size,price):
         quantity=floor_step(size/price,self.rules.step_size)
-        if quantity*price<300 or quantity<self.rules.min_qty:
+        if quantity*price<self.minimum_notional or quantity<self.rules.min_qty:
             raise ShadowRejected('DENY_ROUNDED_SIZE','rounded order falls below required size')
         if quantity>self.rules.max_qty:raise ShadowRejected('DENY_QUANTITY','quantity exceeds exchange rule')
         initial_stop(price,self.rules.tick_size)
@@ -141,22 +141,62 @@ class P3ShadowExecutor(ShadowExecutor):
                     zlib.compress(json.dumps(json_safe(outputs),sort_keys=True).encode(),9)))
         return digest
 
+    def _signal_stop_distance(self, db, position):
+        distance = Decimal('0.008')
+        max_stop = Decimal('0.02') if position.get('strategy_id') == 'T2' else Decimal('0.015')
+        row = db.execute("SELECT candidate_json FROM shadow_orders WHERE signal_id=? AND side='BUY' ORDER BY created_at DESC LIMIT 1", (position['signal_id'],)).fetchone()
+        if row and row[0]:
+            try:
+                raw = Decimal(str(json.loads(row[0]).get('stop_distance') or '0.008'))
+            except Exception:
+                raw = distance
+            if Decimal('0.008') <= raw <= max_stop:
+                distance = raw
+        return distance
+
+    def _t2_stop_price(self, db, position):
+        return D(position['entry_price']) * (1 - self._signal_stop_distance(db, position))
+
     def _protection(self,db,features,evidence,now_ms):
         outputs=[]
         for raw in db.execute("SELECT * FROM shadow_positions WHERE status='OPEN'").fetchall():
             position=dict(raw)
             context=self._context(position,features,now_ms,{'position':position,'evidence':evidence})
             previous=db.execute('SELECT state_json FROM shadow_protection WHERE position_id=?',(position['position_id'],)).fetchone()
+            sig_distance = self._signal_stop_distance(db, position)
+            structure_stop = None
+            if position['strategy_id'] == 'R2':
+                row = db.execute("SELECT candidate_json FROM shadow_orders WHERE signal_id=? AND side='BUY' LIMIT 1", (position['signal_id'],)).fetchone()
+                structure_stop = floor_step(D(json.loads(row[0])['stop_price']), self.rules.tick_size)
             if previous:
                 state=APTSState.from_dict(json.loads(previous[0]))
                 changed=(state.entry_price!=D(position['entry_price']) or state.quantity!=D(position['quantity']))
                 # Added entry partial fills can tighten but never lower the stop.
-                state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
-                    stop_price=max(state.stop_price,initial_stop(position['entry_price'],self.rules.tick_size)),
-                    last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
+                # Preserve wider signal stop distances (e.g. T1 1.0% or T2 <= 2.0%) rather than overwriting with 0.8%.
+                if structure_stop is not None:
+                    state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
+                        stop_price=max(state.stop_price,structure_stop),
+                        last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
+                elif sig_distance > Decimal('0.008'):
+                    new_stop = max(state.stop_price, initial_stop(position['entry_price'], self.rules.tick_size, stop_distance=sig_distance)) if changed else state.stop_price
+                    state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
+                        stop_price=new_stop,
+                        last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
+                else:
+                    state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
+                        stop_price=max(state.stop_price,initial_stop(position['entry_price'],self.rules.tick_size)),
+                        last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
             else:
                 state=APTSState.create(context,position['entry_price'],position['quantity'],self.rules.tick_size,
-                    entry_fee_rate=self.fee_rate,exit_fee_rate=self.fee_rate,slippage_rate=self.slippage_rate)
+                    entry_fee_rate=self.fee_rate,exit_fee_rate=self.fee_rate,slippage_rate=self.slippage_rate,
+                    stop_distance=sig_distance,entry_time_ms=int(position.get('opened_at') or now_ms),
+                    reversal_confirm_ticks=2)
+                if position['strategy_id']=='T2':
+                    wide=self._t2_stop_price(db,position)
+                    if wide<state.stop_price:
+                        state=replace(state,stop_price=wide)
+                if structure_stop is not None:
+                    state=replace(state,stop_price=structure_stop)
                 # Evaluate the first fresh post-fill quote, including an adverse
                 # spread crossing the initial stop at the moment of entry.
                 state=replace(state,last_decision_time_ms=now_ms-1)

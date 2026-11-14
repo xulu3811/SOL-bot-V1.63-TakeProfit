@@ -15,7 +15,13 @@ from solbot.risk import RiskContract
 from .models import SYMBOLS, amount, identifier, timestamp
 from ._storage import verify_existing_store
 
-RESEARCH_FLAGS = frozenset({"RESEARCH_PARAMETERS_UNVALIDATED", "EXECUTION_QUALITY_UNOBSERVED", "R1_LIVE_PERMANENTLY_DISABLED"})
+RESEARCH_FLAGS = frozenset({
+    "RESEARCH_PARAMETERS_UNVALIDATED",
+    "EXECUTION_QUALITY_UNOBSERVED",
+    "R1_LIVE_PERMANENTLY_DISABLED",
+    "HIGHER_TIMEFRAME_DOWNTREND",
+    "HIGHER_TIMEFRAME_DISAGREEMENT",
+})
 
 
 class ShadowRejected(ValueError):
@@ -27,6 +33,10 @@ class ShadowRejected(ValueError):
 class ShadowExecutor:
     storage_kind = "SHADOW"
     risk_policy = "LEGACY_FORCED_LIQUIDATION_EXPERIMENT"
+
+    @property
+    def minimum_notional(self):
+        return self.risk.minimum_notional
 
     def __init__(self, path, *, symbol="SOLUSDT", account_id="SOL-shadow", fee_rate="0.001"):
         if symbol not in SYMBOLS:
@@ -76,6 +86,9 @@ class ShadowExecutor:
                 status TEXT NOT NULL CHECK(status IN ('OPEN','CLOSED')),
                 opened_at INTEGER NOT NULL, closed_at INTEGER, exit_price TEXT,
                 exit_fee TEXT, realized_pnl TEXT, close_reason TEXT)""")
+            position_columns = {row[1] for row in db.execute("PRAGMA table_info(shadow_positions)")}
+            if "high_price" not in position_columns:
+                db.execute("ALTER TABLE shadow_positions ADD COLUMN high_price TEXT")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -129,7 +142,7 @@ class ShadowExecutor:
         if candidate.get("symbol") != self.symbol:
             raise ShadowRejected("DENY_SYMBOL", "candidate symbol differs from this shadow account")
         strategy = candidate.get("strategy_id")
-        if strategy not in ("T1", "R1"):
+        if strategy not in getattr(self, 'allowed_strategies', ("T1", "R1", "T2")):
             raise ShadowRejected("DENY_STRATEGY", "unsupported strategy")
         flags = candidate.get("risk_flags", [])
         if not isinstance(flags, list) or any(flag not in RESEARCH_FLAGS for flag in flags):
@@ -139,8 +152,8 @@ class ShadowExecutor:
         low, high = amount(candidate.get("entry_low")), amount(candidate.get("entry_high"))
         price = amount(limit_price if limit_price is not None else candidate["entry_high"])
         size = amount(notional, "notional")
-        if not low <= price <= high or not self.risk.minimum_notional <= size <= self.risk.maximum_notional:
-            raise ShadowRejected("DENY_SIZE_PRICE", "order must stay in candidate range and fixed 300–700 USDT bounds")
+        if not low <= price <= high or not self.minimum_notional <= size <= self.risk.maximum_notional:
+            raise ShadowRejected("DENY_SIZE_PRICE", "order must stay within candidate price and account notional bounds")
         encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode()) > 65_536:
             raise ValueError("candidate exceeds 64 KiB")
@@ -316,7 +329,43 @@ class ShadowExecutor:
                 if self._mark_risk(db, bid, quote_ms):
                     fills.extend(self._hard_stop_fills(db, quote_ms))
                     return {"processed": True, "code": "HARD_LOCKED", "fills": fills}
+            self._manage_t2(db, bid, quote_ms)
             return {"processed": True, "code": "QUOTE_PROCESSED", "fills": fills}
+
+    def _manage_t2(self, db, bid, now_ms):
+        """Stop, research trail and 24h exit for T2. T1 positions are untouched."""
+        rows = db.execute("SELECT * FROM shadow_positions WHERE status='OPEN' AND strategy_id='T2'").fetchall()
+        for position in rows:
+            entry = Decimal(position["entry_price"])
+            high = max(Decimal(position["high_price"] or entry), bid)
+            db.execute("UPDATE shadow_positions SET high_price=? WHERE position_id=?", (str(high), position["position_id"]))
+            distance = Decimal("0.008")
+            order = db.execute("SELECT candidate_json FROM shadow_orders WHERE signal_id=? AND side='BUY' ORDER BY created_at DESC LIMIT 1", (position["signal_id"],)).fetchone()
+            if order and order[0]:
+                try:
+                    raw = Decimal(str(json.loads(order[0]).get("stop_distance") or "0.008"))
+                except Exception:
+                    raw = distance
+                if Decimal("0.008") <= raw <= Decimal("0.02"):
+                    distance = raw
+            stop = entry * (1 - distance)
+            trail = max(entry * Decimal("1.01"), high * Decimal("0.995")) if high >= entry * Decimal("1.015") else None
+            if bid <= stop:
+                reason = "t2_stop"
+            elif trail is not None and bid <= trail:
+                reason = "t2_trail"
+            else:
+                continue
+            db.execute("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason=? WHERE position_id=? AND side='SELL' AND status='PENDING'", (reason, position["position_id"]))
+            fee = self._sell_fill(db, position, bid, now_ms, reason)
+            key = "T2_EXIT:" + position["position_id"]
+            db.execute("""INSERT OR IGNORE INTO shadow_orders(order_id,request_key,fingerprint,account_id,symbol,
+                strategy_id,signal_id,side,status,limit_price,quantity,notional,reserved,position_id,
+                created_at,expires_at,fill_at,fill_price,fee,close_reason,candidate_json)
+                VALUES (?,?,?,?,?,?,?,'SELL','FILLED',?,?,?,'0',?,?,?,?,?,?,?,'{}')""",
+                       (self._id(key), key, self._id(key), self.account_id, self.symbol, position["strategy_id"], position["signal_id"],
+                        str(bid), position["quantity"], str(Decimal(position["quantity"]) * bid), position["position_id"],
+                        now_ms, now_ms, now_ms, str(bid), str(fee), reason))
 
     @staticmethod
     def _hard_stop_fills(db, quote_ms):

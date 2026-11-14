@@ -60,7 +60,7 @@ def synthetic_study():
     normal=TrendEvidence(ready=True,atr=Decimal('.4'))
     strong=replace(normal,trend_4h=True,trend_1h=True,trend_15m=True,higher_low_1m=True,higher_low_5m=True,
                    rvol=Decimal(3),buy_ratio=Decimal('.7'),previous_buy_ratio=Decimal('.65'),atr=Decimal('.5'))
-    reversal=replace(normal,structure_broken=True,buy_ratio=Decimal('.3'),previous_buy_ratio=Decimal('.7'))
+    reversal=replace(normal,structure_broken=True,buy_ratio=Decimal('.3'),previous_buy_ratio=Decimal('.7'),rsi=Decimal('40'),previous_rsi=Decimal('52'))
     scenarios={'continuation':[('101',strong),('102',strong),('101.38',strong),('104',strong),('103',reversal)],
         'reversal':[('101',normal),('102',strong),('101.7',reversal),('99',reversal)],
         'gap':[('100.2',normal),('98',normal),('97',normal)],

@@ -17,7 +17,9 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     accelerating = (float(rows[-1]["close"]) < float(rows[-2]["close"]) < float(rows[-3]["close"])
                     and m["adx14"][-1] > m["adx14"][-2])
     confirmed = confirm_1m(candles["1m"], last["close_time"])
-    checks = {"R1_REQUIRES_RANGE": regime == "RANGE", "ACCELERATING_DECLINE": not accelerating,
+    macro_ok = float(candles["4h"][-1]["close"]) >= float(metrics["4h"]["ema50"][-1]) * 0.99
+    checks = {"R1_REQUIRES_RANGE": regime == "RANGE", "MACRO_DOWNTREND_GUARD": macro_ok,
+              "ACCELERATING_DECLINE": not accelerating,
               "RSI_OVERSOLD_NOT_RECOVERED": recovery, "RVOL_BELOW_1_5": participation,
               "TAKER_BUY_NOT_RECOVERED": buyers, "FIVE_MINUTE_FLOOR_UNCONFIRMED": stabilizing,
               "ONE_MINUTE_BREAKOUT_UNCONFIRMED": confirmed}

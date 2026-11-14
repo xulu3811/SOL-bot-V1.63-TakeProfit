@@ -8,6 +8,7 @@ from solbot.storage.models import timestamp_ms as timestamp
 from .decimal_utils import D, ZERO, canonical_hash, json_safe
 
 ACCOUNTS = {"SOLUSDT": "SOL-shadow", "SUIUSDT": "SUI-live"}
+ALLOWED_ACCOUNTS = {"SOLUSDT": ("SOL-shadow", "SOL-live"), "SUIUSDT": ("SUI-live",)}
 
 
 def identifier(value):
@@ -29,9 +30,9 @@ class DecisionContext:
     input_hash: str
 
     def __post_init__(self):
-        if ACCOUNTS.get(self.symbol) != self.account_id:
+        if self.account_id not in ALLOWED_ACCOUNTS.get(self.symbol, ()):
             raise ValueError("symbol/account isolation violation")
-        if self.strategy_id not in ("T1", "R1"):
+        if self.strategy_id not in ("T1", "R1", "T2", "R2"):
             raise ValueError("unsupported strategy")
         identifier(self.strategy_version)
         identifier(self.signal_id)

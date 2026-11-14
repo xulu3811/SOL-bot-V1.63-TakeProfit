@@ -78,8 +78,9 @@ class AuthStore:
         with self.tx() as db:
             self._consume(db,'pairing',nonce,rid)
             bound=db.execute('SELECT id,revoked FROM devices WHERE passphrase_hash=?',(fingerprint,)).fetchone()
-            if bound and not bound[1]:raise AuthError('PASSPHRASE_ALREADY_BOUND')
-            if bound:db.execute('DELETE FROM devices WHERE id=?',(bound[0],))
+            if bound:
+                db.execute('UPDATE sessions SET revoked=1 WHERE device_id=?',(bound[0],))
+                db.execute('DELETE FROM devices WHERE id=?',(bound[0],))
             device=secrets.token_hex(16)
             try:db.execute('INSERT INTO devices VALUES(?,?,?,?,0,?,?)',(device,value['public_key_pem'],name,'operator',self.clock(),fingerprint))
             except sqlite3.IntegrityError:raise AuthError('DEVICE_ALREADY_PAIRED') from None

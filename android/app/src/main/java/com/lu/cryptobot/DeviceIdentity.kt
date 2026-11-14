@@ -18,14 +18,14 @@ object RequestProtocol {
 }
 
 @Singleton class DeviceIdentity @Inject constructor() {
-    private val alias = "solbot-device-v1"
+    private val alias = "solbot-device-v2"
     private fun store() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     fun ensure() {
         if (store().containsAlias(alias)) return
         val generator=KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC,"AndroidKeyStore")
         generator.initialize(KeyGenParameterSpec.Builder(alias,KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
             .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1")).setDigests(KeyProperties.DIGEST_SHA256)
-            .setUserAuthenticationRequired(true).setUserAuthenticationValidityDurationSeconds(30).build())
+            .setUserAuthenticationRequired(false).build())
         generator.generateKeyPair()
     }
     fun publicPem(): String { ensure(); return "-----BEGIN PUBLIC KEY-----\n"+Base64.encodeToString(store().getCertificate(alias).publicKey.encoded,Base64.NO_WRAP)+"\n-----END PUBLIC KEY-----" }

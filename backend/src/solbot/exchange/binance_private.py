@@ -9,8 +9,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from solbot.storage.models import LIVE_SYMBOLS, resolve_live_account
+
 ACCOUNT='SUI-live'
-SYMBOLS=frozenset(('SUIUSDT','BNBUSDT'))
+SYMBOLS=LIVE_SYMBOLS
 READ_PATHS=frozenset(('/api/v3/account','/api/v3/openOrders','/api/v3/order','/api/v3/allOrders','/api/v3/myTrades','/api/v3/account/commission','/sapi/v1/account/apiRestrictions'))
 WRITE_PATHS=frozenset(('/api/v3/order','/api/v3/orderList/oco','/api/v3/orderList/otoco','/api/v3/orderList','/api/v3/order/cancelReplace'))
 
@@ -76,8 +78,11 @@ class HTTPTransport:
     def close(self): pass
 
 class BinancePrivate:
-    def __init__(self,credential_loader,transport=None,gate=None,*,clock=None,recv_window=5000):
+    def __init__(self,credential_loader,transport=None,gate=None,*,clock=None,recv_window=5000,account_id='SUI-live',symbols=None):
         if type(recv_window) is not int or not 1<=recv_window<=5000: raise ValueError('bounded recvWindow required')
+        acct,primary,_=resolve_live_account(account_id)
+        self.account_id=acct
+        self.allowed_symbols=frozenset(symbols) if symbols is not None else frozenset((primary,'BNBUSDT'))
         self.loader=credential_loader; self.transport=transport if transport is not None else HTTPTransport()
         self.gate=gate if gate is not None else ClosedGate(); self.clock=clock or (lambda:time.time_ns()//1000000)
         self.recv_window=recv_window; self.offset=0; self.synced_at=None; self.blocked_until=0; self.used_weight=0
@@ -87,11 +92,11 @@ class BinancePrivate:
 
     def _authorize(self,scope,symbol=None):
         if self.closed: raise AuthorizationDenied('private adapter closed')
-        if symbol is not None and symbol not in SYMBOLS: raise AuthorizationDenied('wrong live symbol')
+        if symbol is not None and symbol not in self.allowed_symbols: raise AuthorizationDenied('wrong live symbol')
         # The production release gate runs before invoking even a credential loader.
         if type(self.transport) is not MockTransport:
             HTTPTransport._require_accepted_release()
-        self.gate.require('PRIVATE_READ' if scope=='READ' else scope,ACCOUNT,symbol)
+        self.gate.require('PRIVATE_READ' if scope=='READ' else scope,self.account_id,symbol)
 
     def sync_time(self,server_time,*,sent_at,received_at):
         if any(type(x) is not int for x in (server_time,sent_at,received_at)) or not 0<=received_at-sent_at<=1000:

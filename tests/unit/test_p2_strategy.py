@@ -216,6 +216,45 @@ class StrategyTests(unittest.TestCase):
         self.assertGreaterEqual(result["score"], 75)
         self.assertFalse(result["accepted"])
 
+    def test_t1_oversold_climax_exhaustion_rebound_accepts_in_downtrend(self):
+        from solbot.strategy import t1_pullback
+        candles = {
+            "5m": [
+                {"close_time": BOUNDARY - 600000, "open": "77.0", "high": "77.1", "low": "75.02", "close": "75.20",
+                 "quote_volume": "120000", "taker_buy_quote_volume": "40000"},
+                {"close_time": BOUNDARY - 300000, "open": "75.20", "high": "75.79", "low": "75.34", "close": "75.60",
+                 "quote_volume": "70000", "taker_buy_quote_volume": "36000"},
+                {"close_time": BOUNDARY, "open": "75.60", "high": "75.92", "low": "75.53", "close": "75.85",
+                 "quote_volume": "60000", "taker_buy_quote_volume": "33500"},
+            ] * 2,
+            "1m": [
+                {"close_time": BOUNDARY - 120000, "open": "75.60", "high": "75.72", "low": "75.55", "close": "75.68"},
+                {"close_time": BOUNDARY - 60000, "open": "75.68", "high": "75.80", "low": "75.65", "close": "75.78"},
+                {"close_time": BOUNDARY, "open": "75.78", "high": "75.92", "low": "75.75", "close": "75.85"},
+            ],
+            "4h": [{"close": "75.85"}],
+        }
+        # Ensure last 3 5m bars have the exact plunge -> higher low -> breakout sequence
+        candles["5m"] = candles["5m"][:3] + [
+            {"close_time": BOUNDARY - 600000, "open": "77.0", "high": "77.1", "low": "75.02", "close": "75.20",
+             "quote_volume": "120000", "taker_buy_quote_volume": "40000"},
+            {"close_time": BOUNDARY - 300000, "open": "75.20", "high": "75.79", "low": "75.34", "close": "75.60",
+             "quote_volume": "70000", "taker_buy_quote_volume": "36000"},
+            {"close_time": BOUNDARY, "open": "75.60", "high": "75.92", "low": "75.53", "close": "75.85",
+             "quote_volume": "60000", "taker_buy_quote_volume": "33500"},
+        ]
+        metrics = {
+            "5m": {"rsi6": [35.0, 24.0, 16.0, 11.4, 21.5, 32.8], "rvol20": [1.0, 1.2, 1.9, 2.8, 1.4, 1.1], "vwap20": [77.10]},
+            "15m": {"rsi6": [22.0, 18.5, 20.1]},
+            "1h": {"rsi6": [24.0, 22.5], "adx14": [28.0]},
+            "4h": {"ema20": [80.5]},
+        }
+        factors, reasons = t1_pullback.assess(candles, metrics, "DOWNTREND")
+        self.assertEqual(reasons, [])
+        factors["execution"] = 0.5
+        scored = score(factors)
+        self.assertGreaterEqual(scored["score"], 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()

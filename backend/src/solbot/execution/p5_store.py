@@ -7,21 +7,23 @@ import hashlib
 from solbot.accounts.allocation_ledger import encoded, now_ms
 
 class OrderStore:
-    def __init__(self,path):
+    def __init__(self,path,*,account_id='SUI-live'):
+        from solbot.storage.models import resolve_live_account
+        self.account_id=resolve_live_account(account_id)[0]
         self.path=Path(path).resolve(); self.path.parent.mkdir(parents=True,exist_ok=True)
         with self.tx(init=True) as db:
             tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if tables and 'p5_owner' not in tables: raise ValueError('foreign order database')
             if not tables:
                 db.execute("CREATE TABLE p5_owner(version INTEGER,account_id TEXT)")
-                db.execute("INSERT INTO p5_owner VALUES(5,'SUI-live')")
+                db.execute("INSERT INTO p5_owner VALUES(5,?)",(self.account_id,))
                 db.execute('CREATE TABLE orders(client_id TEXT PRIMARY KEY,intent_id TEXT UNIQUE NOT NULL,fingerprint TEXT NOT NULL,payload TEXT NOT NULL,purpose TEXT NOT NULL,state TEXT NOT NULL,exchange_id TEXT,cumulative TEXT NOT NULL,quote TEXT NOT NULL,last_time INTEGER NOT NULL,terminal TEXT,created_at INTEGER NOT NULL)')
                 db.execute('CREATE TABLE order_events(event_id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at INTEGER NOT NULL)')
                 db.execute('CREATE TABLE outbox(event_id TEXT PRIMARY KEY,payload TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0)')
                 db.execute('CREATE TABLE fills(trade_key TEXT PRIMARY KEY,client_id TEXT NOT NULL,payload TEXT NOT NULL)')
                 db.execute('CREATE TABLE execution_state(singleton INTEGER PRIMARY KEY,state TEXT NOT NULL,reason TEXT NOT NULL)')
                 db.execute("INSERT INTO execution_state VALUES(1,'LIVE_OFF','P6_NOT_ACCEPTED')")
-            if tuple(db.execute('SELECT * FROM p5_owner').fetchone())!=(5,'SUI-live'): raise ValueError('schema or account mismatch')
+            if tuple(db.execute('SELECT * FROM p5_owner').fetchone())!=(5,self.account_id): raise ValueError('schema or account mismatch')
         with closing(self.connect()) as db: db.execute('PRAGMA journal_mode=WAL')
     def connect(self):
         db=sqlite3.connect(self.path,timeout=15,isolation_level=None); db.row_factory=sqlite3.Row
@@ -31,7 +33,7 @@ class OrderStore:
         with closing(self.connect()) as db:
             db.execute('BEGIN IMMEDIATE')
             try:
-                if not init and tuple(db.execute('SELECT * FROM p5_owner').fetchone())!=(5,'SUI-live'): raise ValueError('stale writer')
+                if not init and tuple(db.execute('SELECT * FROM p5_owner').fetchone())!=(5,self.account_id): raise ValueError('stale writer')
                 yield db; db.commit()
             except BaseException: db.rollback(); raise
     def get(self,client_id):

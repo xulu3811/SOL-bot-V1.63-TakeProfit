@@ -28,8 +28,9 @@ class ExposureManager:
             pos=db.execute('SELECT * FROM robot_positions WHERE intent_id=?',(intent_id,)).fetchone()
             oldqty=D(pos['quantity']) if pos else D('0'); oldcost=D(pos['cost']) if pos else D('0'); oldrisk=D(pos['risk']) if pos else D('0')
             protection=pos['protection'] if pos else json.dumps({'stop_price':request['stop_price'],'native_status':'UNVERIFIED','responsibility':'KEEP_PROTECTION'})
-            db.execute('INSERT INTO robot_positions VALUES(?,?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET quantity=excluded.quantity,cost=excluded.cost,risk=excluded.risk',(intent_id,'SUI',str(oldqty+qty),str(oldcost+qty*px),str(oldrisk+allocated_risk),protection))
-            self.ledger.set_owned(db,'SUI','ROBOT_OWNED',self.ledger.owned(db,'SUI')+qty)
+            asset=getattr(self.ledger,'base_asset','SUI')
+            db.execute('INSERT INTO robot_positions VALUES(?,?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET quantity=excluded.quantity,cost=excluded.cost,risk=excluded.risk',(intent_id,asset,str(oldqty+qty),str(oldcost+qty*px),str(oldrisk+allocated_risk),protection))
+            self.ledger.set_owned(db,asset,'ROBOT_OWNED',self.ledger.owned(db,asset)+qty)
             db.execute("INSERT OR IGNORE INTO pending_actions VALUES(?,'VERIFY_PROTECTION',?,'PENDING')",('protection:'+intent_id,intent_id))
 
     def cancel_request(self,event_id,intent_id,*,at=None):

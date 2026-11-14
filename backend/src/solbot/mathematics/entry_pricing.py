@@ -19,7 +19,8 @@ def price_entry(context, features, *, signal_max_price, notional, atr,
         raise ValueError("unsupported pricing mode")
     ceiling, amount, volatility = D(signal_max_price, positive=True), D(notional, positive=True), D(atr, nonnegative=True)
     stop, chase = D(stop_distance, positive=True), D(max_chase_bps, nonnegative=True) / 10_000
-    if stop != Decimal("0.008") or chase > Decimal("0.005"):
+    max_stop = Decimal("0.020") if getattr(context, "strategy_id", None) == "T2" else Decimal("0.015")
+    if stop < Decimal("0.008") or stop > max_stop or chase > Decimal("0.005"):
         raise ValueError("initial stop cannot widen; chase research cap is 50bps")
     reasons = list(feature_reasons(context, features))
     if not Decimal("300") <= amount <= Decimal("700"):

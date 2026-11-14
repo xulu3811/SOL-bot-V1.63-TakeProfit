@@ -90,11 +90,15 @@ class StrategyStore:
         if symbol:
             query += " AND symbol=?"
             args.append(symbol)
-        # Filter expiration at SQL level so an old accepted page cannot hide
-        # later fresh decisions indefinitely from a polling consumer.
+        # Filter expiration at SQL level using the stored expires_at (falling back
+        # to candidate_time + 300000) so multi-horizon strategies (e.g. T2 15m)
+        # are never prematurely truncated.
         if now_ms is not None:
             timestamp_ms(now_ms)
-            query += " AND signal_time<=? AND candidate_time+300000>?"
+            query += (
+                " AND signal_time<=?"
+                " AND COALESCE(CAST(json_extract(payload_json,'$.expires_at') AS INTEGER),candidate_time+300000)>?"
+            )
             args.extend((now_ms, now_ms))
         query += " ORDER BY id LIMIT ?"
         args.append(limit)
@@ -102,7 +106,7 @@ class StrategyStore:
                 for row in self.connection.execute(query, args)]
 
     def persist(self, symbol: str, as_of_ms: int, results: list[dict], source: dict,
-                now_ms: int | None = None) -> list[dict]:
+                now_ms: int | None = None, *, cooldown_ms: int = 3_600_000) -> list[dict]:
         with self.transaction() as conn:
             previous = conn.execute("SELECT last_close_time FROM checkpoints WHERE symbol=?", (symbol,)).fetchone()
             if previous and previous[0] >= as_of_ms:
@@ -119,6 +123,15 @@ class StrategyStore:
                         (symbol, result["candidate_time"])).fetchone():
                     result["accepted"] = False
                     result["reasons"].append("DUPLICATE_CANDIDATE")
+                if result["accepted"] and cooldown_ms > 0:
+                    recent = conn.execute(
+                        "SELECT signal_time FROM decisions WHERE symbol=? AND strategy_id=? AND accepted=1 "
+                        "AND candidate_time!=? AND signal_time>? ORDER BY signal_time DESC LIMIT 1",
+                        (symbol, result["strategy_id"], result["candidate_time"], as_of_ms - cooldown_ms),
+                    ).fetchone()
+                    if recent is not None:
+                        result["accepted"] = False
+                        result["reasons"].append("STRATEGY_COOLDOWN_ACTIVE")
                 conn.execute("""INSERT INTO decisions(symbol,strategy_id,signal_time,candidate_time,
                     accepted,strategy_version,signal_id,payload_json) VALUES (?,?,?,?,?,?,?,?)""",
                              (symbol, result["strategy_id"], as_of_ms, result["candidate_time"],
@@ -134,12 +147,15 @@ class StrategyStore:
 
 
 class Scheduler:
-    def __init__(self, market_db: str | Path, store: StrategyStore, symbol: str):
+    def __init__(self, market_db: str | Path, store: StrategyStore, symbol: str,
+                 *, micro_status_path: str | Path | None = None, cooldown_ms: int = 3_600_000):
         if symbol not in SYMBOLS:
             raise ValueError("unsupported symbol")
         self.market_path, self.store, self.symbol = Path(market_db).expanduser().resolve(), store, symbol
         if self.market_path == self.store.path:
             raise ValueError("market and strategy databases must be separate")
+        self.micro_status_path = micro_status_path
+        self.cooldown_ms = cooldown_ms
         self._cache: dict[str, list[dict]] = {}
         self._source_validated = False
 
@@ -190,8 +206,15 @@ class Scheduler:
             conn.execute("BEGIN")
             inputs = self._inputs(conn, as_of_ms)
         selected, _ = prepare(self.symbol, inputs, as_of_ms)
-        results = evaluate(self.symbol, inputs, as_of_ms)
-        return self.store.persist(self.symbol, as_of_ms, results, provenance(selected), now_ms)
+        micro = None
+        if now_ms is not None and self.symbol == "SOLUSDT":
+            from solbot.app_api.micro_feed import read_micro_snapshot
+            micro = read_micro_snapshot(self.micro_status_path, now_ms=now_ms)
+        results = evaluate(self.symbol, inputs, as_of_ms, micro_features=micro)
+        return self.store.persist(
+            self.symbol, as_of_ms, results, provenance(selected), now_ms,
+            cooldown_ms=self.cooldown_ms if now_ms is not None else 0,
+        )
 
     def tick(self, now_ms: int | None = None) -> dict:
         now_ms = time.time_ns() // 1_000_000 if now_ms is None else timestamp_ms(now_ms)
@@ -240,8 +263,8 @@ class Report:
     def __init__(self, symbol: str, mode: str):
         self.symbol, self.mode = symbol, mode
         self.processed = 0
-        self.counts = {name: Counter() for name in ("T1", "R1")}
-        self.reasons = {name: Counter() for name in ("T1", "R1")}
+        self.counts = {name: Counter() for name in ("T1", "R1", "T2")}
+        self.reasons = {name: Counter() for name in ("T1", "R1", "T2")}
         self.regimes = Counter()
         self.samples: dict[str, dict] = {}
         self.first = self.last = None

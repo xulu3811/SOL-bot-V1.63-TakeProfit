@@ -36,6 +36,14 @@ data/*.json
 data/*.jsonl
 data/*.txt
 data/p*-server/
+data/**/*.sqlite
+data/**/*.sqlite-*
+data/**/*.tar.gz
+data/**/*.csv
+data/rebound-*/
+data/audit-*/
+1年SOL历史数据存放位置.txt
+止盈止损策略优化---gemini-code-*.md
 
 # OS / IDE
 desktop.ini

@@ -144,7 +144,7 @@ class RealReplayTests(unittest.TestCase):
             self.assertEqual(left, right)
             self.assertGreater(left["decisions"]["payload_count"], 0)
             self.assertGreater(report["missing_historical_depth_decisions"], 0)
-            self.assertEqual(set(left["report"]["counts"]), {"T1", "R1"})
+            self.assertEqual(set(left["report"]["counts"]), {"T1", "R1", "T2"})
             math = report["math_passes"][0]
             self.assertEqual(math["coverage"]["AVAILABLE"], 1)
             self.assertEqual(math["output_statuses"]["T1:expected_return:INSUFFICIENT_EVIDENCE"], 1)

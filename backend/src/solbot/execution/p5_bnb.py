@@ -27,7 +27,10 @@ def commission_value(commission,asset,prices):
     return fee*D(prices[asset],positive=True)
 
 class BNBExecution:
-    def __init__(self,path,executor,gate,guardian):
+    def __init__(self,path,executor,gate,guardian,*,account_id=None):
+        from solbot.storage.models import LIVE_ACCOUNTS, resolve_live_account
+        raw_acct=account_id if account_id is not None else getattr(gate,'account_id',None)
+        self.account_id=resolve_live_account(raw_acct if raw_acct in LIVE_ACCOUNTS else 'SUI-live')[0]
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
         self.executor,self.gate,self.guardian=executor,gate,guardian
         with self.tx() as db:
@@ -43,7 +46,7 @@ class BNBExecution:
             except BaseException: db.rollback();raise
 
     def refill(self,intent_id,*,robot_bnb,free_bnb,price,free_usdt,robot_cash,step,min_notional,hard_locked=False):
-        self.gate.require('TRADE',account_id='SUI-live',symbol='BNBUSDT')
+        self.gate.require('TRADE',account_id=self.account_id,symbol='BNBUSDT')
         owned,available,px=D(robot_bnb,nonnegative=True),D(free_bnb,nonnegative=True),D(price,positive=True)
         if hard_locked or min(owned,available)*px>=3: raise ValueError('refill not authorized or not needed')
         qty=ceil_step(max(D('10'),D(min_notional,positive=True))/px,D(step,positive=True)); amount=qty*px

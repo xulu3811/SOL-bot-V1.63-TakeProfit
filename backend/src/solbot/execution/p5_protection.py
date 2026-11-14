@@ -12,7 +12,11 @@ ACTIVE = {'NEW','PARTIALLY_FILLED'}
 class ProtectionError(ValueError): pass
 
 class ProtectionManager:
-    def __init__(self,path,executor,gate):
+    def __init__(self,path,executor,gate,*,account_id=None,symbol=None):
+        from solbot.storage.models import LIVE_ACCOUNTS, resolve_live_account
+        raw_acct=account_id if account_id is not None else getattr(gate,'account_id',None)
+        acct=raw_acct if raw_acct in LIVE_ACCOUNTS else 'SUI-live'
+        self.account_id,self.symbol,_=resolve_live_account(acct,symbol)
         self.path=Path(path); self.executor=executor; self.gate=gate
         self.path.parent.mkdir(parents=True,exist_ok=True)
         with self.tx() as db:
@@ -29,7 +33,8 @@ class ProtectionManager:
 
     @staticmethod
     def plan(symbol,quantity,stop_price,limit_price,exchange_info,*,trailing_delta=None):
-        if symbol!='SUIUSDT' or exchange_info.get('symbol')!=symbol or exchange_info.get('status')!='TRADING' or exchange_info.get('isSpotTradingAllowed') is not True:
+        from solbot.storage.models import LIVE_ACCOUNT_BY_SYMBOL
+        if symbol not in LIVE_ACCOUNT_BY_SYMBOL or exchange_info.get('symbol')!=symbol or exchange_info.get('status')!='TRADING' or exchange_info.get('isSpotTradingAllowed') is not True:
             raise ProtectionError('unsupported or inactive protection market')
         types=exchange_info.get('orderTypes',[])
         kind='STOP_LOSS' if 'STOP_LOSS' in types else 'STOP_LOSS_LIMIT' if 'STOP_LOSS_LIMIT' in types else None
@@ -55,7 +60,9 @@ class ProtectionManager:
         return result
 
     def install(self,position_id,symbol,quantity,owned_quantity,stop_price,limit_price,exchange_info,*,trailing_delta=None,previous_id=None,generation=None):
-        self.gate.require('PROTECT',account_id='SUI-live',symbol=symbol)
+        from solbot.storage.models import LIVE_ACCOUNT_BY_SYMBOL
+        acct=LIVE_ACCOUNT_BY_SYMBOL.get(symbol,self.account_id)
+        self.gate.require('PROTECT',account_id=acct,symbol=symbol)
         params=self.plan(symbol,quantity,stop_price,limit_price,exchange_info,trailing_delta=trailing_delta)
         identity=json.dumps([position_id,params,generation],sort_keys=True,separators=(',',':'))
         client_id='p5p-'+hashlib.sha256(identity.encode()).hexdigest()[:28]
@@ -83,12 +90,12 @@ class ProtectionManager:
                 return dict(row)
             return [dict(r) for r in db.execute('SELECT * FROM native_protection')]
 
-    def initial(self,position_id,quantity,owned_quantity,entry_price,exchange_info):
+    def initial(self,position_id,quantity,owned_quantity,entry_price,exchange_info,*,stop_distance=None):
         from solbot.mathematics.protective_stop import initial_stop,stop_limit_price
         filters={f['filterType']:f for f in exchange_info['filters']}
         tick=filters['PRICE_FILTER']['tickSize']
-        stop=initial_stop(entry_price,tick)
-        return self.install(position_id,'SUIUSDT',quantity,owned_quantity,stop,stop_limit_price(stop,tick),exchange_info)
+        stop=initial_stop(entry_price,tick) if stop_distance is None else initial_stop(entry_price,tick,stop_distance=stop_distance)
+        return self.install(position_id,self.symbol,quantity,owned_quantity,stop,stop_limit_price(stop,tick),exchange_info)
 
     def observe(self,event_id,event):
         """Called only with authenticated exchange/order-query evidence by the engine."""
@@ -115,10 +122,12 @@ class ProtectionManager:
             db.execute('UPDATE native_protection SET state=?,executed=?,exchange_id=?,alert=? WHERE client_id=?',(status,str(cumulative),str(exchange_id) if exchange_id is not None else row['exchange_id'],alert,client_id))
 
     def update(self,client_id,new_stop,limit_price,owned_quantity,exchange_info):
+        from solbot.storage.models import LIVE_ACCOUNT_BY_SYMBOL
         row=self.snapshot(client_id)
         if D(new_stop)<D(row['stop']): raise ProtectionError('protective stop cannot decrease')
         if D(new_stop)==D(row['stop']): return row
-        self.gate.require('PROTECT',account_id='SUI-live',symbol=row['symbol'])
+        acct=LIVE_ACCOUNT_BY_SYMBOL.get(row['symbol'],self.account_id)
+        self.gate.require('PROTECT',account_id=acct,symbol=row['symbol'])
         if row['state'] not in ACTIVE: raise ProtectionError('old protection state not confirmed')
         # Never cancel first. A separate independently owned free tranche must
         # cover the new order until the old cancellation is positively confirmed.
@@ -134,12 +143,14 @@ class ProtectionManager:
         return new
 
     def apply_apts(self,client_id,decision,owned_quantity,exchange_info):
+        from solbot.storage.models import LIVE_ACCOUNT_BY_SYMBOL
         row=self.snapshot(client_id)
-        if decision.context.symbol!=row['symbol'] or decision.context.account_id!='SUI-live': raise ProtectionError('APTS ownership mismatch')
+        expected_acct=LIVE_ACCOUNT_BY_SYMBOL.get(row['symbol'],self.account_id)
+        if decision.context.symbol!=row['symbol'] or decision.context.account_id!=expected_acct: raise ProtectionError('APTS ownership mismatch')
         if decision.status in ('DATA_UNAVAILABLE','DUPLICATE_OR_OLD_EVENT'): return row
         if decision.exit_required:
             if row['alert'].startswith('APTS_EXIT_'): raise ProtectionError('prior APTS exit requires order reconciliation')
-            self.gate.require('PROTECT',account_id='SUI-live',symbol=row['symbol'])
+            self.gate.require('PROTECT',account_id=expected_acct,symbol=row['symbol'])
             qty=D(row['quantity'])-D(row['executed'])
             intent='p5x-'+hashlib.sha256((client_id+str(decision.context.decision_time_ms)).encode()).hexdigest()[:28]
             params={'symbol':row['symbol'],'side':'SELL','type':'LIMIT','timeInForce':'GTC','quantity':str(qty),'price':str(decision.limit_price),'newClientOrderId':intent}

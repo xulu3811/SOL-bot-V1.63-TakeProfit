@@ -4,8 +4,9 @@ from .allocation_ledger import D, encoded, now_ms
 class BalanceReconciliation:
     def __init__(self,ledger): self.ledger=ledger
 
-    def reconcile(self,event_id,balances,observed_at,*,account_id='SUI-live',unknown_orders=False,at=None):
+    def reconcile(self,event_id,balances,observed_at,*,account_id=None,unknown_orders=False,at=None):
         at=now_ms() if at is None else at
+        if account_id is None: account_id=self.ledger.account_id
         if account_id!=self.ledger.account_id: raise ValueError('wrong account snapshot')
         with self.ledger.transaction() as db:
             payload={'balances':balances,'observed_at':observed_at,'unknown_orders':unknown_orders,'account_id':account_id}

@@ -9,7 +9,13 @@ plugins {
 android {
     namespace = "com.lu.cryptobot"
     compileSdk = 36
-    defaultConfig { applicationId = "com.lu.cryptobot"; minSdk = 26; targetSdk = 36; versionCode = 107; versionName = "1.07"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    defaultConfig { applicationId = "com.lu.cryptobot"; minSdk = 26; targetSdk = 36; versionCode = 141; versionName = "1.41"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
@@ -26,7 +32,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.1")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.1")
     implementation("androidx.navigation:navigation-compose:2.9.0")
-    implementation("androidx.biometric:biometric:1.1.0")
     implementation("com.google.dagger:hilt-android:2.57.2")
     ksp("com.google.dagger:hilt-compiler:2.57.2")
     implementation("androidx.room:room-runtime:2.6.1")
@@ -39,4 +44,37 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.16.0"))
     implementation("com.google.firebase:firebase-messaging")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
+
+val exportReleaseApk by tasks.registering(Copy::class) {
+    val ver = android.defaultConfig.versionName ?: "1.01"
+    from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
+    into(rootProject.projectDir.parentFile.resolve("release"))
+    rename { "SOL-bot v$ver.apk" }
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy(exportReleaseApk)
+}
+
+tasks.register("bumpVersion") {
+    doLast {
+        val f = project.buildFile
+        val text = f.readText()
+        val verMatch = Regex("""versionName\s*=\s*"(\d+)\.(\d+)"""").find(text)
+            ?: error("versionName not found")
+        val major = verMatch.groupValues[1].toInt()
+        val minor = verMatch.groupValues[2].toInt() + 1
+        val nextVer = if (minor >= 100) "${major + 1}.00" else "$major.${minor.toString().padStart(2, '0')}"
+        val codeMatch = Regex("""versionCode\s*=\s*(\d+)""").find(text)
+            ?: error("versionCode not found")
+        val nextCode = codeMatch.groupValues[1].toInt() + 1
+        val updated = text
+            .replaceFirst(verMatch.value, """versionName = "$nextVer"""")
+            .replaceFirst(codeMatch.value, """versionCode = $nextCode""")
+        f.writeText(updated)
+        println("Bumped version -> $nextVer (versionCode=$nextCode)")
+    }
+}
+

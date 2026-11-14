@@ -16,7 +16,11 @@ from .p5_protection import ProtectionManager,ACTIVE,TERMINAL
 from .p5_bnb import BNBExecution
 
 class ExecutionSystem:
-    def __init__(self,path,engine,protection,reader,guardian,gate,exchange_info_provider,price_provider,*,clock=now_ms):
+    def __init__(self,path,engine,protection,reader,guardian,gate,exchange_info_provider,price_provider,*,clock=now_ms,account_id=None,symbol=None):
+        from solbot.storage.models import LIVE_ACCOUNTS, resolve_live_account
+        raw_acct=account_id or getattr(getattr(guardian,'ledger',None),'account_id',None) or getattr(gate,'account_id',None)
+        acct=raw_acct if raw_acct in LIVE_ACCOUNTS else 'SUI-live'
+        self.account_id,self.symbol,self.base_asset=resolve_live_account(acct,symbol)
         self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True)
         self.engine,self.protection,self.reader,self.guardian,self.gate=engine,protection,reader,guardian,gate
         self.exchange_info_provider,self.price_provider,self.clock=exchange_info_provider,price_provider,clock
@@ -47,7 +51,7 @@ class ExecutionSystem:
     def on_position(self,position_id):
         """Engine invokes only after its ENTRY fill outbox is durably settled."""
         try:
-            self.gate.require('PRIVATE_READ',account_id='SUI-live',symbol='SUIUSDT')
+            self.gate.require('PRIVATE_READ',account_id=self.account_id,symbol=self.symbol)
             with self.engine.store.tx() as db:
                 orders=[dict(r) for r in db.execute('SELECT * FROM orders')]
                 outbox_unknown=db.execute('SELECT 1 FROM outbox WHERE delivered=0').fetchone() is not None
@@ -55,7 +59,7 @@ class ExecutionSystem:
             by_id={r['client_id']:r for r in orders}
             manual=[]
             known=[]
-            for symbol in ('SUIUSDT','BNBUSDT'):
+            for symbol in (self.symbol,'BNBUSDT'):
                 for order in self.reader.open_orders(symbol):
                     local=by_id.get(order.get('clientOrderId'))
                     if local is None:manual.append(order.get('orderId'));unknown=True
@@ -63,11 +67,11 @@ class ExecutionSystem:
                     else: known.append({'client_id':local['client_id'],'purpose':local['purpose'],'symbol':symbol,'status':order['status'],'remaining_quantity':str(D(order.get('origQty',json.loads(local['payload'])['quantity']))-D(order.get('executedQty','0')))})
             account=self.reader.account()
             balances=AccountReader.normalize_account(account)
-            outcome=self.guardian.reconcile({'event_id':'protect-reconcile:'+str(uuid.uuid4()),'account_id':'SUI-live','balances':balances,'observed_at':self.clock(),'unknown_orders':unknown,'manual_orders':manual,'known_orders':known})
+            outcome=self.guardian.reconcile({'event_id':'protect-reconcile:'+str(uuid.uuid4()),'account_id':self.account_id,'balances':balances,'observed_at':self.clock(),'unknown_orders':unknown,'manual_orders':manual,'known_orders':known})
             if outcome!='RECONCILED' and not (isinstance(outcome,dict) and outcome.get('status')=='RECONCILED'):
                 raise ValueError('ACCOUNT_RECONCILIATION_REQUIRED')
             position=self.guardian.position(position_id)
-            if position.get('intent_id',position_id)!=position_id or position.get('asset')!='SUI':raise ValueError('POSITION_IDENTITY_MISMATCH')
+            if position.get('intent_id',position_id)!=position_id or position.get('asset')!=self.base_asset:raise ValueError('POSITION_IDENTITY_MISMATCH')
             quantity=D(position['quantity'],nonnegative=True)
             if quantity==0:return self._record(position_id,'CLOSED',quantity='0')
             rows=[r for r in self.protection.snapshot() if r['position_id']==position_id]
@@ -75,20 +79,20 @@ class ExecutionSystem:
             covered=sum((D(r['quantity'])-D(r['executed']) for r in rows if r['state'] in ACTIVE),D('0'))
             if covered>quantity:raise ValueError('PROTECTION_EXCEEDS_OWNED_POSITION')
             if covered==quantity:return self._record(position_id,'PROTECTED',quantity=str(quantity),covered=str(covered))
-            info=self.exchange_info_provider('SUIUSDT')
+            info=self.exchange_info_provider(self.symbol)
             filters={f['filterType']:f for f in info['filters']}
             step=D(filters['LOT_SIZE']['stepSize'],positive=True);tick=D(filters['PRICE_FILTER']['tickSize'],positive=True)
             remainder=quantity-covered;tradable=floor_step(remainder,step);dust=remainder-tradable
             if tradable==0:raise ValueError('PROTECTION_QUANTITY_BELOW_LOT_STEP')
             protection=position['protection'];protection=json.loads(protection) if isinstance(protection,str) else protection
             stop=ceil_step(protection['stop_price'],tick)
-            market=self.price_provider('SUIUSDT')
+            market=self.price_provider(self.symbol)
             if not isinstance(market,dict) or type(market.get('at')) is not int or not 0<=self.clock()-market['at']<=2000:
                 raise ValueError('PROTECTION_MARKET_STALE')
             if D(market['bid'],positive=True)<=stop:raise ValueError('INITIAL_STOP_ALREADY_BREACHED')
             # Each partial-fill tranche uses cumulative owned size in its ID.
             # This allows equal-sized consecutive fills without reusing an old order.
-            result=self.protection.install(position_id,'SUIUSDT',str(tradable),position.get('robot_owned_quantity',str(quantity)),str(stop),str(stop_limit_price(stop,tick)),info,generation=str(quantity))
+            result=self.protection.install(position_id,self.symbol,str(tradable),position.get('robot_owned_quantity',str(quantity)),str(stop),str(stop_limit_price(stop,tick)),info,generation=str(quantity))
             if result['state'] not in ACTIVE:raise ValueError('NATIVE_PROTECTION_NOT_ACKNOWLEDGED')
             if dust:
                 self.gate.pause()
@@ -99,9 +103,9 @@ class ExecutionSystem:
             # Do not copy arbitrary API exception text (which may contain secrets).
             return self._record(position_id,'PAUSED',alert=type(exc).__name__,protection_confirmed=False)
 
-def build_execution_system(path,engine,reader,guardian,gate,exchange_info_provider,price_provider,*,clock=now_ms):
+def build_execution_system(path,engine,reader,guardian,gate,exchange_info_provider,price_provider,*,clock=now_ms,account_id=None,symbol=None):
     root=Path(path);root.mkdir(parents=True,exist_ok=True)
-    protection=ProtectionManager(root/'native-protection.sqlite',engine,gate)
-    system=ExecutionSystem(root/'protection-system.sqlite',engine,protection,reader,guardian,gate,exchange_info_provider,price_provider,clock=clock)
-    system.bnb=BNBExecution(root/'bnb-execution.sqlite',engine,gate,guardian.bnb_candidate)
+    protection=ProtectionManager(root/'native-protection.sqlite',engine,gate,account_id=account_id,symbol=symbol)
+    system=ExecutionSystem(root/'protection-system.sqlite',engine,protection,reader,guardian,gate,exchange_info_provider,price_provider,clock=clock,account_id=account_id,symbol=symbol)
+    system.bnb=BNBExecution(root/'bnb-execution.sqlite',engine,gate,guardian.bnb_candidate,account_id=system.account_id)
     return system

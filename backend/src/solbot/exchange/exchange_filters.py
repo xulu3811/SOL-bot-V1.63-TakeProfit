@@ -1,6 +1,7 @@
 """Fresh exchange rules, including BNB, with conservative unknown-filter denial."""
 from dataclasses import dataclass
 from solbot.mathematics.decimal_utils import D
+from solbot.storage.models import LIVE_SYMBOLS
 
 @dataclass(frozen=True)
 class ExchangeFilters:
@@ -11,7 +12,7 @@ class ExchangeFilters:
 
     @classmethod
     def from_exchange_info(cls,data,symbol,observed_at):
-        if symbol not in ('SUIUSDT','BNBUSDT'): raise ValueError('wrong live symbol')
+        if symbol not in LIVE_SYMBOLS: raise ValueError('wrong live symbol')
         rows=[r for r in data.get('symbols',[]) if r.get('symbol')==symbol]
         if len(rows)!=1: raise ValueError('symbol rules absent or duplicated')
         return cls(symbol,rows[0],observed_at,tuple(data.get('exchangeFilters',[])))

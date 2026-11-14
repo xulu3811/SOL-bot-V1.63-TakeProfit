@@ -37,8 +37,14 @@ def size_position(context, features, *, score, entry_price, equity, high_waterma
     reserved = D(reserved_entry_notional, nonnegative=True) + D(reserved_entry_fees, nonnegative=True)
     entry_fee, exit_fee, slip, stop = (D(value, nonnegative=True) for value in
                                       (entry_fee_rate, exit_fee_rate, slippage_fraction, stop_distance))
-    if stop != Decimal("0.008"):
-        raise ValueError("initial stop distance is fixed at 0.8 percent")
+    if context.strategy_id == "T2":
+        if stop < Decimal("0.008") or stop > Decimal("0.020"):
+            raise ValueError("T2 stop distance must stay between 0.8 and 2.0 percent")
+        risk_budget = parameters.t1_budget
+    else:
+        if stop < Decimal("0.008") or stop > Decimal("0.015"):
+            raise ValueError("initial stop distance must stay between 0.8 and 1.5 percent")
+        risk_budget = parameters.t1_budget if context.strategy_id == "T1" else parameters.r1_budget
     if entry_fee > Decimal("0.02") or exit_fee > Decimal("0.02") or slip > Decimal("0.1"):
         raise ValueError("fee/slippage input outside research bounds")
     if any(type(value) is not int or value < 0 for value in (open_positions, pending_entries)) or type(hard_locked) is not bool:
@@ -55,7 +61,6 @@ def size_position(context, features, *, score, entry_price, equity, high_waterma
     with localcontext() as precision:
         precision.prec = 40
         n_score = Decimal("300") + Decimal("400") * clip((score - 75) / 25)
-        risk_budget = parameters.t1_budget if context.strategy_id == "T1" else parameters.r1_budget
         loss_fraction = stop + entry_fee + exit_fee + slip
         n_risk = net * risk_budget / loss_fraction
         n_available = max(ZERO, cash - reserved) / (ONE + entry_fee)

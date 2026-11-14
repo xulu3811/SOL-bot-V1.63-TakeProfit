@@ -12,6 +12,8 @@ from solbot.risk.bnb_reserve import BNBReserve
 class GuardianBridge:
     def __init__(self,ledger,clock=now_ms):
         self.ledger,self.clock=ledger,clock
+        self.symbol=getattr(ledger,'symbol','SUIUSDT')
+        self.base_asset=getattr(ledger,'base_asset','SUI')
         self._signing_key=secrets.token_bytes(32)
     def health(self):
         with self.ledger.transaction() as db:
@@ -26,7 +28,7 @@ class GuardianBridge:
         with self.ledger.transaction() as db:
             row=db.execute('SELECT * FROM robot_positions WHERE intent_id=?',(intent_id,)).fetchone()
             if not row: raise ValueError('position not owned')
-            return dict(row,robot_owned_quantity=str(self.ledger.owned(db,'SUI')))
+            return dict(row,robot_owned_quantity=str(self.ledger.owned(db,self.base_asset)))
     def bind_order(self,params,protective=False):
         from solbot.accounts.allocation_ledger import encoded,digest
         key=params.get('newClientOrderId',params.get('origClientOrderId'))
@@ -38,7 +40,7 @@ class GuardianBridge:
                     own=any('sb5-'+hashlib.sha256((self.ledger.account_id+'|'+r[0]).encode()).hexdigest()[:28]==key for r in db.execute('SELECT intent_id FROM fund_reservations'))
                 if not own: raise PermissionError('cancel not robot owned')
                 intent=None
-            elif params.get('side')=='BUY' and params.get('symbol')=='SUIUSDT':
+            elif params.get('side')=='BUY' and params.get('symbol')==self.symbol:
                 match=None
                 for row in db.execute('SELECT * FROM fund_reservations'):
                     if 'sb5-'+hashlib.sha256((self.ledger.account_id+'|'+row['intent_id']).encode()).hexdigest()[:28]==key: match=row
@@ -111,7 +113,7 @@ class GuardianBridge:
                 cash=db.execute("SELECT free FROM exchange_balances WHERE asset='USDT'").fetchone()
                 if a['live_state']!='LIVE_ON' or a['recovery_required'] or not 0<=self.clock()-a['reconciled_at']<=5000 or not cash or D(r['reserve'])>min(D(cash[0]),D(a['cash'])): return {'decision':'DENY'}
                 return {'decision':'ALLOW'}
-        if params.get('side')!='SELL' or params.get('symbol')!='SUIUSDT': return {'decision':'DENY'}
+        if params.get('side')!='SELL' or params.get('symbol')!=self.symbol: return {'decision':'DENY'}
         with self.ledger.transaction() as db:
             pos=db.execute('SELECT * FROM robot_positions WHERE intent_id=?',(position_id,)).fetchone()
             if not pos or D(params['quantity'])>D(pos['quantity']): return {'decision':'DENY'}
@@ -124,18 +126,18 @@ class GuardianBridge:
             if snapshot:
                 evidence=json.loads(snapshot[0])
                 if evidence['result']=='RECONCILED' and evidence['observed_at']==a['reconciled_at']:
-                    known={r['client_id']:D(r['remaining_quantity']) for r in evidence.get('known_orders',[]) if r['symbol']=='SUIUSDT' and r['purpose'] in ('PROTECT','EXIT') and r['status'] in ('NEW','PARTIALLY_FILLED')}
-            rows=[dict(r) for r in db.execute("SELECT * FROM exit_reservations WHERE asset='SUI' AND status='RESERVED' AND intent_id!=?",(key,))]
+                    known={r['client_id']:D(r['remaining_quantity']) for r in evidence.get('known_orders',[]) if r['symbol']==self.symbol and r['purpose'] in ('PROTECT','EXIT') and r['status'] in ('NEW','PARTIALLY_FILLED')}
+            rows=[dict(r) for r in db.execute("SELECT * FROM exit_reservations WHERE asset=? AND status='RESERVED' AND intent_id!=?",(self.base_asset,key))]
             total=sum((D(r['quantity']) for r in rows),D('0'))
             exchange_locked=sum((min(D(r['quantity']),known.get(r['intent_id'],D('0'))) for r in rows),D('0'))
-            bal=db.execute("SELECT free,locked FROM exchange_balances WHERE asset='SUI'").fetchone()
+            bal=db.execute("SELECT free,locked FROM exchange_balances WHERE asset=?",(self.base_asset,)).fetchone()
             qty=D(params['quantity'])
-            if not bal or exchange_locked>D(bal['locked']) or qty+total-exchange_locked>D(bal['free']) or qty+total>self.ledger.owned(db,'SUI'): raise PermissionError('free/owned sell limit')
+            if not bal or exchange_locked>D(bal['locked']) or qty+total-exchange_locked>D(bal['free']) or qty+total>self.ledger.owned(db,self.base_asset): raise PermissionError('free/owned sell limit')
             from solbot.accounts.allocation_ledger import encoded
-            payload={'asset':'SUI','quantity':qty,'category':'ROBOT_OWNED','authorization_id':None}
+            payload={'asset':self.base_asset,'quantity':qty,'category':'ROBOT_OWNED','authorization_id':None}
             old=db.execute('SELECT * FROM exit_reservations WHERE intent_id=?',(key,)).fetchone()
             if old and (old['payload']!=encoded(payload) or old['status']!='RESERVED'): raise ValueError('exit conflict')
-            if not old: db.execute("INSERT INTO exit_reservations VALUES(?,'SUI','ROBOT_OWNED',?,?,'RESERVED')",(key,str(qty),encoded(payload)))
+            if not old: db.execute("INSERT INTO exit_reservations VALUES(?,?,'ROBOT_OWNED',?,?,'RESERVED')",(key,self.base_asset,str(qty),encoded(payload)))
             self.ledger.event(db,'aux:'+key,'P5_AUX_APPROVAL',{'params':params,'purpose':purpose,'position_id':position_id},self.clock())
         result={'decision':'ALLOW','live_authorized':False}
         return result
@@ -160,7 +162,7 @@ class GuardianBridge:
                 with self.ledger.transaction() as db:
                     if self.ledger.event(db,message['event_id']+':commission','P5_COMMISSION',message,self.clock()):
                         self.ledger.set_owned(db,asset,'ROBOT_OWNED',self.ledger.owned(db,asset)-fee)
-                        if asset=='SUI':
+                        if asset==self.base_asset:
                             pos=db.execute('SELECT quantity FROM robot_positions WHERE intent_id=?',(message['position_id'],)).fetchone()
                             if D(pos[0])<fee: raise ValueError('base commission position deficit')
                             db.execute('UPDATE robot_positions SET quantity=? WHERE intent_id=?',(str(D(pos[0])-fee),message['position_id']))
@@ -185,8 +187,8 @@ class GuardianBridge:
             request=json.loads(r['payload']); limit=D(request['price'])
             if qty+D(r['filled'])>D(r['quantity']) or price>limit: raise ValueError('exchange fill conflict')
             if qty*limit>D(r['remaining']): raise ValueError('late fill conflicts with released reservation; reconcile')
-            if asset not in ('SUI','USDT','BNB') and fee: raise ValueError('unvalued commission asset')
-            acquired=qty-(fee if asset=='SUI' else D('0'))
+            if asset not in (self.base_asset,'USDT','BNB') and fee: raise ValueError('unvalued commission asset')
+            acquired=qty-(fee if asset==self.base_asset else D('0'))
             if acquired<0: raise ValueError('base commission exceeds quantity')
             if asset=='BNB' and fee>self.ledger.owned(db,'BNB'): raise ValueError('BNB fee ownership unresolved')
             remaining=D(r['remaining'])-qty*limit
@@ -196,8 +198,8 @@ class GuardianBridge:
             pos=db.execute('SELECT * FROM robot_positions WHERE intent_id=?',(ident,)).fetchone()
             pq=D(pos['quantity']) if pos else D('0'); pc=D(pos['cost']) if pos else D('0'); pr=D(pos['risk']) if pos else D('0')
             protection=pos['protection'] if pos else json.dumps({'stop_price':request['stop_price'],'native_status':'UNVERIFIED','responsibility':'KEEP_PROTECTION'})
-            db.execute('INSERT INTO robot_positions VALUES(?,?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET quantity=excluded.quantity,cost=excluded.cost,risk=excluded.risk',(ident,'SUI',str(pq+acquired),str(pc+qty*price),str(pr+D(r['risk'])-remaining_risk),protection))
-            self.ledger.set_owned(db,'SUI','ROBOT_OWNED',self.ledger.owned(db,'SUI')+acquired)
+            db.execute('INSERT INTO robot_positions VALUES(?,?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET quantity=excluded.quantity,cost=excluded.cost,risk=excluded.risk',(ident,self.base_asset,str(pq+acquired),str(pc+qty*price),str(pr+D(r['risk'])-remaining_risk),protection))
+            self.ledger.set_owned(db,self.base_asset,'ROBOT_OWNED',self.ledger.owned(db,self.base_asset)+acquired)
             if asset=='BNB': self.ledger.set_owned(db,'BNB','ROBOT_OWNED',self.ledger.owned(db,'BNB')-fee)
             db.execute('UPDATE fund_reservations SET remaining=?,fees=?,risk=?,filled=?,cost=?,status=? WHERE intent_id=?',(str(remaining),str(remaining*D('.001')),str(remaining_risk),str(D(r['filled'])+qty),str(D(r['cost'])+qty*price),'FILLED' if remaining==0 else (r['status'] if r['status'] in ('UNKNOWN','CANCEL_PENDING') else 'PARTIAL'),ident))
             db.execute('UPDATE account_allocations SET cash=?,equity_at=0,reconciled_at=0,recovery_required=1',(str(cash),))

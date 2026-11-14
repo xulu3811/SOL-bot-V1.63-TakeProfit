@@ -38,11 +38,11 @@ SCHEMA = (
 )
 
 class AllocationLedger:
-    def __init__(self, path, account_id='SUI-live', symbol='SUIUSDT'):
-        if account_id != 'SUI-live' or symbol != 'SUIUSDT':
-            raise ValueError('P4 production allocation is SUI-live/SUIUSDT only')
+    def __init__(self, path, account_id='SUI-live', symbol=None):
+        from solbot.storage.models import resolve_live_account
+        account_id, symbol, base_asset = resolve_live_account(account_id, symbol)
         self.path = Path(path).resolve()
-        self.account_id, self.symbol = account_id, symbol
+        self.account_id, self.symbol, self.base_asset = account_id, symbol, base_asset
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.transaction(initializing=True) as db:
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}

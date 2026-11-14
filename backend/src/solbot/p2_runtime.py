@@ -82,7 +82,15 @@ def main() -> None:
                 consumed=[]
                 for record in store.accepted_after(after_id=cursor,symbol=args.symbol,now_ms=now,limit=100):
                     try:
-                        order=shadow.submit_candidate(record,notional='300',now_ms=now)
+                        notional='300'
+                        if record.get('strategy_id')=='T2':
+                            from solbot.strategy.t2_swing import risk_notional
+                            account=shadow.snapshot()
+                            sized=risk_notional(account['last_equity'],record.get('stop_distance') or '0',shadow.fee_rate,record.get('score') or 75)
+                            if sized is None:
+                                raise ValueError('T2_SIZE')
+                            notional=format(sized,'f')
+                        order=shadow.submit_candidate(record,notional=notional,now_ms=now)
                         consumed.append({'decision_id':record['decision_id'],'result':order})
                     except ValueError as exc:
                         consumed.append({'decision_id':record['decision_id'],'rejected':str(exc)[:200]})

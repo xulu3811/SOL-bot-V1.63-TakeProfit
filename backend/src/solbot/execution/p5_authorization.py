@@ -5,10 +5,12 @@ import time
 class AuthorizationDenied(PermissionError): pass
 
 class LiveSession:
-    def __init__(self,*,environment='production',clock=None):
+    def __init__(self,*,environment='production',clock=None,account_id='SUI-live'):
+        from solbot.storage.models import resolve_live_account
         if environment not in ('production','mock'): raise ValueError('unsupported environment')
         self.environment=environment; self.clock=clock or (lambda:int(time.time()*1000))
-        self.state='LIVE_OFF'; self._lease=None; self.expires_at=0; self.account_id='SUI-live'
+        self.account_id,self.primary_symbol,_=resolve_live_account(account_id)
+        self.state='LIVE_OFF'; self._lease=None; self.expires_at=0
         self.risk_locked=False; self.recovery_required=True
         self._closers=[]
     def register_close(self,callback): self._closers.append(callback)
@@ -28,10 +30,11 @@ class LiveSession:
         except BaseException:
             self.off(); raise
 
-    def require(self,scope,account_id='SUI-live',symbol=None):
+    def require(self,scope,account_id=None,symbol=None):
         if self.environment=='production': raise AuthorizationDenied('DENY_P6_AUTHENTICATION_NOT_ACCEPTED')
         if not self._lease or self.clock()>=self.expires_at: raise AuthorizationDenied('authorization absent or expired')
-        if account_id!=self.account_id or symbol not in (None,'SUIUSDT','BNBUSDT'): raise AuthorizationDenied('identity mismatch')
+        acct=self.account_id if account_id is None else account_id
+        if acct!=self.account_id or symbol not in (None,self.primary_symbol,'BNBUSDT'): raise AuthorizationDenied('identity mismatch')
         if scope not in ('PRIVATE_READ','TRADE','PROTECT','CANCEL'): raise AuthorizationDenied('unknown scope')
         if self.state=='LIVE_PENDING' and scope=='PRIVATE_READ': return
         if self.state not in ('LIVE_ON','PAUSED','HARD_LOCKED'): raise AuthorizationDenied('LIVE OFF')
