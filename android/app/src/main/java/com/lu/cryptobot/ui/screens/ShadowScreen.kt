@@ -2,7 +2,9 @@ package com.lu.cryptobot.ui.screens
 
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ReceiptLong
@@ -30,11 +33,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.lu.cryptobot.ui.components.BotFormatters
 import com.lu.cryptobot.ui.components.BotSurfaceCard
-import com.lu.cryptobot.ui.components.MetricBentoTile
 import com.lu.cryptobot.ui.components.OrderListItem
 import com.lu.cryptobot.ui.components.SectionHeader
 import com.lu.cryptobot.ui.components.StatusBadge
@@ -85,141 +90,200 @@ fun ShadowScreen(
             }
             Text(healthMessage, color = MaterialTheme.colorScheme.error)
         }
-        // 1. Equity Hero Card with 2x2 Zero-Truncation Bento Grid
-        shadow?.optJSONObject("r2")?.let { r2 ->
-            val state = r2.optJSONObject("candidate")?.optString("state")
-            val stage = when (state) {
-                "WATCHING" -> "观察底部"
-                "ARMED" -> "等待突破"
-                "TRIGGERED" -> "入场意图待处理"
-                "CONSUMED" -> "本次候选已处理"
-                "EXPIRED" -> "候选已过期"
-                "INVALIDATED" -> "候选已失效"
-                else -> "等待超卖候选"
-            }
-            BotSurfaceCard {
-                Text("R2 反弹 · 独立影子盘", style = MaterialTheme.typography.titleMedium)
-                Text(if (r2.optBoolean("synced", false)) stage else "服务状态待恢复",
-                    color = if (r2.optBoolean("synced", false)) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error)
-                r2.optJSONObject("shadow")?.let { account ->
-                    Text("虚拟权益 $${BotFormatters.formatNumber(account.optString("last_equity"), 2)}")
-                }
-            }
+        val r2Obj = shadow?.optJSONObject("r2")
+        val r2Synced = r2Obj?.optBoolean("synced", false) == true
+        val r2Stage = when (r2Obj?.optJSONObject("candidate")?.optString("state")) {
+            "WATCHING" -> "观察底部"
+            "ARMED" -> "等待突破"
+            "TRIGGERED" -> "入场意图待处理"
+            "CONSUMED" -> "本次候选已处理"
+            "EXPIRED" -> "候选已过期"
+            "INVALIDATED" -> "候选已失效"
+            else -> "等待超卖候选"
         }
-        BotSurfaceCard {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(Icons.Outlined.Science, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                    Text("Shadow-bot", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    StatusBadge("影子沙盒账本", bot.infoSoft, bot.info)
-                }
-                StatusBadge("与实盘同源行情", bot.gainSoft, bot.gain)
-            }
+        val r2Equity = r2Obj?.optJSONObject("shadow")?.optString("last_equity").orEmpty()
 
-            Spacer(Modifier.height(10.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Bottom,
-            ) {
-                Text(
-                    text = "$${BotFormatters.formatNumber(equity, 2)}",
-                    style = MaterialTheme.typography.displaySmall.tnum(),
-                    fontWeight = FontWeight.Bold,
-                )
-                StatusBadge(
-                    text = "${BotFormatters.formatSignedUsdt(pnl)} (${BotFormatters.formatSignedPct(pnlPct)})",
-                    containerColor = if (negPnl) bot.lossSoft else bot.gainSoft,
-                    contentColor = if (negPnl) bot.loss else bot.gain,
-                )
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // 2x2 Bento Grid guarantees zero ellipsis truncation at 360dp widths
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MetricBentoTile(
-                        label = "初始虚拟本金",
-                        value = "$${BotFormatters.formatNumber(initialCap, 2)}",
-                        modifier = Modifier.weight(1f),
-                    )
-                    MetricBentoTile(
-                        label = "已结算胜率",
-                        value = winRate,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MetricBentoTile(
-                        label = "累计虚拟成交",
-                        value = "$totalTrades 笔",
-                        modifier = Modifier.weight(1f),
-                    )
-                    MetricBentoTile(
-                        label = "活跃虚拟仓位",
-                        value = "$activePosCount / $maxPos 槽位",
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-
-        // 2. Compact BNB Fee & Simulation Rules Strip
-        BotSurfaceCard(
-            modifier = Modifier.animateContentSize(),
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-            onClick = { rulesExpanded = !rulesExpanded },
+        // 1. Unified Shadow-bot Card (R2 status strip + Equity 2x2 grid + Collapsible BNB/Rules drawer)
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(),
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, bot.hairline),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
                 Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.weight(1f),
                 ) {
-                    Icon(Icons.AutoMirrored.Outlined.ReceiptLong, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                    Column {
-                        Text("BNB $feeLabel 抵扣与沙盒参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                        Text(
-                            text = "单笔 $500–$1000 · T1/T2/R2 · 未止损长持",
-                            style = MaterialTheme.typography.labelSmall.tnum(),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(Icons.Outlined.Science, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(17.dp))
+                        Text("Shadow-bot", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        StatusBadge("影子沙盒账本", bot.infoSoft, bot.info)
+                    }
+                    StatusBadge("与实盘同源行情", bot.gainSoft, bot.gain)
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "$${BotFormatters.formatNumber(equity, 2)}",
+                        style = MaterialTheme.typography.headlineMedium.tnum(),
+                        fontWeight = FontWeight.Bold,
+                    )
+                    StatusBadge(
+                        text = "${BotFormatters.formatSignedUsdt(pnl)} (${BotFormatters.formatSignedPct(pnlPct)})",
+                        containerColor = if (negPnl) bot.lossSoft else bot.gainSoft,
+                        contentColor = if (negPnl) bot.loss else bot.gain,
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        ShadowCompactMetricTile(
+                            label = "初始本金",
+                            value = "$${BotFormatters.formatNumber(initialCap, 2)}",
+                            modifier = Modifier.weight(1f),
+                        )
+                        ShadowCompactMetricTile(
+                            label = "已结胜率",
+                            value = winRate,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        ShadowCompactMetricTile(
+                            label = "累计成交",
+                            value = "$totalTrades 笔",
+                            modifier = Modifier.weight(1f),
+                        )
+                        ShadowCompactMetricTile(
+                            label = "活跃仓位",
+                            value = "$activePosCount / $maxPos 槽",
+                            modifier = Modifier.weight(1f),
                         )
                     }
                 }
-                Icon(
-                    if (rulesExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
-                    contentDescription = "展开规则",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (rulesExpanded) {
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider(color = bot.hairline)
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "• 模拟撮合使用真实盘口 Bid/Ask，扣除 $feeLabel BNB 等效手续费（储备上限 $${bnbCap} USDT，独立 SQLite 账本持久化）。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "• 与实盘共享 T1/T2/R2 信号及 APTS v2 移动止损状态机（S0 初始保护 → S1 +1.0% 保本 → S2 +1.5%+ 双 tick 追踪，未触发止损一直持仓）。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+
+                if (r2Obj != null) {
+                    Spacer(Modifier.height(6.dp))
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(1.dp, bot.hairline),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(if (r2Synced) bot.info else MaterialTheme.colorScheme.error),
+                                )
+                                Text(
+                                    text = "R2 独立盘 · ${if (r2Synced) r2Stage else "服务状态待恢复"}",
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp,
+                                    color = if (r2Synced) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            if (r2Equity.isNotBlank()) {
+                                Text(
+                                    text = "权益 $${BotFormatters.formatNumber(r2Equity, 2)}",
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp,
+                                    style = MaterialTheme.typography.labelSmall.tnum(),
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    border = BorderStroke(1.dp, bot.hairline),
+                    onClick = { rulesExpanded = !rulesExpanded },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Icon(Icons.AutoMirrored.Outlined.ReceiptLong, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
+                                Text(
+                                    text = "BNB $feeLabel · 单笔 $500–$1000 · T1/T2/R2 · 长持",
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp,
+                                    style = MaterialTheme.typography.labelSmall.tnum(),
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            Icon(
+                                if (rulesExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                contentDescription = "展开规则",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                        if (rulesExpanded) {
+                            Spacer(Modifier.height(6.dp))
+                            HorizontalDivider(color = bot.hairline)
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "• 模拟撮合使用真实盘口 Bid/Ask，扣除 $feeLabel BNB 等效手续费（储备上限 $${bnbCap} USDT，独立 SQLite 账本持久化）。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "• 与实盘共享 T1/T2/R2 信号及 APTS v2 移动止损状态机（S0 初始保护 → S1 +1.0% 保本 → S2 +1.5%+ 双 tick 追踪，未触发止损一直持仓）。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -342,5 +406,49 @@ fun ShadowScreen(
             }
         }
         Spacer(Modifier.height(12.dp))
+    }
+}
+
+@Composable
+private fun ShadowCompactMetricTile(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(1.dp, LocalBotColors.current.hairline),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 9.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .padding(end = 4.dp),
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelLarge.tnum(),
+                fontSize = 12.5.sp,
+                lineHeight = 16.sp,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false,
+            )
+        }
     }
 }
