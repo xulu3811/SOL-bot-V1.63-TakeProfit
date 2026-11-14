@@ -66,8 +66,8 @@ class T2RuleTests(unittest.TestCase):
         tight = risk_notional("2000", "0.008", "0.00075", "92.5")
         wide = risk_notional("2000", "0.020", "0.00075", "92.5")
         self.assertGreater(tight, wide)
-        self.assertGreaterEqual(wide, Decimal("300"))
-        self.assertLessEqual(tight, Decimal("700"))
+        self.assertGreaterEqual(wide, Decimal("500"))
+        self.assertLessEqual(tight, Decimal("1000"))
         self.assertIsNone(risk_notional("500", "0.020", "0.00075", "92.5"))
 
 

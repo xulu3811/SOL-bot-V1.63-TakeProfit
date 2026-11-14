@@ -516,7 +516,7 @@ fun LiveToggleConfirmSheet(
                 ) {
                     if (enabling) {
                         Text("• 实盘默认授权 T1 顺势 / T2 波段 / R2 超卖反弹策略（R1 震荡默认禁用）。", style = MaterialTheme.typography.bodySmall)
-                        Text("• 单笔限价买入 $300–$700 USDT，上限 2 个策略仓，未触发止损一直持仓，日内回撤 ≥ 5.0% 自动硬锁。", style = MaterialTheme.typography.bodySmall)
+                        Text("• 单笔限价买入 $500–$1000 USDT（不足 $1000 按最大可用开仓，低于 $500 拒开），上限 2 个策略仓，未触发止损一直持仓，仅策略交易计入日内 5.0% 亏损熔断。", style = MaterialTheme.typography.bodySmall)
                         Text(
                             text = "• API 现货权限: ${if (ordersEnabled) "已就绪" else "未开启"} · 当前可用 USDT: $${BotFormatters.formatNumber(freeUsdt, 2)}",
                             style = MaterialTheme.typography.bodySmall.tnum(),

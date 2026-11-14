@@ -495,12 +495,12 @@ class BinanceAccountInputTests(unittest.TestCase):
             chased = vault.consider_entry(reader, Decimal('82.95'), Decimal('0.01'), 1800000000000, ask=Decimal('82.97'))
             self.assertEqual(chased['reason'], 'CHASE_EXCEEDED')
 
-            # Inside band: uses ask price (min(entry_high, ask) = 82.85), R2 dynamic sizing ($500 cap), stores strategy_id & expires_at
+            # Inside band: uses ask price (min(entry_high, ask) = 82.85), R2 dynamic sizing ($500-$1000), stores strategy_id & expires_at
             placed = vault.consider_entry(reader, Decimal('82.80'), Decimal('0.01'), 1800000000000, ask=Decimal('82.85'))
             self.assertTrue(placed['placed'])
             self.assertEqual(placed['strategy_id'], 'R2')
             self.assertEqual(placed['price'], '82.85')
-            self.assertEqual(Decimal(placed['quantity']), Decimal('6.035'))
+            self.assertEqual(Decimal(placed['quantity']), Decimal('7.724'))
             orders = vault.bot_orders()
             self.assertEqual(len(orders), 1)
             self.assertEqual(orders[0]['strategy_id'], 'R2')
@@ -621,6 +621,200 @@ class BinanceAccountInputTests(unittest.TestCase):
         # +1.60% from click-time price ($75.20 -> $76.40) triggers S2 adaptive trailing
         s2 = vault.advance(Decimal('76.40'), ev, Decimal('0.01'), 1800000025000)
         self.assertEqual(s2['stage'], 'S2')
+
+    def test_live_sizing_500_to_1000_fallback_below_1000_and_reject_below_500(self):
+        def make_strat(name, sid, score, ts):
+            p = self.root / name
+            with closing(sqlite3.connect(p)) as db, db:
+                db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy_id TEXT, signal_id TEXT, payload_json TEXT)')
+                sig = {
+                    'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'signal_id': sid,
+                    'accepted': True, 'entry_low': '80.00', 'entry_high': '80.50',
+                    'stop_distance': '0.010', 'score': score,
+                    'signal_time': ts, 'expires_at': ts + 60000,
+                }
+                db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                           ('SOLUSDT', 'T1', sid, json.dumps(sig)))
+            return p
+
+        # Below 500 USDT available rejects with USDT_BELOW_500
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='480', sol_free='0', sol_locked='0')
+        vault_low = self.vault(transport)
+        vault_low.save(self.key, self.secret)
+        vault_low.enable_live()
+        r_low = DataReader({'SOLUSDT_strategy': make_strat('s_low.sqlite', 't1-low', '90', 1800000000000)}, clock=lambda: 1800000000000)
+        rejected = vault_low.consider_entry(r_low, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertFalse(rejected['placed'])
+        self.assertEqual(rejected['reason'], 'USDT_BELOW_500')
+
+        # 500 <= free < 1000 (720 USDT) opens with max available (~720 USDT / 80 = 9.0 SOL)
+        transport.usdt_free = '720'
+        fb_dir = self.root / 'fb'
+        fb_dir.mkdir(exist_ok=True)
+        vault_fb = AccountVault(fb_dir, clock=lambda: 1800000000000, transport=transport)
+        vault_fb.save(self.key, self.secret)
+        vault_fb.enable_live()
+        r_fb = DataReader({'SOLUSDT_strategy': make_strat('s_fb.sqlite', 't1-fb', '75', 1800000000000)}, clock=lambda: 1800000000000)
+        fb = vault_fb.consider_entry(r_fb, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertTrue(fb['placed'])
+        self.assertEqual(Decimal(fb['quantity']), Decimal('9.000'))
+
+        # Plenty of cash: score=75 opens ~500 USDT (6.25 SOL), score=100 opens ~1000 USDT (12.5 SOL), 3rd signal blocked by SLOTS_FULL
+        transport.usdt_free = '3000'
+        full_dir = self.root / 'full'
+        full_dir.mkdir(exist_ok=True)
+        vault_full = AccountVault(full_dir, clock=lambda: 1800000000000, transport=transport)
+        vault_full.save(self.key, self.secret)
+        vault_full.enable_live()
+        strat_db = make_strat('s_full.sqlite', 't1-min', '75', 1800000000000)
+        r0 = DataReader({'SOLUSDT_strategy': strat_db}, clock=lambda: 1800000000000)
+        p75 = vault_full.consider_entry(r0, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertTrue(p75['placed'])
+        self.assertEqual(Decimal(p75['quantity']), Decimal('6.250'))
+
+        with closing(sqlite3.connect(strat_db)) as db, db:
+            db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                       ('SOLUSDT', 'T1', 't1-max', json.dumps({
+                           'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'signal_id': 't1-max',
+                           'accepted': True, 'entry_low': '80.00', 'entry_high': '80.50',
+                           'stop_distance': '0.010', 'score': '100',
+                           'signal_time': 1800001000000, 'expires_at': 1800001060000,
+                       })))
+        r1 = DataReader({'SOLUSDT_strategy': strat_db}, clock=lambda: 1800001000000)
+        p100 = vault_full.consider_entry(r1, Decimal('80.00'), Decimal('0.01'), 1800001000000, ask=Decimal('80.00'))
+        self.assertTrue(p100['placed'])
+        self.assertEqual(Decimal(p100['quantity']), Decimal('12.500'))
+
+        with closing(sqlite3.connect(strat_db)) as db, db:
+            db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                       ('SOLUSDT', 'T1', 't1-third', json.dumps({
+                           'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'signal_id': 't1-third',
+                           'accepted': True, 'entry_low': '80.00', 'entry_high': '80.50',
+                           'stop_distance': '0.010', 'score': '90',
+                           'signal_time': 1800002000000, 'expires_at': 1800002060000,
+                       })))
+        r2 = DataReader({'SOLUSDT_strategy': strat_db}, clock=lambda: 1800002000000)
+        blocked = vault_full.consider_entry(r2, Decimal('80.00'), Decimal('0.01'), 1800002000000, ask=Decimal('80.00'))
+        self.assertFalse(blocked['placed'])
+        self.assertEqual(blocked['reason'], 'SLOTS_FULL')
+
+    def test_sub_5_usdt_dust_order_market_closed_and_excluded_from_slots_live_and_shadow(self):
+        from solbot.execution.p3_shadow import P3ShadowExecutor
+        from solbot.mathematics.trend_exhaustion import TrendEvidence
+        from test_p3_apts_shadow import NOW, NORMAL, RULES, features, signal
+
+        strat_db = self.root / 'decisions_dust.sqlite'
+        with closing(sqlite3.connect(strat_db)) as db, db:
+            db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy_id TEXT, signal_id TEXT, payload_json TEXT)')
+            db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                       ('SOLUSDT', 'T1', 't1-dust-seed', json.dumps({
+                           'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'signal_id': 't1-dust-seed',
+                           'accepted': True, 'entry_low': '79.00', 'entry_high': '81.00',
+                           'stop_distance': '0.010', 'score': '75',
+                           'signal_time': 1800000000000, 'expires_at': 1800000060000,
+                       })))
+
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='3000', sol_free='20', sol_locked='0')
+        vault = self.vault(transport)
+        vault.save(self.key, self.secret)
+        vault.enable_live()
+
+        r0 = DataReader({'SOLUSDT_strategy': strat_db}, clock=lambda: 1800000000000)
+        seed = vault.consider_entry(r0, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertTrue(seed['placed'])
+        # Shrink seeded bot order to residual 0.04 SOL (< $5 at $80) -> must NOT count toward slots
+        with vault._db() as db:
+            db.execute("UPDATE bot_orders SET status='FILLED', quantity='0.04', quote='3.20' WHERE signal_id='t1-dust-seed'")
+        self.assertEqual(len(vault.open_bot_slots()), 0)
+        self.assertFalse(vault.has_open_bots(include_dust=False))
+        self.assertTrue(vault.has_open_bots(include_dust=True))
+
+        # Two full bot slots can still open despite the residual < 5 USDT order
+        for idx in (1, 2):
+            sid = f't1-full-{idx}'
+            ts = 1800000000000 + idx * 1000000
+            with closing(sqlite3.connect(strat_db)) as db, db:
+                db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                           ('SOLUSDT', 'T1', sid, json.dumps({
+                               'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'signal_id': sid,
+                               'accepted': True, 'entry_low': '79.00', 'entry_high': '81.00',
+                               'stop_distance': '0.010', 'score': '75',
+                               'signal_time': ts, 'expires_at': ts + 60000,
+                           })))
+            ri = DataReader({'SOLUSDT_strategy': strat_db}, clock=lambda t=ts: t)
+            res = vault.consider_entry(ri, Decimal('80.00'), Decimal('0.01'), ts, ask=Decimal('80.00'))
+            self.assertTrue(res['placed'])
+
+        # sync_bot_stops / advance liquidates the < 5 USDT dust order at MARKET SELL and marks CLOSED
+        ev = TrendEvidence(ready=True, atr=Decimal('0.3'), previous_atr=Decimal('0.3'))
+        synced = vault.sync_bot_stops(Decimal('80.00'), Decimal('0.01'), 1800002010000, evidence=ev)
+        self.assertTrue(any(a.get('signal_id') == 't1-dust-seed' and a.get('status') == 'CLOSED' and a.get('reason') == 'DUST_BELOW_5_USDT' for a in synced['actions']))
+        self.assertTrue(any(m == 'POST' and p == '/api/v3/order' and 'side=SELL' in q and 'type=MARKET' in q for m, p, q in transport.calls))
+        with vault._db() as db:
+            dust_row = db.execute("SELECT status FROM bot_orders WHERE signal_id='t1-dust-seed'").fetchone()
+        self.assertEqual(dust_row[0], 'CLOSED')
+
+        # Shadow P3ShadowExecutor: < 5 USDT open position excluded from _occupied_slots and market-closed on process_market
+        shadow = P3ShadowExecutor(self.root / 'p3_dust.sqlite', rules=RULES, fee_rate='0.00075', minimum_notional='500', maximum_notional='1000')
+        with shadow._transaction() as db:
+            db.execute(
+                """INSERT INTO shadow_positions(position_id,account_id,symbol,strategy_id,signal_id,quantity,entry_price,entry_cost,entry_fee,status,opened_at)
+                   VALUES ('p-dust','SOL-shadow','SOLUSDT','T1','sig-dust','0.04','100','4','0.003','OPEN',?)""",
+                (NOW - 5000,),
+            )
+            self.assertEqual(shadow._occupied_slots(db), 0)
+        o1 = shadow.submit_candidate(signal(1, price='100'), notional='500', now_ms=NOW)
+        o2 = shadow.submit_candidate(signal(2, price='100'), notional='500', now_ms=NOW)
+        self.assertEqual(o1['status'], 'PENDING')
+        self.assertEqual(o2['status'], 'PENDING')
+        mk = shadow.process_market(features(1000, bid='100', ask='100.01', quantity='100'), NORMAL, now_ms=NOW + 1000)
+        self.assertTrue(any(f.get('close_reason') == 'dust_below_5_usdt_market_exit' for f in mk['fills']))
+        with shadow._transaction() as db:
+            st = db.execute("SELECT status, close_reason FROM shadow_positions WHERE position_id='p-dust'").fetchone()
+        self.assertEqual(tuple(st), ('CLOSED', 'dust_below_5_usdt_market_exit'))
+
+    def test_manual_trade_loss_excluded_from_daily_loss_live_risk(self):
+        guardian_db = self.root / 'guardian_risk.sqlite'
+        AllocationLedger(guardian_db, account_id='SOL-live', symbol='SOLUSDT')
+        with closing(sqlite3.connect(guardian_db)) as db, db:
+            # Manual spot loss dropped equity from 2000 to 1700 (-15%) -> guardian locked, but bot had $0 loss
+            db.execute("UPDATE account_allocations SET allocated='2000', live_state='HARD_LOCKED', equity_at=?", (1800000000000,))
+            db.execute("UPDATE risk_high_watermarks SET high='2000', equity='1700'")
+
+        market_db = self.root / 'market_risk.sqlite'
+        with closing(sqlite3.connect(market_db)) as db, db:
+            db.execute("CREATE TABLE market_klines(symbol TEXT, interval TEXT, is_closed INTEGER, close_time INTEGER, close TEXT)")
+            db.execute("INSERT INTO market_klines VALUES('SOLUSDT','1m',1,1800000000000,'80.00')")
+
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='1700', sol_free='0', sol_locked='0')
+        vault_dir = self.root / 'vault_risk'
+        vault_dir.mkdir(exist_ok=True)
+        vault = AccountVault(vault_dir, clock=lambda: 1800000005000, transport=transport)
+        vault.save(self.key, self.secret)
+        vault.enable_live()
+
+        reader = DataReader({'guardian': guardian_db, 'binance_vault': vault_dir / 'binance-vault.sqlite', 'SOLUSDT_market': market_db}, clock=lambda: 1800000005000)
+        bot_risk = vault.bot_daily_risk(mark_price=Decimal('80.00'))
+        self.assertEqual(bot_risk['daily_loss_usdt'], '0.00')
+        self.assertEqual(bot_risk['loss_scope'], 'BOT_ONLY_EXCLUDES_MANUAL')
+        risk_doc = reader.live_risk()
+        self.assertEqual(risk_doc['daily_loss_usdt'], '0.00')
+        self.assertEqual(risk_doc['drawdown_pct'], '0.00')
+        self.assertEqual(risk_doc['state'], 'NORMAL')
+        self.assertEqual(risk_doc['loss_scope'], 'BOT_ONLY_EXCLUDES_MANUAL')
+
+        # Now record a real bot closed loss of $12.50 today -> bot daily loss reflects ONLY the $12.50 bot loss, not $300 manual loss
+        with vault._db() as db:
+            db.execute(
+                """INSERT INTO bot_orders(client_order_id,signal_id,exchange_order_id,strategy_id,status,price,quantity,quote,exit_price,realized_pnl,closed_at,created_at)
+                   VALUES('cbot-loss-1','sig-loss-1','9001','T1','CLOSED','80.00','12.5','1000','79.00','-12.50',?,?)""",
+                (1800000002000, 1800000001000),
+            )
+        bot_risk_after = vault.bot_daily_risk(mark_price=Decimal('80.00'))
+        self.assertEqual(bot_risk_after['daily_loss_usdt'], '12.50')
+        risk_after = reader.live_risk()
+        self.assertEqual(risk_after['daily_loss_usdt'], '12.50')
+        self.assertEqual(risk_after['drawdown_pct'], '0.62')
 
 
 if __name__ == '__main__':

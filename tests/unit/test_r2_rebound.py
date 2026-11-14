@@ -19,20 +19,34 @@ class R2Tests(unittest.TestCase):
     def test_rebound_order_below_legacy_minimum_respects_risk_budget(self):
         from decimal import Decimal
         from solbot.execution.r2_shadow import R2ShadowExecutor
+        from solbot.execution.shadow import ShadowRejected
         from test_p3_apts_shadow import RULES, NOW
         with tempfile.TemporaryDirectory() as folder:
             ledger = R2ShadowExecutor(Path(folder) / 'r2.sqlite', rules=RULES, fee_rate='0.00075')
             intent = {'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'strategy_version': 'r2-rebound-2',
                       'signal_id': 'rebound-risk-test', 'accepted': True, 'reasons': [],
                       'signal_time': NOW, 'expires_at': NOW+60000, 'entry_low': '78.75',
-                      'entry_high': '78.98625', 'candidate_low': '77.92', 'stop_price': '77.86346'}
+                      'entry_high': '78.98625', 'candidate_low': '77.92', 'stop_price': '77.86346', 'score': '75'}
             order = ledger.submit_intent(intent, NOW)
             price = Decimal(order['limit_price'])
             notional = Decimal(order['quantity']) * price
             risk = notional * ((price - Decimal('77.86')) / price + Decimal('.0025'))
-            self.assertGreaterEqual(notional, 100)
-            self.assertLess(notional, 300)
-            self.assertLessEqual(risk, 4)
+            self.assertGreaterEqual(notional, 499)
+            self.assertLessEqual(notional, 1000)
+            self.assertLessEqual(risk, 25)
+            # When available cash < 1000 and >= 500, open max available cash
+            with ledger._transaction() as db:
+                db.execute("UPDATE shadow_account SET cash='750',reserved='0'")
+            intent_fb = dict(intent, signal_id='rebound-fallback-test', score='75')
+            fb = ledger.submit_intent(intent_fb, NOW)
+            fb_notional = Decimal(fb['quantity']) * Decimal(fb['limit_price'])
+            self.assertGreater(fb_notional, Decimal('740'))
+            self.assertLess(fb_notional, Decimal('755'))
+            # Below 500 USDT available cash rejects opening
+            with ledger._transaction() as db:
+                db.execute("UPDATE shadow_account SET cash='450',reserved='0'")
+            with self.assertRaises(ShadowRejected):
+                ledger.submit_intent(dict(intent, signal_id='rebound-low-cash'), NOW)
 
     def test_paper_execution_retry_and_structure_stop(self):
         from solbot.execution.r2_shadow import R2ShadowExecutor

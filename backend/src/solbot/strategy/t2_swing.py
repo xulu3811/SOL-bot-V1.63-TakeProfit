@@ -106,7 +106,7 @@ def stop_distance(entry, swing_low, atr) -> Decimal:
 
 
 def risk_notional(equity, stop_distance, fee_rate, score):
-    """USDT size whose stop, fees and 0.2% slip stay within 0.4% of equity."""
+    """USDT size (500-1000) scaled by score and bounded by 0.6% equity risk."""
     try:
         equity = Decimal(str(equity))
         stop = Decimal(str(stop_distance))
@@ -122,8 +122,9 @@ def risk_notional(equity, stop_distance, fee_rate, score):
     if loss <= 0:
         return None
     span = min(Decimal("1"), max(Decimal("0"), (score - Decimal("75")) / Decimal("25")))
-    score_cap = Decimal("300") + span * Decimal("400")
-    sized = min(Decimal("700"), score_cap, equity * Decimal("0.004") / loss)
-    if sized < 300:
+    score_cap = Decimal("500") + span * Decimal("500")
+    risk_cap = equity * Decimal("0.006") / loss
+    sized = min(Decimal("1000"), score_cap, risk_cap)
+    if sized < 500:
         return None
     return sized

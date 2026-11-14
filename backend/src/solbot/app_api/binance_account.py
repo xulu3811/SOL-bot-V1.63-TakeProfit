@@ -44,6 +44,9 @@ EXIT_PENDING_TIMEOUT_MS = 5000
 STOP_REPLACE_MIN_INTERVAL_MS = 15000
 STOP_REPLACE_MIN_STEP_PCT = Decimal('0.0015')
 CROSS_STRATEGY_COOLDOWN_MS = 900_000
+MIN_ORDER_USDT = Decimal('500')
+MAX_ORDER_USDT = Decimal('1000')
+DUST_NOTIONAL_USDT = Decimal('5')
 
 
 def _fields(query):
@@ -241,7 +244,7 @@ class AccountVault:
             rows = db.execute(
                 "SELECT b.signal_id,b.client_order_id,b.exchange_order_id,b.price,b.quantity,b.quote,b.status,b.created_at,"
                 "b.stop_distance,b.stop_client_id,b.filled_at,b.high_price,b.exit_client_id,b.stop_price,b.stop_updated_at,b.exit_started_at,"
-                "b.strategy_id,b.expires_at,c.stage,c.note,c.state_json "
+                "b.strategy_id,b.expires_at,c.stage,c.note,c.state_json,b.exit_price,b.closed_at,b.realized_pnl "
                 "FROM bot_orders b LEFT JOIN custody_apts c ON c.intent_id=('bot:' || b.signal_id) "
                 "ORDER BY COALESCE(b.filled_at,b.created_at) DESC, b.signal_id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
@@ -273,12 +276,47 @@ class AccountVault:
                 'quote': r[5], 'status': r[6], 'time': r[10] or r[7], 'created_at': r[7],
                 'filled_at': r[10], 'expires_at': r[17], 'stop_distance': r[8] or '0.010', 'stop_client_id': r[9] or '',
                 'stop_price': r[13] or '', 'high_price': r[11] or '', 'exit_client_id': r[12] or '',
+                'exit_price': r[21] or '', 'closed_at': r[22], 'realized_pnl': r[23] or '',
                 'stage': apts_info['stage'], 'hold_note': r[19] or '', 'apts': apts_info,
             })
         return items
 
-    def open_bot_slots(self):
-        rows = [row for row in self.bot_orders(limit=20, offset=0) if row.get('status') in ('NEW', 'PARTIALLY_FILLED', 'FILLED', 'EXIT_PENDING')]
+    @staticmethod
+    def _is_dust_order(qty_raw, price_raw, mark_dec=None, status=None):
+        """Return True if a filled/exiting SOL bot order is residual dust worth < 5 USDT."""
+        try:
+            qty = Decimal(str(qty_raw or '0'))
+            ref = mark_dec if (mark_dec is not None and mark_dec > 0) else Decimal(str(price_raw or '0'))
+        except Exception:
+            return False
+        if status == 'NEW':
+            return False
+        if qty <= 0:
+            return True
+        if ref <= 0:
+            return False
+        if status == 'PARTIALLY_FILLED':
+            return False
+        return qty * ref < DUST_NOTIONAL_USDT
+
+    def _current_mark_dec(self):
+        mark = self.mark()
+        if isinstance(mark, dict) and mark.get('mark_price'):
+            try:
+                val = Decimal(str(mark['mark_price']))
+                if val > 0:
+                    return val
+            except Exception:
+                pass
+        return None
+
+    def open_bot_slots(self, mark_price=None):
+        mark_dec = Decimal(str(mark_price)) if mark_price is not None else self._current_mark_dec()
+        rows = [
+            row for row in self.bot_orders(limit=50, offset=0)
+            if row.get('status') in ('NEW', 'PARTIALLY_FILLED', 'FILLED', 'EXIT_PENDING')
+            and not self._is_dust_order(row.get('quantity'), row.get('price'), mark_dec, row.get('status'))
+        ]
         slots = []
         for idx, row in enumerate(rows[:2], start=1):
             qty = row.get('quantity') or '0'
@@ -295,6 +333,71 @@ class AccountVault:
                 'hold_note': row.get('hold_note') or '', 'apts': row.get('apts'),
             })
         return slots
+
+    def bot_daily_risk(self, mark_price=None, now_ms=None, reference_cap=Decimal('2000')):
+        """Compute daily realized + unrealized loss strictly from bot_orders (excludes user manual trades)."""
+        now = int(now_ms if now_ms is not None else self.clock())
+        day_start_ms = (now // 86_400_000) * 86_400_000
+        mark_dec = Decimal(str(mark_price)) if mark_price is not None else self._current_mark_dec()
+        realized_today = Decimal('0')
+        unrealized = Decimal('0')
+        if self.db_path.exists():
+            with self._db() as db:
+                closed_rows = db.execute(
+                    "SELECT price,quantity,exit_price,realized_pnl,COALESCE(closed_at,stop_updated_at,exit_started_at,filled_at,created_at) AS close_ts "
+                    "FROM bot_orders WHERE status='CLOSED'"
+                ).fetchall()
+                open_rows = db.execute(
+                    "SELECT price,quantity,status FROM bot_orders WHERE status IN ('PARTIALLY_FILLED','FILLED','EXIT_PENDING')"
+                ).fetchall()
+            for entry_raw, qty_raw, exit_raw, pnl_raw, close_ts in closed_rows:
+                if not close_ts or int(close_ts) < day_start_ms:
+                    continue
+                if pnl_raw not in (None, ''):
+                    try:
+                        realized_today += Decimal(str(pnl_raw))
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    entry = Decimal(str(entry_raw or '0'))
+                    qty = Decimal(str(qty_raw or '0'))
+                    exit_px = Decimal(str(exit_raw or '0'))
+                    if entry > 0 and qty > 0 and exit_px > 0:
+                        realized_today += (exit_px - entry) * qty
+                except Exception:
+                    continue
+            if mark_dec is not None and mark_dec > 0:
+                for entry_raw, qty_raw, status in open_rows:
+                    if self._is_dust_order(qty_raw, entry_raw, mark_dec, status):
+                        continue
+                    try:
+                        entry = Decimal(str(entry_raw or '0'))
+                        qty = Decimal(str(qty_raw or '0'))
+                        if entry > 0 and qty > 0:
+                            unrealized += (mark_dec - entry) * qty
+                    except Exception:
+                        continue
+        net_pnl = realized_today + unrealized
+        daily_loss_usdt = max(Decimal('0'), -net_pnl)
+        try:
+            cap = Decimal(str(reference_cap or '2000'))
+        except Exception:
+            cap = Decimal('2000')
+        if cap <= 0:
+            cap = Decimal('2000')
+        drawdown = min(Decimal('1'), daily_loss_usdt / cap)
+        drawdown_pct = f'{(drawdown * Decimal("100")):.2f}'
+        return {
+            'realized_pnl_today': f'{realized_today:.2f}',
+            'unrealized_pnl': f'{unrealized:.2f}',
+            'daily_net_pnl_usdt': f'{net_pnl:.2f}',
+            'daily_loss_usdt': f'{daily_loss_usdt:.2f}',
+            'drawdown': format(drawdown.quantize(Decimal('0.0001')), 'f'),
+            'drawdown_pct': drawdown_pct,
+            'loss_scope': 'BOT_ONLY_EXCLUDES_MANUAL',
+            'day_start_ms': day_start_ms,
+        }
 
     def live_state(self):
         if not self.db_path.exists():
@@ -327,11 +430,12 @@ class AccountVault:
         return {'accepted': True, 'state': 'LIVE_OFF', 'code': 'LIVE_OFF', 'protection': 'RETAINED', 'buy_orders': 0}
 
     @staticmethod
-    def _r2_notional(equity, stop_distance, fee_rate):
+    def _r2_notional(equity, stop_distance, fee_rate, score='85'):
         try:
             equity = Decimal(str(equity))
             stop = Decimal(str(stop_distance))
             fee = Decimal(str(fee_rate))
+            score_dec = Decimal(str(score))
         except Exception:
             return None
         if equity <= 0 or stop < Decimal('0.005') or stop > Decimal('0.050'):
@@ -341,10 +445,12 @@ class AccountVault:
         loss = stop + fee + fee + Decimal('0.002')
         if loss <= 0:
             return None
-        risk_cap = equity * Decimal('0.004') / loss
-        if risk_cap < Decimal('300'):
+        span = min(Decimal('1'), max(Decimal('0'), (score_dec - Decimal('75')) / Decimal('25')))
+        score_cap = MIN_ORDER_USDT + span * (MAX_ORDER_USDT - MIN_ORDER_USDT)
+        risk_cap = equity * Decimal('0.010') / loss
+        if risk_cap < MIN_ORDER_USDT:
             return None
-        return min(Decimal('500'), risk_cap)
+        return min(MAX_ORDER_USDT, score_cap, risk_cap)
 
     def consider_entry(self, reader, bid, tick, now, allowed_strategies=None, ask=None):
         """Place at most one SOL limit buy from an accepted live strategy signal."""
@@ -355,14 +461,13 @@ class AccountVault:
                 return {'placed': False, 'reason': 'HARD_LOCKED', 'buy_orders': 0}
         except Exception:
             pass
-        with self._db() as db:
-            open_slots = db.execute("SELECT COUNT(*) FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')").fetchone()[0]
+        bid_dec = Decimal(str(bid))
+        open_slots = len(self.open_bot_slots(mark_price=bid_dec if bid_dec > 0 else None))
         if open_slots >= 2:
             return {'placed': False, 'reason': 'SLOTS_FULL', 'buy_orders': 0}
-        signal = self._next_signal(reader, now, allowed_strategies=allowed_strategies)
+        signal = self._next_signal(reader, now, allowed_strategies=allowed_strategies, mark_price=bid_dec)
         if signal is None:
             return {'placed': False, 'buy_orders': 0}
-        bid_dec = Decimal(str(bid))
         ask_dec = Decimal(str(ask)) if ask is not None else bid_dec
         if ask_dec <= 0:
             ask_dec = bid_dec
@@ -389,25 +494,29 @@ class AccountVault:
                     usdt_total = amount
                 elif row.get('asset') == 'SOL':
                     sol_total = amount
+            if free < MIN_ORDER_USDT or price <= 0:
+                return {'placed': False, 'reason': 'USDT_BELOW_500', 'buy_orders': 0}
+            ref_equity = max(Decimal('2000'), usdt_total + sol_total * bid_dec)
             if signal['strategy_id'] == 'T2':
-                equity = usdt_total + sol_total * bid_dec
-                sized = risk_notional(equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal['score'])
-                if sized is None:
+                target_notional = risk_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal['score'])
+                if target_notional is None:
                     return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
-                notional = min(sized, free)
             elif signal['strategy_id'] == 'R2':
-                equity = usdt_total + sol_total * bid_dec
-                sized = self._r2_notional(equity, signal['stop_distance'], DEFAULT_FEE_RATE)
-                if sized is None:
+                target_notional = self._r2_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal.get('score') or '85')
+                if target_notional is None:
                     return {'placed': False, 'reason': 'R2_SIZE', 'buy_orders': 0}
-                notional = min(sized, free)
             else:
-                notional = min(signal['notional'], free)
-            if notional < Decimal('300') or price <= 0:
-                return {'placed': False, 'reason': 'USDT_BELOW_300', 'buy_orders': 0}
+                target_notional = signal['notional']
+            if free < MAX_ORDER_USDT:
+                notional = free
+            else:
+                notional = min(MAX_ORDER_USDT, max(MIN_ORDER_USDT, target_notional), free)
+            if notional < MIN_ORDER_USDT:
+                return {'placed': False, 'reason': 'USDT_BELOW_500', 'buy_orders': 0}
             rules = self._get_sol_rules(now)
             qty = self._floor(notional / price, rules['step'])
-            min_notional = max(Decimal('300'), rules.get('min_notional') or Decimal('0'))
+            step_tolerance = price * rules['step']
+            min_notional = max(MIN_ORDER_USDT - step_tolerance, rules.get('min_notional') or Decimal('5'))
             if qty <= 0 or qty < rules['min_qty'] or qty * price < min_notional:
                 return {'placed': False, 'reason': 'BELOW_MIN_NOTIONAL', 'buy_orders': 0}
             client_id = 'cbotby' + hashlib.sha256(signal['signal_id'].encode()).hexdigest()[:16]
@@ -429,12 +538,14 @@ class AccountVault:
             )
         return {'placed': True, 'signal_id': signal['signal_id'], 'strategy_id': signal['strategy_id'], 'quantity': format(qty, 'f'), 'price': format(price, 'f'), 'buy_orders': 1}
 
-    def has_open_bots(self):
+    def has_open_bots(self, include_dust=False):
         if not self.db_path.exists():
             return False
-        with self._db() as db:
-            count = db.execute("SELECT COUNT(*) FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')").fetchone()[0]
-        return bool(count)
+        if include_dust:
+            with self._db() as db:
+                count = db.execute("SELECT COUNT(*) FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')").fetchone()[0]
+            return bool(count)
+        return bool(self.open_bot_slots())
 
     def sync_bot_stops(self, bid, tick, now, evidence=None, micro_features=None):
         """Protect all live bot positions through APTS + atomic cancelReplace, and enforce 24h & 5s exit fallbacks."""
@@ -523,13 +634,13 @@ class AccountVault:
                 return {'handled': True, 'target': 'protections', 'intent_id': intent_id, 'status': prot_status}
 
             row = db.execute(
-                "SELECT signal_id,client_order_id,stop_client_id,exit_client_id,price,quantity,filled_at,status "
+                "SELECT signal_id,client_order_id,stop_client_id,exit_client_id,price,quantity,filled_at,status,stop_price "
                 "FROM bot_orders WHERE client_order_id=? OR stop_client_id=? OR exit_client_id=?",
                 (client_id, client_id, client_id),
             ).fetchone()
             if row is None:
                 return {'handled': False, 'reason': 'UNKNOWN_ORDER'}
-            signal_id, entry_cid, stop_cid, exit_cid, cur_px, cur_qty, cur_filled_at, cur_status = row
+            signal_id, entry_cid, stop_cid, exit_cid, cur_px, cur_qty, cur_filled_at, cur_status, cur_stop_px = row
             if client_id == entry_cid:
                 new_px = fill_px if Decimal(fill_px) > 0 else cur_px
                 new_qty = format(executed, 'f') if executed > 0 else cur_qty
@@ -546,15 +657,67 @@ class AccountVault:
                 return {'handled': True, 'target': 'bot_entry', 'signal_id': signal_id, 'status': new_status}
             if client_id == stop_cid:
                 if exch_status == 'FILLED':
-                    db.execute("UPDATE bot_orders SET status='CLOSED' WHERE signal_id=?", (signal_id,))
+                    exit_px = fill_px if Decimal(fill_px) > 0 else (cur_stop_px or cur_px)
+                    self._record_bot_close(db, signal_id, cur_px, executed if executed > 0 else cur_qty, exit_px, event_time, exit_client_id=client_id)
                     return {'handled': True, 'target': 'bot_stop', 'signal_id': signal_id, 'status': 'CLOSED'}
                 if exch_status in ('CANCELED', 'EXPIRED', 'REJECTED'):
                     db.execute("UPDATE bot_orders SET stop_client_id='',stop_price='' WHERE signal_id=?", (signal_id,))
                     return {'handled': True, 'target': 'bot_stop', 'signal_id': signal_id, 'status': exch_status}
             if client_id == exit_cid and exch_status == 'FILLED':
-                db.execute("UPDATE bot_orders SET status='CLOSED' WHERE signal_id=?", (signal_id,))
+                exit_px = fill_px if Decimal(fill_px) > 0 else cur_px
+                self._record_bot_close(db, signal_id, cur_px, executed if executed > 0 else cur_qty, exit_px, event_time, exit_client_id=client_id)
                 return {'handled': True, 'target': 'bot_exit', 'signal_id': signal_id, 'status': 'CLOSED'}
             return {'handled': True, 'target': 'bot_orders', 'signal_id': signal_id, 'status': cur_status}
+
+    @staticmethod
+    def _record_bot_close(db, signal_id, entry_px, qty_raw, exit_px, closed_at, exit_client_id=None):
+        try:
+            entry = Decimal(str(entry_px or '0'))
+            qty = Decimal(str(qty_raw or '0'))
+            exit_d = Decimal(str(exit_px or '0'))
+            pnl = (exit_d - entry) * qty if (entry > 0 and qty > 0 and exit_d > 0) else Decimal('0')
+        except Exception:
+            exit_d = Decimal('0')
+            pnl = Decimal('0')
+        exit_str = format(exit_d, 'f') if exit_d > 0 else str(exit_px or '')
+        if exit_client_id is not None:
+            db.execute(
+                "UPDATE bot_orders SET status='CLOSED', exit_price=?, closed_at=?, realized_pnl=?, exit_client_id=? WHERE signal_id=?",
+                (exit_str, int(closed_at), format(pnl, 'f'), exit_client_id, signal_id),
+            )
+        else:
+            db.execute(
+                "UPDATE bot_orders SET status='CLOSED', exit_price=?, closed_at=?, realized_pnl=? WHERE signal_id=?",
+                (exit_str, int(closed_at), format(pnl, 'f'), signal_id),
+            )
+
+    def _close_dust_bot_order(self, api_key, secret, signal_id, quantity, entry_price, prev_client_id, step, bid_dec, now):
+        """Attempt market close for a < 5 USDT SOL residual bot order and always mark it CLOSED to free slots."""
+        mkt_cid = 'cbot2x' + hashlib.sha256(f'{signal_id}:dust:{now}'.encode()).hexdigest()[:16]
+        exit_px = bid_dec
+        final_cid = prev_client_id or mkt_cid
+        if prev_client_id:
+            try:
+                self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': prev_client_id}, api_key, secret, now, method='DELETE')
+            except ValueError as exc:
+                if str(exc) != 'ORDER_GONE':
+                    pass
+        try:
+            res = self._market_exit_order(
+                api_key, secret, prev_client_id=None, exit_client_id=mkt_cid,
+                desired_qty=quantity, step=step, now=now,
+            )
+            placed = res.get('placed') if isinstance(res.get('placed'), dict) else None
+            if placed:
+                fp = self._fill_price(placed)
+                if Decimal(fp) > 0:
+                    exit_px = Decimal(fp)
+            final_cid = res.get('client_id') or mkt_cid
+        except ValueError:
+            pass
+        with self._db() as db:
+            self._record_bot_close(db, signal_id, entry_price, quantity, exit_px, now, exit_client_id=final_cid)
+        return {'signal_id': signal_id, 'status': 'CLOSED', 'reason': 'DUST_BELOW_5_USDT'}
 
     def _sync_one_bot(self, api_key, secret, bid, tick, step, now, evidence, micro_features,
                       signal_id, client_id, price, qty, status, stop_distance, stop_client,
@@ -577,16 +740,16 @@ class AccountVault:
                 with self._db() as db:
                     db.execute('UPDATE bot_orders SET status=? WHERE signal_id=?', (exch_status, signal_id))
                 return {'signal_id': signal_id, 'status': exch_status}
-            elif exch_status == 'NEW' and executed == 0 and expires_at is not None and now >= int(expires_at):
+            elif exch_status in ('NEW', 'PARTIALLY_FILLED') and expires_at is not None and now >= int(expires_at):
                 try:
                     cancelled = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now, method='DELETE')
-                    cancel_exec = Decimal(str(cancelled.get('executedQty') or '0'))
+                    cancel_exec = Decimal(str(cancelled.get('executedQty') or executed))
                     cancel_px = self._fill_price(cancelled)
                 except ValueError as exc:
                     if str(exc) != 'ORDER_GONE':
                         raise
                     refound = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now)
-                    cancel_exec = Decimal(str(refound.get('executedQty') or '0'))
+                    cancel_exec = Decimal(str(refound.get('executedQty') or executed))
                     cancel_px = self._fill_price(refound)
                 if cancel_exec > 0:
                     status = 'FILLED'
@@ -603,7 +766,9 @@ class AccountVault:
             with self._db() as db:
                 db.execute('UPDATE bot_orders SET status=?,price=?,quantity=?,filled_at=? WHERE signal_id=?', (status, price, qty, filled_at, signal_id))
         if status == 'EXIT_PENDING':
-            return self._escalate_bot_exit(api_key, secret, signal_id, qty, exit_client, exit_started_at, step, now)
+            if bid_dec > 0 and self._is_dust_order(qty, price, bid_dec, status):
+                return self._close_dust_bot_order(api_key, secret, signal_id, Decimal(str(qty)), price, exit_client or stop_client, step, bid_dec, now)
+            return self._escalate_bot_exit(api_key, secret, signal_id, price, qty, exit_client, exit_started_at, step, bid_dec, now)
         if status != 'FILLED':
             return {'signal_id': signal_id, 'status': status}
         entry = Decimal(str(price))
@@ -611,6 +776,8 @@ class AccountVault:
         distance = Decimal(str(stop_distance or '0.010'))
         if distance < Decimal('0.005') or distance > Decimal('0.050') or entry <= 0 or quantity <= 0:
             return {'signal_id': signal_id, 'status': 'IGNORED'}
+        if bid_dec > 0 and self._is_dust_order(quantity, entry, bid_dec, status):
+            return self._close_dust_bot_order(api_key, secret, signal_id, quantity, entry, stop_client or exit_client, step, bid_dec, now)
         high = max(Decimal(str(high_price or entry)), bid_dec)
         with self._db() as db:
             db.execute('UPDATE bot_orders SET high_price=? WHERE signal_id=?', (format(high, 'f'), signal_id))
@@ -620,8 +787,10 @@ class AccountVault:
             found = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': stop_client}, api_key, secret, now)
             stop_status = str(found.get('status') or '')
             if stop_status == 'FILLED':
+                stop_fill_px = self._fill_price(found)
+                exit_px = stop_fill_px if Decimal(stop_fill_px) > 0 else (stored_stop_price or format(bid_dec, 'f'))
                 with self._db() as db:
-                    db.execute("UPDATE bot_orders SET status='CLOSED' WHERE signal_id=?", (signal_id,))
+                    self._record_bot_close(db, signal_id, entry, quantity, exit_px, now, exit_client_id=stop_client)
                 return {'signal_id': signal_id, 'status': 'CLOSED'}
             if stop_status in ('CANCELED', 'EXPIRED', 'REJECTED'):
                 stop_client = ''
@@ -638,63 +807,80 @@ class AccountVault:
             entry_time_ms=int(filled_at or now), reversal_confirm_ticks=2,
         )
         if decision.exit_required:
-            return self._place_bot_exit_limit(api_key, secret, signal_id, stop_client, decision, tick_dec, step, now)
+            return self._place_bot_exit_limit(api_key, secret, signal_id, entry, stop_client, decision, tick_dec, step, bid_dec, now)
 
         target_stop = decision.stop_price
         if target_stop <= 0 or target_stop >= entry * Decimal('2'):
             return {'signal_id': signal_id, 'status': 'STOP_REJECTED'}
         if not stop_client:
-            return self._update_bot_stop(api_key, secret, signal_id, None, quantity, target_stop, tick_dec, step, now, stage, 'STOP_PLACED')
+            return self._update_bot_stop(api_key, secret, signal_id, entry, None, quantity, target_stop, tick_dec, step, bid_dec, now, stage, 'STOP_PLACED')
         if self._should_replace_stop(current_stop, target_stop, quantity, decision.quantity, stop_updated_at, now, stage != prev_stage):
-            return self._update_bot_stop(api_key, secret, signal_id, stop_client, decision.quantity, target_stop, tick_dec, step, now, stage, 'TRAIL_RAISED')
+            return self._update_bot_stop(api_key, secret, signal_id, entry, stop_client, decision.quantity, target_stop, tick_dec, step, bid_dec, now, stage, 'TRAIL_RAISED')
         return {'signal_id': signal_id, 'status': 'STOP_RESTING', 'stage': stage, 'stop': format(current_stop or target_stop, 'f')}
 
-    def _update_bot_stop(self, api_key, secret, signal_id, prev_stop_client, quantity, stop_price, tick, step, now, stage, label):
+    def _update_bot_stop(self, api_key, secret, signal_id, entry_price, prev_stop_client, quantity, stop_price, tick, step, bid_dec, now, stage, label):
         from solbot.mathematics.protective_stop import stop_limit_price
         new_cid = 'cbot2s' + hashlib.sha256(f'{signal_id}:{stop_price}:{now}'.encode()).hexdigest()[:16]
         limit = stop_limit_price(stop_price, tick)
+        if quantity * stop_price < DUST_NOTIONAL_USDT:
+            return self._close_dust_bot_order(api_key, secret, signal_id, quantity, entry_price, prev_stop_client, step, bid_dec, now)
         res = self._atomic_replace_or_place_stop(
             api_key, secret, prev_client_id=prev_stop_client, new_client_id=new_cid,
             quantity=quantity, stop_price=stop_price, limit_price=limit,
             order_type='STOP_LOSS_LIMIT', step=step, now=now,
         )
         if res.get('closed_by_prev_stop') or res.get('zero_balance'):
+            prev_order = res.get('order') if isinstance(res.get('order'), dict) else {}
+            prev_px = self._fill_price(prev_order) if prev_order else '0'
+            exit_px = prev_px if Decimal(prev_px) > 0 else format(bid_dec, 'f')
             with self._db() as db:
-                db.execute("UPDATE bot_orders SET status='CLOSED' WHERE signal_id=?", (signal_id,))
+                self._record_bot_close(db, signal_id, entry_price, quantity, exit_px, now, exit_client_id=prev_stop_client)
             return {'signal_id': signal_id, 'status': 'CLOSED'}
         final_qty = res['quantity']
+        if final_qty * stop_price < DUST_NOTIONAL_USDT:
+            return self._close_dust_bot_order(api_key, secret, signal_id, final_qty, entry_price, res['client_id'], step, bid_dec, now)
         with self._db() as db:
             db.execute('UPDATE bot_orders SET stop_client_id=?,stop_price=?,stop_updated_at=?,quantity=? WHERE signal_id=?',
                        (res['client_id'], format(stop_price, 'f'), now, format(final_qty, 'f'), signal_id))
         return {'signal_id': signal_id, 'status': label, 'stage': stage, 'stop': format(stop_price, 'f')}
 
-    def _place_bot_exit_limit(self, api_key, secret, signal_id, stop_client, decision, tick, step, now):
+    def _place_bot_exit_limit(self, api_key, secret, signal_id, entry_price, stop_client, decision, tick, step, bid_dec, now):
         exit_cid = 'cbot2x' + hashlib.sha256(f'{signal_id}:exit:{now}'.encode()).hexdigest()[:16]
         price = floor_step(decision.limit_price, tick)
+        if decision.quantity * price < DUST_NOTIONAL_USDT:
+            return self._close_dust_bot_order(api_key, secret, signal_id, decision.quantity, entry_price, stop_client, step, bid_dec, now)
         res = self._atomic_replace_or_place_stop(
             api_key, secret, prev_client_id=stop_client or None, new_client_id=exit_cid,
             quantity=decision.quantity, stop_price=price, limit_price=price,
             order_type='LIMIT', step=step, now=now,
         )
         if res.get('closed_by_prev_stop') or res.get('zero_balance') or str((res.get('placed') or {}).get('status') or '') == 'FILLED':
+            placed = res.get('placed') if isinstance(res.get('placed'), dict) else {}
+            prev_order = res.get('order') if isinstance(res.get('order'), dict) else {}
+            fp = self._fill_price(placed or prev_order) if (placed or prev_order) else '0'
+            exit_px = fp if Decimal(fp) > 0 else format(price, 'f')
             with self._db() as db:
-                db.execute("UPDATE bot_orders SET status='CLOSED', exit_client_id=? WHERE signal_id=?", (res.get('client_id') or exit_cid, signal_id))
+                self._record_bot_close(db, signal_id, entry_price, decision.quantity, exit_px, now, exit_client_id=res.get('client_id') or exit_cid)
             return {'signal_id': signal_id, 'status': 'CLOSED'}
         with self._db() as db:
             db.execute("UPDATE bot_orders SET status='EXIT_PENDING', exit_client_id=?, exit_started_at=?, quantity=? WHERE signal_id=?",
                        (res['client_id'], now, format(res['quantity'], 'f'), signal_id))
         return {'signal_id': signal_id, 'status': 'EXIT_PENDING'}
 
-    def _escalate_bot_exit(self, api_key, secret, signal_id, qty, exit_client, exit_started_at, step, now):
+    def _escalate_bot_exit(self, api_key, secret, signal_id, entry_price, qty, exit_client, exit_started_at, step, bid_dec, now):
         desired = Decimal(str(qty))
+        if bid_dec > 0 and desired * bid_dec < DUST_NOTIONAL_USDT:
+            return self._close_dust_bot_order(api_key, secret, signal_id, desired, entry_price, exit_client, step, bid_dec, now)
         exch_status = ''
         if exit_client:
             try:
                 found = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': exit_client}, api_key, secret, now)
                 exch_status = str(found.get('status') or '')
                 if exch_status == 'FILLED':
+                    fp = self._fill_price(found)
+                    exit_px = fp if Decimal(fp) > 0 else format(bid_dec, 'f')
                     with self._db() as db:
-                        db.execute("UPDATE bot_orders SET status='CLOSED' WHERE signal_id=?", (signal_id,))
+                        self._record_bot_close(db, signal_id, entry_price, desired, exit_px, now, exit_client_id=exit_client)
                     return {'signal_id': signal_id, 'status': 'CLOSED'}
             except ValueError as exc:
                 if str(exc) != 'ORDER_GONE':
@@ -705,18 +891,34 @@ class AccountVault:
         mkt_cid = 'cbot2x' + hashlib.sha256(f'{signal_id}:mkt:{now}'.encode()).hexdigest()[:16]
         res = self._market_exit_order(api_key, secret, prev_client_id=exit_client, exit_client_id=mkt_cid, desired_qty=desired, step=step, now=now)
         closed = res.get('status') == 'FILLED' or res.get('closed_by_prev_stop') or res.get('already_closed')
-        with self._db() as db:
-            db.execute('UPDATE bot_orders SET exit_client_id=?, exit_started_at=?, status=? WHERE signal_id=?',
-                       (res.get('client_id') or mkt_cid, now, 'CLOSED' if closed else 'EXIT_PENDING', signal_id))
+        if closed:
+            placed = res.get('placed') if isinstance(res.get('placed'), dict) else {}
+            prev_order = res.get('order') if isinstance(res.get('order'), dict) else {}
+            fp = self._fill_price(placed or prev_order) if (placed or prev_order) else '0'
+            exit_px = fp if Decimal(fp) > 0 else format(bid_dec, 'f')
+            with self._db() as db:
+                self._record_bot_close(db, signal_id, entry_price, desired, exit_px, now, exit_client_id=res.get('client_id') or mkt_cid)
+        else:
+            with self._db() as db:
+                db.execute("UPDATE bot_orders SET exit_client_id=?, exit_started_at=?, status='EXIT_PENDING' WHERE signal_id=?",
+                           (res.get('client_id') or mkt_cid, now, signal_id))
         return {'signal_id': signal_id, 'status': 'CLOSED' if closed else 'EXIT_ESCALATED'}
 
-    def _exit_bot_quantity(self, api_key, secret, signal_id, quantity, step, now, stop_client):
+    def _exit_bot_quantity(self, api_key, secret, signal_id, entry_price, quantity, step, bid_dec, now, stop_client):
         client_id = 'cbot2x' + hashlib.sha256(f'{signal_id}:time:{now}'.encode()).hexdigest()[:16]
         res = self._market_exit_order(api_key, secret, prev_client_id=stop_client, exit_client_id=client_id, desired_qty=quantity, step=step, now=now)
         closed = res.get('status') == 'FILLED' or res.get('closed_by_prev_stop') or res.get('already_closed')
-        with self._db() as db:
-            db.execute('UPDATE bot_orders SET exit_client_id=?, exit_started_at=?, status=? WHERE signal_id=?',
-                       (res.get('client_id') or client_id, now, 'CLOSED' if closed else 'EXIT_PENDING', signal_id))
+        if closed:
+            placed = res.get('placed') if isinstance(res.get('placed'), dict) else {}
+            prev_order = res.get('order') if isinstance(res.get('order'), dict) else {}
+            fp = self._fill_price(placed or prev_order) if (placed or prev_order) else '0'
+            exit_px = fp if Decimal(fp) > 0 else format(bid_dec, 'f')
+            with self._db() as db:
+                self._record_bot_close(db, signal_id, entry_price, quantity, exit_px, now, exit_client_id=res.get('client_id') or client_id)
+        else:
+            with self._db() as db:
+                db.execute("UPDATE bot_orders SET exit_client_id=?, exit_started_at=?, status='EXIT_PENDING' WHERE signal_id=?",
+                           (res.get('client_id') or client_id, now, signal_id))
         return {'closed': closed}
 
     def _require_spot(self, api_key, secret):
@@ -751,7 +953,7 @@ class AccountVault:
         if limit <= 0:
             return None
         span = min(Decimal('1'), max(Decimal('0'), (score - Decimal('75')) / Decimal('25')))
-        notional = Decimal('300') + span * Decimal('400')
+        notional = MIN_ORDER_USDT + span * (MAX_ORDER_USDT - MIN_ORDER_USDT)
         default_stop = '0.010' if strategy_id == 'T1' else ('0.012' if strategy_id == 'R2' else None)
         stop_dist = payload.get('stop_distance') or default_stop
         return {
@@ -761,20 +963,22 @@ class AccountVault:
             'signal_time': int(payload.get('signal_time') or 0),
         }
 
-    def _next_signal(self, reader, now, allowed_strategies=None):
+    def _next_signal(self, reader, now, allowed_strategies=None, mark_price=None):
         if allowed_strategies is not None:
             allowed = tuple(allowed_strategies)
         else:
             allowed = tuple(
                 item.strip() for item in os.environ.get('SOLBOT_LIVE_STRATEGIES', '').split(',') if item.strip()
             ) or DEFAULT_LIVE_STRATEGIES
+        mark_dec = Decimal(str(mark_price)) if mark_price is not None and Decimal(str(mark_price)) > 0 else self._current_mark_dec()
         with self._db() as db:
             used = {row[0] for row in db.execute('SELECT signal_id FROM bot_orders')}
             recent_active = [
                 int(row[0] or 0)
                 for row in db.execute(
-                    "SELECT created_at FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')"
+                    "SELECT created_at,quantity,price,status FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')"
                 )
+                if not self._is_dust_order(row[1], row[2], mark_dec, row[3])
             ]
         if any(0 <= now - ts < CROSS_STRATEGY_COOLDOWN_MS for ts in recent_active if ts > 0):
             return None
@@ -868,6 +1072,23 @@ class AccountVault:
         bid, tick = Decimal(str(bid)), Decimal(str(tick))
         self._remember_mark(bid, now)
         entry, qty = Decimal(current['entry_price']), min(Decimal(current['quantity']), held)
+        if bid > 0 and qty * bid < DUST_NOTIONAL_USDT:
+            api_key, secret = self._load()
+            try:
+                try:
+                    step = self._get_sol_rules(now)['step']
+                except Exception:
+                    step = Decimal('0.001')
+                mkt_cid = 'cbotex' + hashlib.sha256(f'manual:SOL:dust:{now}'.encode()).hexdigest()[:16]
+                try:
+                    self._market_exit_order(api_key, secret, prev_client_id=current['client_order_id'], exit_client_id=mkt_cid, desired_qty=qty, step=step, now=now)
+                except ValueError:
+                    pass
+            finally:
+                api_key = secret = None
+            with self._db() as db:
+                db.execute('UPDATE protections SET status=?,updated_at=? WHERE intent_id=?', ('CLOSED', now, current['intent_id']))
+            return {'advanced': True, 'stage': 'CLOSED', 'reason': 'DUST_BELOW_5_USDT', 'buy_orders': 0}
         current_stop = Decimal(current['stop_price'])
         decision, stage, prev_stage = self._advance_apts_step(
             'manual:SOL', entry=entry, qty=qty, current_stop=current_stop,
@@ -1621,6 +1842,7 @@ class AccountVault:
             ('high_price', 'TEXT'), ('exit_client_id', 'TEXT'),
             ('stop_price', 'TEXT'), ('stop_updated_at', 'INTEGER'), ('exit_started_at', 'INTEGER'),
             ('strategy_id', 'TEXT'), ('expires_at', 'INTEGER'),
+            ('exit_price', 'TEXT'), ('closed_at', 'INTEGER'), ('realized_pnl', 'TEXT'),
         ):
             if name not in bot_columns:
                 db.execute(f'ALTER TABLE bot_orders ADD COLUMN {name} {kind}')

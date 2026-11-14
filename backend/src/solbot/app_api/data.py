@@ -357,7 +357,43 @@ class DataReader:
             a=self.read('guardian','SELECT * FROM account_allocations')[0];h=self.read('guardian','SELECT * FROM risk_high_watermarks')[0]
             dd=str((Decimal(h['high'])-Decimal(h['equity']))/Decimal(h['high'])) if Decimal(h['high'])>0 else None
             dd_pct=f'{(Decimal(dd)*Decimal("100")):.2f}' if dd is not None else '0.00'
-            return dict(a,state=a.get('live_state'),account_id='SOL-live',symbol='SOLUSDT',book_symbol='SOLUSDT',guardian_cap_usdt=a.get('allocated'),legacy_account_id=owner['account_id'],**{k:v for k,v in h.items() if k!='singleton'},drawdown=dd,drawdown_pct=dd_pct,hard_limit='0.05',hard_limit_pct='5.00',assets=self.read('guardian','SELECT * FROM asset_ownership'),custody=self.read('guardian','SELECT * FROM custody_authorizations'),pending=self.read('guardian',"SELECT * FROM pending_actions WHERE status='PENDING' LIMIT 500"),verified=0<=self.clock()-a['equity_at']<=5000 and not a['recovery_required'])
+            state=a.get('live_state')
+            daily_loss_usdt='0.00'
+            loss_scope='GUARDIAN_WATERMARK'
+            if self._optional('binance_vault',"SELECT 1 FROM sqlite_master WHERE type='table' AND name='bot_orders' LIMIT 1"):
+                loss_scope='BOT_ONLY_EXCLUDES_MANUAL'
+                day_start_ms=(int(self.clock())//86_400_000)*86_400_000
+                mark_dec=self._mark('SOLUSDT')
+                realized_today=Decimal('0')
+                for row in self._optional('binance_vault',"SELECT price,quantity,exit_price,realized_pnl,COALESCE(closed_at,stop_updated_at,exit_started_at,filled_at,created_at) AS close_ts FROM bot_orders WHERE status='CLOSED'"):
+                    ts=row.get('close_ts')
+                    if not ts or int(ts)<day_start_ms:continue
+                    if row.get('realized_pnl') not in (None,''):
+                        try:
+                            realized_today+=Decimal(str(row['realized_pnl']))
+                            continue
+                        except Exception:pass
+                    try:
+                        ep,qty,ex=Decimal(str(row.get('price') or '0')),Decimal(str(row.get('quantity') or '0')),Decimal(str(row.get('exit_price') or '0'))
+                        if ep>0 and qty>0 and ex>0:realized_today+=(ex-ep)*qty
+                    except Exception:pass
+                unrealized=Decimal('0')
+                if mark_dec is not None and mark_dec>0:
+                    for row in self._optional('binance_vault',"SELECT price,quantity FROM bot_orders WHERE status IN ('PARTIALLY_FILLED','FILLED','EXIT_PENDING')"):
+                        try:
+                            ep,qty=Decimal(str(row.get('price') or '0')),Decimal(str(row.get('quantity') or '0'))
+                            if ep>0 and qty>0 and qty*mark_dec>=Decimal('5'):unrealized+=(mark_dec-ep)*qty
+                        except Exception:pass
+                cap=Decimal(str(a.get('allocated') or '2000'))
+                if cap<=0:cap=Decimal('2000')
+                loss=max(Decimal('0'),-(realized_today+unrealized))
+                daily_loss_usdt=f'{loss:.2f}'
+                dd_val=min(Decimal('1'),loss/cap)
+                dd=format(dd_val.quantize(Decimal('0.0001')),'f')
+                dd_pct=f'{(dd_val*Decimal("100")):.2f}'
+                if state=='HARD_LOCKED' and dd_val<Decimal('0.05'):
+                    state='NORMAL'
+            return dict(a,state=state,account_id='SOL-live',symbol='SOLUSDT',book_symbol='SOLUSDT',guardian_cap_usdt=a.get('allocated'),legacy_account_id=owner['account_id'],**{k:v for k,v in h.items() if k!='singleton'},drawdown=dd,drawdown_pct=dd_pct,daily_loss_usdt=daily_loss_usdt,daily_drawdown_pct=dd_pct,loss_scope=loss_scope,hard_limit='0.05',hard_limit_pct='5.00',assets=self.read('guardian','SELECT * FROM asset_ownership'),custody=self.read('guardian','SELECT * FROM custody_authorizations'),pending=self.read('guardian',"SELECT * FROM pending_actions WHERE status='PENDING' LIMIT 500"),verified=0<=self.clock()-a['equity_at']<=5000 and not a['recovery_required'])
         return self._safe(load)
     def live_orders(self,limit=50,offset=0):
         self.bounds(limit,offset)
@@ -373,13 +409,20 @@ class DataReader:
                 if row.get('asset')!='SOL':continue
                 quantity,cost=Decimal(row['quantity']),Decimal(row['cost'])
                 robot+=quantity
-                if len(slots)>=2:continue
                 entry=(cost/quantity) if quantity>0 else None
+                ref_px=mark if (mark is not None and mark>0) else entry
+                if ref_px is not None and ref_px>0 and quantity*ref_px<Decimal('5'):continue
+                if len(slots)>=2:continue
                 stage=self._stage(row.get('protection'))
                 slots.append({'source':'ROBOT','slot':len(slots)+1,'intent_id':row['intent_id'],'asset':'SOL','symbol':'SOLUSDT','quantity':self._num(quantity),'entry_price':None if entry is None else self._num(entry),'cost':self._num(cost),'cost_usdt':self._num(cost),'stage':stage,'protection':stage,'risk':row.get('risk'),**self._performance(entry,quantity,mark,'LAST_CLOSED_CANDLE')})
             bot_open=Decimal('0')
-            for row in self._optional('binance_vault',"SELECT quantity FROM bot_orders WHERE status IN ('FILLED','EXITING')"):
-                try: bot_open+=Decimal(str(row.get('quantity') or '0'))
+            for row in self._optional('binance_vault',"SELECT quantity,price,status FROM bot_orders WHERE status IN ('PARTIALLY_FILLED','FILLED','EXIT_PENDING','EXITING')"):
+                try:
+                    qty=Decimal(str(row.get('quantity') or '0'))
+                    entry_px=Decimal(str(row.get('price') or '0'))
+                    ref_px=mark if (mark is not None and mark>0) else entry_px
+                    if qty>0 and (ref_px<=0 or qty*ref_px>=Decimal('5')):
+                        bot_open+=qty
                 except Exception: pass
             account,observed,manual_orders=self._user_account()
             if not account:
@@ -391,13 +434,15 @@ class DataReader:
             sol=account.get('SOL')
             if sol:
                 excess=Decimal(sol['free'])+Decimal(sol['locked'])-robot-bot_open
-                if excess>0 and (bot_open==0 or excess>=Decimal('0.001')):
+                entry=self._average_entry(manual_orders)
+                if entry is None:
+                    buys=[row for row in manual_orders if row.get('side')=='BUY' and row.get('status')=='FILLED' and Decimal(str(row.get('price') or '0'))>0]
+                    if buys:
+                        entry=Decimal(str(max(buys, key=lambda row: int(row.get('time') or 0))['price']))
+                manual_ref=mark if (mark is not None and mark>0) else entry
+                is_dust_manual=(manual_ref is not None and manual_ref>0 and excess*manual_ref<Decimal('5'))
+                if excess>0 and (bot_open==0 or excess>=Decimal('0.001')) and not is_dust_manual:
                     manual.append({'source':'MANUAL','intent_id':'manual:SOL','asset':'SOL','symbol':'SOLUSDT','quantity':self._num(excess),'free':sol['free'],'locked':sol['locked']})
-                    entry=self._average_entry(manual_orders)
-                    if entry is None:
-                        buys=[row for row in manual_orders if row.get('side')=='BUY' and row.get('status')=='FILLED' and Decimal(str(row.get('price') or '0'))>0]
-                        if buys:
-                            entry=Decimal(str(max(buys, key=lambda row: int(row.get('time') or 0))['price']))
                     if entry is not None:
                         shown=self._num(entry)
                         manual[0]['entry_price']=shown
@@ -507,7 +552,6 @@ class DataReader:
             r2_trades=int(r2_trades_rows[0]['n']) if r2_trades_rows else 0
             trades=int(self.read('shadow',"SELECT COUNT(*) AS n FROM shadow_orders WHERE status='FILLED'")[0]['n'])+r2_trades
             r2_open_positions=self._read_r2('r2_shadow',"SELECT * FROM shadow_positions WHERE status='OPEN' LIMIT 500")
-            opens=int(self.read('shadow',"SELECT COUNT(*) AS n FROM shadow_positions WHERE status='OPEN'")[0]['n'])+len(r2_open_positions)
             rate=(Decimal(wins)/Decimal(len(closed))*Decimal('100')) if closed else Decimal('0')
             prot_rows=self._optional('shadow','SELECT * FROM shadow_protection LIMIT 500')+self._read_r2('r2_shadow','SELECT * FROM shadow_protection LIMIT 500')
             prot_map={}
@@ -525,8 +569,25 @@ class DataReader:
             if mark is None:
                 mark=self._mark('SOLUSDT')
             raw_positions=self.read('shadow',"SELECT * FROM shadow_positions WHERE status='OPEN' LIMIT 500")+r2_open_positions
-            positions=[]
+            pending_buy_pids={'p-'+str(r['order_id']) for r in self.read('shadow',"SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'")+self._read_r2('r2_shadow',"SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'")}
+            filtered_positions=[]
             for pos in raw_positions:
+                pid=pos.get('position_id')
+                if pid in pending_buy_pids:
+                    filtered_positions.append(pos)
+                    continue
+                try:
+                    qty_dec=Decimal(str(pos.get('quantity') or '0'))
+                    entry_dec=Decimal(str(pos.get('entry_price') or '0'))
+                    ref_px=mark if (mark is not None and mark>0) else entry_dec
+                    if ref_px>0 and qty_dec*ref_px<Decimal('5'):
+                        continue
+                except Exception:
+                    pass
+                filtered_positions.append(pos)
+            opens=len(filtered_positions)
+            positions=[]
+            for pos in filtered_positions:
                 enriched=dict(pos)
                 st=prot_map.get(pos.get('position_id')) or {}
                 stage=APTS_STAGE_SHORT.get(str(st.get('stage') or ''),'S0')
@@ -550,7 +611,7 @@ class DataReader:
                 enriched['reversal_hits']=reversal_hits
                 enriched['max_reversal_hits']=max_hits
                 positions.append(enriched)
-            return {'mode':'SIMULATED','symbol':'SOLUSDT','synced':True,'is_preview':False,'initial_capital':f'{initial:.2f}','equity':f'{equity:.2f}','pnl':f'{pnl:+.2f}','pnl_pct':f'{(pnl/initial*Decimal("100")):+.2f}%','win_rate':f'{rate:.1f}%','total_trades':trades,'active_positions':opens,'fee_asset':'BNB','fee_rate':'0.00075','fee_rate_label':'0.075%','bnb_cap_usdt':'20','bnb_refill_below_usdt':'3','bnb_refill_target_usdt':'10','ledger_fee_rate':account.get('fee_rate'),'bid':account.get('bid'),'ask':account.get('ask'),'account':account,'positions':positions,'protection':prot_rows,'rules':{'min_order_usdt':'300','max_order_usdt':'700','t1_stop_distance':'0.010','stag_hours':0,'max_positions':2}}
+            return {'mode':'SIMULATED','symbol':'SOLUSDT','synced':True,'is_preview':False,'initial_capital':f'{initial:.2f}','equity':f'{equity:.2f}','pnl':f'{pnl:+.2f}','pnl_pct':f'{(pnl/initial*Decimal("100")):+.2f}%','win_rate':f'{rate:.1f}%','total_trades':trades,'active_positions':opens,'fee_asset':'BNB','fee_rate':'0.00075','fee_rate_label':'0.075%','bnb_cap_usdt':'20','bnb_refill_below_usdt':'3','bnb_refill_target_usdt':'10','ledger_fee_rate':account.get('fee_rate'),'bid':account.get('bid'),'ask':account.get('ask'),'account':account,'positions':positions,'protection':prot_rows,'rules':{'min_order_usdt':'500','max_order_usdt':'1000','t1_stop_distance':'0.010','stag_hours':0,'max_positions':2}}
         result = self._safe(load)
         health = self._shadow_health()
         if not result.get('available'):

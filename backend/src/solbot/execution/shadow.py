@@ -38,6 +38,10 @@ class ShadowExecutor:
     def minimum_notional(self):
         return self.risk.minimum_notional
 
+    @property
+    def maximum_notional(self):
+        return self.risk.maximum_notional
+
     def __init__(self, path, *, symbol="SOLUSDT", account_id="SOL-shadow", fee_rate="0.001"):
         if symbol not in SYMBOLS:
             raise ValueError("unsupported shadow symbol")
@@ -152,7 +156,7 @@ class ShadowExecutor:
         low, high = amount(candidate.get("entry_low")), amount(candidate.get("entry_high"))
         price = amount(limit_price if limit_price is not None else candidate["entry_high"])
         size = amount(notional, "notional")
-        if not low <= price <= high or not self.minimum_notional <= size <= self.risk.maximum_notional:
+        if not low <= price <= high or not self.minimum_notional <= size <= self.maximum_notional:
             raise ShadowRejected("DENY_SIZE_PRICE", "order must stay within candidate price and account notional bounds")
         encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode()) > 65_536:
@@ -191,8 +195,23 @@ class ShadowExecutor:
 
     @staticmethod
     def _occupied_slots(db):
-        return (db.execute("SELECT COUNT(*) FROM shadow_positions WHERE status='OPEN'").fetchone()[0]
-                + db.execute("SELECT COUNT(*) FROM shadow_orders WHERE status='PENDING' AND side='BUY'").fetchone()[0])
+        acc = db.execute("SELECT bid FROM shadow_account WHERE singleton=1").fetchone()
+        bid = Decimal(acc[0]) if acc and acc[0] and Decimal(acc[0]) > 0 else None
+        pending_buys = {
+            "p-" + row[0]
+            for row in db.execute("SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'").fetchall()
+        }
+        slots = set(pending_buys)
+        for row in db.execute("SELECT position_id, quantity, entry_price, entry_cost FROM shadow_positions WHERE status='OPEN'").fetchall():
+            pid = row[0]
+            if pid in pending_buys:
+                slots.add(pid)
+                continue
+            ref = bid if bid is not None else Decimal(row[2])
+            val = Decimal(row[1]) * ref if ref > 0 else Decimal(row[3])
+            if val >= Decimal("5"):
+                slots.add(pid)
+        return len(slots)
 
     @staticmethod
     def _quantity(size,price):
@@ -253,8 +272,41 @@ class ShadowExecutor:
         pnl = proceeds - fee - Decimal(position["entry_cost"]) - Decimal(position["entry_fee"])
         db.execute("UPDATE shadow_account SET cash=? WHERE singleton=1", (str(cash),))
         db.execute("""UPDATE shadow_positions SET status='CLOSED',closed_at=?,exit_price=?,exit_fee=?,
-            realized_pnl=?,close_reason=? WHERE position_id=?""", (now_ms, str(price), str(fee), str(pnl), reason, position["position_id"]))
+            realized_pnl=?,close_reason=? WHERE position_id=?""",
+                   (now_ms, str(price), str(fee), str(pnl), reason, position["position_id"]))
         return fee
+
+    def _close_dust_positions(self, db, bid, now_ms):
+        dust_fills = []
+        pending_buys = {
+            "p-" + row[0]
+            for row in db.execute("SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'").fetchall()
+        }
+        for position in db.execute("SELECT * FROM shadow_positions WHERE status='OPEN'").fetchall():
+            pid = position["position_id"]
+            if pid in pending_buys:
+                continue
+            qty = Decimal(position["quantity"])
+            if qty * bid < Decimal("5"):
+                db.execute(
+                    "UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='dust_below_5_usdt' WHERE position_id=? AND side='SELL' AND status='PENDING'",
+                    (pid,),
+                )
+                fee = self._sell_fill(db, position, bid, now_ms, "dust_below_5_usdt_market_exit")
+                key = f"DUST_EXIT:{pid}:{now_ms}"
+                order_id = self._id(key)
+                db.execute(
+                    """INSERT OR IGNORE INTO shadow_orders(order_id,request_key,fingerprint,account_id,symbol,
+                        strategy_id,signal_id,side,status,limit_price,quantity,notional,reserved,position_id,
+                        created_at,expires_at,fill_at,fill_price,fee,close_reason,candidate_json)
+                        VALUES (?,?,?,?,?,?,?,'SELL','FILLED',?,?,?,'0',?,?,?,?,?,?,'dust_below_5_usdt_market_exit','{}')""",
+                    (order_id, key, order_id, self.account_id, self.symbol, position["strategy_id"], position["signal_id"],
+                     str(bid), position["quantity"], str(qty * bid), pid, now_ms, now_ms, now_ms, str(bid), str(fee)),
+                )
+                order = self._order(db, order_id)
+                if order is not None:
+                    dust_fills.append(order)
+        return dust_fills
 
     def _mark_risk(self, db, bid, now_ms):
         account = self._account(db)
@@ -296,9 +348,9 @@ class ShadowExecutor:
             if account["last_quote_ms"] is not None and quote_ms <= account["last_quote_ms"]:
                 return {"processed": False, "code": "DUPLICATE_OR_OLD_QUOTE", "fills": []}
             db.execute("UPDATE shadow_account SET last_quote_ms=?,bid=?,ask=? WHERE singleton=1", (quote_ms, str(bid), str(ask)))
+            fills = self._close_dust_positions(db, bid, quote_ms)
             if self._mark_risk(db, bid, quote_ms):
-                return {"processed": True, "code": "HARD_LOCKED", "fills": self._hard_stop_fills(db, quote_ms)}
-            fills = []
+                return {"processed": True, "code": "HARD_LOCKED", "fills": fills + self._hard_stop_fills(db, quote_ms)}
             orders = db.execute("SELECT * FROM shadow_orders WHERE status='PENDING' AND created_at<? ORDER BY created_at,order_id", (quote_ms,)).fetchall()
             for order in orders:
                 price = ask if order["side"] == "BUY" else bid

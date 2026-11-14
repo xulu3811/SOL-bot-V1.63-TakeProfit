@@ -60,7 +60,7 @@ object BotFormatters {
         "GUARDIAN_HARD_LOCK" to "触发日内 5% 硬风控熔断保护，自动买入已锁定",
         "API_KEY_MISSING" to "尚未绑定 Binance API 密钥，无法查询余额或自动交易",
         "SPOT_PERMISSION_OFF" to "当前 API 未开启「现货与杠杆交易」权限，仅支持只读对账",
-        "INSUFFICIENT_FREE_USDT" to "可用 USDT 低于单笔下限 $300.00，当前不会自动开新仓",
+        "INSUFFICIENT_FREE_USDT" to "可用 USDT 低于单笔下限 $500.00，当前不会自动开新仓",
         "MAX_SLOTS_REACHED" to "机器人已满 2 槽位持仓上限，暂停开立新仓",
     )
 
@@ -111,7 +111,7 @@ object BotFormatters {
     fun blockerLabel(code: String?, freeUsdt: String?): String? {
         if (code.isNullOrBlank() || code.equals("null", ignoreCase = true)) return null
         if (code == "INSUFFICIENT_FREE_USDT" && !freeUsdt.isNullOrBlank()) {
-            return "可用 USDT $${formatNumber(freeUsdt, 2)} 低于单笔下限 $300.00，新买入已暂停"
+            return "可用 USDT $${formatNumber(freeUsdt, 2)} 低于单笔下限 $500.00，新买入已暂停"
         }
         return blockerMap[code] ?: code
     }

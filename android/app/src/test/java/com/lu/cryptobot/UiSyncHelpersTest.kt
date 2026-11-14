@@ -76,7 +76,7 @@ class UiSyncHelpersTest {
         assertEquals("空头排列", BotFormatters.emaAlignmentLabel("BEARISH"))
         assertEquals("多头排列", BotFormatters.emaAlignmentLabel("BULLISH"))
         val msg = BotFormatters.blockerLabel("INSUFFICIENT_FREE_USDT", "1.61").orEmpty()
-        assertTrue(msg.contains("1.61") && msg.contains("300.00"))
+        assertTrue(msg.contains("1.61") && msg.contains("500.00"))
         assertEquals("4h/1h 趋势强度不足", BotFormatters.reasonLabel("HIGHER_TIMEFRAME_WEAK_TREND"))
         assertEquals("", JSONObject().put("blocker", JSONObject.NULL).optCleanString("blocker"))
         assertEquals("", JSONObject().put("blocker", "null").optCleanString("blocker"))

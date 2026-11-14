@@ -14,9 +14,12 @@ from solbot.mathematics.execution_cost import FeeSchedule, estimate_cost
 from solbot.mathematics.expected_return import estimate_return
 from solbot.mathematics.fill_probability import estimate_fill
 from solbot.mathematics.entry_pricing import price_entry
-from solbot.mathematics.position_sizing import size_position
+from solbot.mathematics.position_sizing import ResearchRiskParameters, size_position
+from solbot.execution.shadow import ShadowRejected
 from solbot.execution.p3_shadow import P3ShadowExecutor
 from solbot.storage.read_snapshot import publish
+
+SHADOW_RISK_PARAMETERS=ResearchRiskParameters(symbol='SOLUSDT',version='p3-shadow-500-1000-v1',t1_budget=Decimal('0.012'),r1_budget=Decimal('0.008'),min_notional=Decimal('500'),max_notional=Decimal('1000'),allow_cash_fallback=True)
 
 def scheduler_status(report):
     """Normalize only legacy diagnostic floats, never monetary/model inputs."""
@@ -87,9 +90,11 @@ def plan_signal(payload,features,account,now,market_db_path=None):
     cost=estimate_cost(context,entry_price=price,exit_price=price*Decimal('1.015'),quantity=quantity,fees=bnb_fees)
     execution=estimate_fill(context,features,limit_price=price,quantity=quantity,wait_ms=min(60000,max(1,signal['expires_at']-now)))
     expected=estimate_return(context,notional=amount,profit_fraction='.015',loss_fraction=stop_dist,cost=cost,execution=execution)
-    sizing_args=dict(entry_fee_rate='0.00075',exit_fee_rate='0.00075',stop_distance=stop_dist,**ref_kwargs)
+    sizing_args=dict(entry_fee_rate='0.00075',exit_fee_rate='0.00075',stop_distance=stop_dist,parameters=SHADOW_RISK_PARAMETERS if signal['symbol']=='SOLUSDT' else None,**ref_kwargs)
+    bid_ref=D(features['bid'],positive=True) if features.get('bid') else None
+    non_dust_positions=sum(1 for pos in account['positions'] if D(pos['quantity'])*(bid_ref or D(pos['entry_price']))>=Decimal('5'))
     sizing=size_position(context,features,score=signal['score'],entry_price=price,equity=account['last_equity'],high_watermark=account['peak_equity'],
-        cash_balance=account['cash'],reserved_entry_notional=account['reserved'],open_positions=len(account['positions']),
+        cash_balance=account['cash'],reserved_entry_notional=account['reserved'],open_positions=non_dust_positions,
         pending_entries=sum(1 for r in account['pending_orders'] if r['side']=='BUY' and not r.get('position_id')),hard_locked=bool(account['hard_locked']),**sizing_args)
     pricing=price_entry(context,features,signal_max_price=signal['entry_high'],notional=amount,
         atr=signal['indicators']['5m']['atr14'],cost=cost,expected=expected,stop_distance=stop_dist,**ref_kwargs)
@@ -123,7 +128,7 @@ def main():
             features=micro.latest()
             if features is None:raise ValueError('no public depth snapshot')
             features=refresh_features(features,now)
-            if args.shadow_db and ledger is None:ledger=P3ShadowExecutor(args.shadow_db,rules=SymbolRules.from_exchange_info(features['rules'],args.symbol),fee_rate='0.00075')
+            if args.shadow_db and ledger is None:ledger=P3ShadowExecutor(args.shadow_db,rules=SymbolRules.from_exchange_info(features['rules'],args.symbol),fee_rate='0.00075',minimum_notional='500',maximum_notional='1000')
             evidence=TrendEvidence();market_ready=False
             try:
                 with opener.open(f'http://127.0.0.1:{port}/health',timeout=2) as r:health=json.load(r)

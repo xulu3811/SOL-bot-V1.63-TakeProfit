@@ -111,11 +111,11 @@ def create_app(auth,reader,notifications,control,vault=None):
             blocker = 'TRADE_PERMISSION_REQUIRED'
         elif open_slots >= 2:
             blocker = 'SLOTS_FULL'
-        elif free_usdt < Decimal('300'):
+        elif free_usdt < Decimal('500'):
             blocker = 'INSUFFICIENT_FREE_USDT'
         else:
             blocker = None
-        dd_pct = (risk_doc or {}).get('drawdown_pct')
+        dd_pct = (risk_doc or {}).get('daily_drawdown_pct') or (risk_doc or {}).get('drawdown_pct')
         if dd_pct is None:
             try:
                 dd_raw = Decimal(str((risk_doc or {}).get('drawdown') or '0'))
@@ -127,8 +127,8 @@ def create_app(auth,reader,notifications,control,vault=None):
             'total_usdt': f'{total_usdt:.2f}',
             'free_bnb': f'{free_bnb:.4f}',
             'free_sol': f'{free_sol:.3f}',
-            'min_order_usdt': '300.00',
-            'max_order_usdt': '700.00',
+            'min_order_usdt': '500.00',
+            'max_order_usdt': '1000.00',
             'max_slots': 2,
             'open_slots': open_slots,
             'configured': configured,
@@ -138,14 +138,38 @@ def create_app(auth,reader,notifications,control,vault=None):
             'daily_drawdown_pct': str(dd_pct),
             'hard_circuit_pct': str((risk_doc or {}).get('hard_limit_pct') or '5.00'),
         }
+    def _apply_bot_risk(risk_doc):
+        risk_copy=dict(risk_doc or {})
+        try:
+            v=account_vault()
+            if v is not None and callable(getattr(v,'bot_daily_risk',None)):
+                dbp=getattr(v,'db_path',None)
+                if dbp is not None and Path(dbp).exists():
+                    cap=risk_copy.get('guardian_cap_usdt') or risk_copy.get('allocated') or '2000'
+                    bot_risk=v.bot_daily_risk(reference_cap=cap)
+                    if isinstance(bot_risk,dict):
+                        risk_copy.update(bot_risk)
+                        risk_copy['daily_drawdown_pct']=bot_risk.get('drawdown_pct',risk_copy.get('drawdown_pct','0.00'))
+                        if risk_copy.get('state')=='HARD_LOCKED' and Decimal(str(bot_risk.get('drawdown') or '0'))<Decimal('0.05'):
+                            risk_copy['state']='NORMAL'
+        except Exception:
+            pass
+        return risk_copy
     def present_live_status():
         base=dict(reader.live_status() or {})
-        try: risk=dict(reader.live_risk() or {})
+        try: risk=_apply_bot_risk(reader.live_risk() or {})
         except Exception: risk={}
         if base.get('state')!='HARD_LOCKED':
             try: user=account_vault().live_state()
             except Exception: user='LIVE_OFF'
             if user in ('LIVE_ON','LIVE_OFF','PAUSED','HARD_LOCKED'):
+                base['state']=user
+                base['live_state']=user
+                base['available']=True
+        elif risk.get('loss_scope')=='BOT_ONLY_EXCLUDES_MANUAL' and Decimal(str(risk.get('drawdown') or '0'))<Decimal('0.05'):
+            try: user=account_vault().live_state()
+            except Exception: user='LIVE_OFF'
+            if user in ('LIVE_ON','LIVE_OFF','PAUSED'):
                 base['state']=user
                 base['live_state']=user
                 base['available']=True
@@ -159,7 +183,7 @@ def create_app(auth,reader,notifications,control,vault=None):
         base['live_strategies']=list(allowed_fn()) if callable(allowed_fn) else ['T1']
         return base
     def present_live_risk():
-        base=dict(reader.live_risk() or {})
+        base=_apply_bot_risk(reader.live_risk() or {})
         status_doc=present_live_status()
         if status_doc.get('state'):
             base['state']=status_doc['state']

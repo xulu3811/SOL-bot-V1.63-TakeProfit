@@ -282,7 +282,7 @@ fun LiveScreen(
                                     softWrap = false,
                                 )
                                 Text(
-                                    text = "2槽 · $300–700",
+                                    text = "2槽 · $500–1000",
                                     fontSize = 10.sp,
                                     lineHeight = 12.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -344,7 +344,7 @@ fun LiveScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        text = "日内回撤 $drawdownPctStr% / 熔断 $hardLimitPctStr% · 单笔 $300–$700 动态定仓 · 上限 2 个策略槽位 · 风控参考额度 $$guardianCap USDT",
+                        text = "日内回撤 $drawdownPctStr% / 熔断 $hardLimitPctStr% · 单笔 $500–$1000 动态定仓(不足$1000按可用全额·低于$500拒开) · 上限 2 个策略槽位 · 风控参考额度 $$guardianCap USDT(不含手动亏损)",
                         modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelSmall.tnum(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -420,7 +420,7 @@ fun LiveScreen(
             1 -> OrdersFeedSection(
                 orders = botOrdersArr,
                 isBot = true,
-                emptyText = "暂无机器人自动下单记录，触发 T1/T2/R2 高分信号且可用 USDT ≥ $300 时将自动挂单。",
+                emptyText = "暂无机器人自动下单记录，触发 T1/T2/R2 高分信号且可用 USDT ≥ $500 时将自动挂单。",
                 onInspectOrder = onInspectOrder,
             )
             else -> OrdersFeedSection(

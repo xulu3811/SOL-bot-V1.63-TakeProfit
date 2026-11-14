@@ -12,6 +12,9 @@ class ResearchRiskParameters:
     version: str
     t1_budget: Decimal = Decimal("0.004")
     r1_budget: Decimal = Decimal("0.0025")
+    min_notional: Decimal = Decimal("300")
+    max_notional: Decimal = Decimal("700")
+    allow_cash_fallback: bool = False
 
 
 PARAMETERS = {symbol: ResearchRiskParameters(symbol, symbol.lower() + "-risk-research-1")
@@ -22,8 +25,9 @@ def size_position(context, features, *, score, entry_price, equity, high_waterma
                   cash_balance, reserved_entry_notional="0", reserved_entry_fees="0",
                   open_positions=0, pending_entries=0, hard_locked=False,
                   entry_fee_rate="0.001", exit_fee_rate="0.001", slippage_fraction="0.002",
-                  stop_distance="0.008", reference_price=None, reference_minutes=None):
-    parameters = PARAMETERS[context.symbol]
+                  stop_distance="0.008", reference_price=None, reference_minutes=None,
+                  parameters=None):
+    parameters = parameters if parameters is not None else PARAMETERS[context.symbol]
     inputs = dict(features=features, score=score, entry_price=entry_price, equity=equity,
                   high_watermark=high_watermark, cash_balance=cash_balance,
                   reserved_entry_notional=reserved_entry_notional, reserved_entry_fees=reserved_entry_fees,
@@ -60,18 +64,31 @@ def size_position(context, features, *, score, entry_price, equity, high_waterma
         reasons.append("RESERVATIONS_EXCEED_CASH")
     with localcontext() as precision:
         precision.prec = 40
-        n_score = Decimal("300") + Decimal("400") * clip((score - 75) / 25)
+        min_n = parameters.min_notional
+        max_n = parameters.max_notional
+        n_score = min_n + (max_n - min_n) * clip((score - 75) / 25)
         loss_fraction = stop + entry_fee + exit_fee + slip
         n_risk = net * risk_budget / loss_fraction
         n_available = max(ZERO, cash - reserved) / (ONE + entry_fee)
-        permitted = min(n_score, Decimal("700"), n_risk, n_available)
-        if permitted < 300:
-            reasons.append("ALLOWED_NOTIONAL_BELOW_300")
+        if parameters.allow_cash_fallback and min_n <= n_available < max_n:
+            permitted = min(max_n, n_risk, floor_step(n_available, Decimal("0.01")))
+        else:
+            permitted = min(n_score, max_n, n_risk, n_available)
+        if permitted < min_n:
+            reasons.append(f"ALLOWED_NOTIONAL_BELOW_{int(min_n)}")
         rules = SymbolRules.from_exchange_info(features["rules"], context.symbol)
         qty = floor_step(permitted / price, rules.step_size)
         actual = qty * price
-        if actual < 300:
-            reasons.append("ROUNDED_NOTIONAL_BELOW_300")
+        if parameters.allow_cash_fallback and actual < min_n and (qty + rules.step_size) * price <= min(max_n, n_available):
+            qty = qty + rules.step_size
+            actual = qty * price
+        min_rounded = (
+            max(rules.min_notional, min_n - price * rules.step_size)
+            if parameters.allow_cash_fallback and permitted >= min_n
+            else min_n
+        )
+        if actual < min_rounded:
+            reasons.append(f"ROUNDED_NOTIONAL_BELOW_{int(min_n)}")
         if qty > 0:
             reasons.extend(rules.validate_order(price, qty, reference_price=reference_price,
                                                  reference_minutes=reference_minutes))

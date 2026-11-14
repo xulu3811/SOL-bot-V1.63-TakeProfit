@@ -2,13 +2,14 @@
 from decimal import Decimal
 from solbot.execution.p3_shadow import P3ShadowExecutor
 from solbot.execution.shadow import ShadowRejected
-from solbot.mathematics.decimal_utils import D, floor_step
+from solbot.mathematics.decimal_utils import D, clip, floor_step
 
 
 class R2ShadowExecutor(P3ShadowExecutor):
     allowed_strategies = ('R2',)
-    minimum_notional = Decimal('100')
-    risk_budget = Decimal('.002')
+    minimum_notional = Decimal('500')
+    maximum_notional = Decimal('1000')
+    risk_budget = Decimal('.012')
 
     def submit_intent(self, intent, now):
         # Retry with the identical request after a crash between ledger commit
@@ -22,9 +23,17 @@ class R2ShadowExecutor(P3ShadowExecutor):
         stop = floor_step(D(intent['stop_price']), self.rules.tick_size)
         if not 0 < stop < price:
             raise ShadowRejected('INVALID_STRUCTURE_STOP', 'invalid structural stop')
-        risk_fraction = (price-stop)/price + self.fee_rate*2 + Decimal('.001')
-        notional = min(self.risk.maximum_notional, D(account['last_equity'])*self.risk_budget/risk_fraction,
-                       (D(account['cash'])-D(account['reserved']))/(1+self.fee_rate))
+        risk_fraction = (price - stop) / price + self.fee_rate * 2 + Decimal('.001')
+        cash_cap = (D(account['cash']) - D(account['reserved'])) / (1 + self.fee_rate)
+        risk_cap = D(account['last_equity']) * self.risk_budget / risk_fraction
+        if min(self.maximum_notional, risk_cap, cash_cap) < self.minimum_notional:
+            raise ShadowRejected('R2_RISK_BELOW_MINIMUM', f'risk or available cash permits less than {self.minimum_notional} USDT')
+        if cash_cap < self.maximum_notional:
+            notional = min(self.maximum_notional, risk_cap, floor_step(cash_cap, Decimal('0.01')))
+        else:
+            score = D(intent.get('score', 75))
+            score_notional = self.minimum_notional + (self.maximum_notional - self.minimum_notional) * clip((score - 75) / 25)
+            notional = min(score_notional, self.maximum_notional, risk_cap, cash_cap)
         if notional < self.minimum_notional:
             raise ShadowRejected('R2_RISK_BELOW_MINIMUM', f'risk budget permits less than {self.minimum_notional} USDT')
         candidate = dict(intent, risk_flags=['RESEARCH_PARAMETERS_UNVALIDATED'], stop_price=str(stop))

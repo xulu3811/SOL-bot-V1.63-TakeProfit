@@ -193,7 +193,7 @@ fun ShadowScreen(
                     Column {
                         Text("BNB $feeLabel 抵扣与沙盒参数", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                         Text(
-                            text = "单笔 $300–$700 · T1/T2/R2 · 未止损长持",
+                            text = "单笔 $500–$1000 · T1/T2/R2 · 未止损长持",
                             style = MaterialTheme.typography.labelSmall.tnum(),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

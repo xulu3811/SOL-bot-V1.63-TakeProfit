@@ -26,10 +26,12 @@ class P3ShadowExecutor(ShadowExecutor):
     risk_policy='BLOCK_ENTRIES_KEEP_PROTECTION_V1'
 
     def __init__(self,path,*,rules:SymbolRules,symbol='SOLUSDT',account_id='SOL-shadow',fee_rate='0.001',
-                 participation='0.10',slippage_rate='0.0005'):
+                 participation='0.10',slippage_rate='0.0005',minimum_notional=None,maximum_notional=None):
         if symbol!='SOLUSDT' or account_id!='SOL-shadow' or rules.symbol!=symbol:
             raise ValueError('P3 simulation belongs only to SOL-shadow/SOLUSDT')
         self.rules=rules
+        self._min_notional_override=D(minimum_notional,positive=True) if minimum_notional is not None else None
+        self._max_notional_override=D(maximum_notional,positive=True) if maximum_notional is not None else Decimal('1000')
         self.participation=D(participation,positive=True)
         self.slippage_rate=D(slippage_rate,nonnegative=True)
         if self.participation>Decimal('.1') or self.slippage_rate>Decimal('.01'):
@@ -73,9 +75,18 @@ class P3ShadowExecutor(ShadowExecutor):
             if config!={'risk_policy':self.risk_policy,'participation':str(self.participation),'slippage_rate':str(self.slippage_rate)}:
                 raise ValueError('persisted P3 policy/assumptions mismatch; explicit migration required')
 
+    @property
+    def minimum_notional(self):
+        return self._min_notional_override if self._min_notional_override is not None else super().minimum_notional
+
+    @property
+    def maximum_notional(self):
+        return self._max_notional_override
+
     def _quantity(self,size,price):
         quantity=floor_step(size/price,self.rules.step_size)
-        if quantity*price<self.minimum_notional or quantity<self.rules.min_qty:
+        min_allowed=max(self.rules.min_notional,self.minimum_notional-price*self.rules.step_size) if size>=self.minimum_notional else self.minimum_notional
+        if quantity*price<min_allowed or quantity<self.rules.min_qty:
             raise ShadowRejected('DENY_ROUNDED_SIZE','rounded order falls below required size')
         if quantity>self.rules.max_qty:raise ShadowRejected('DENY_QUANTITY','quantity exceeds exchange rule')
         initial_stop(price,self.rules.tick_size)
@@ -92,9 +103,7 @@ class P3ShadowExecutor(ShadowExecutor):
 
     @staticmethod
     def _occupied_slots(db):
-        keys={r[0] for r in db.execute("SELECT position_id FROM shadow_positions WHERE status='OPEN'")}
-        keys.update('p-'+r[0] for r in db.execute("SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'"))
-        return len(keys)
+        return ShadowExecutor._occupied_slots(db)
 
     def _before_sell(self,db,position,price):
         reasons=self.rules.validate_order(price,position['quantity'],'SELL')
@@ -273,6 +282,39 @@ class P3ShadowExecutor(ShadowExecutor):
             (fill_id,order['order_id'],position_id,now_ms,side,str(quantity),str(price),str(fee),input_hash,'ASSUMED_10_PERCENT_DISPLAYED_DEPTH_WITH_SLIPPAGE'))
         return {'fill_id':fill_id,'side':side,'quantity':str(quantity),'price':str(price),'fee':str(fee),'remaining':str(remaining),'order_id':order['order_id']}
 
+    def _close_dust_positions(self,db,bid,now_ms,digest=''):
+        dust_fills=[]
+        pending_buys={'p-'+row[0] for row in db.execute("SELECT order_id FROM shadow_orders WHERE status='PENDING' AND side='BUY'").fetchall()}
+        for position in db.execute("SELECT * FROM shadow_positions WHERE status='OPEN'").fetchall():
+            pid=position['position_id']
+            if pid in pending_buys:continue
+            qty=D(position['quantity'],nonnegative=True)
+            if qty*bid<Decimal('5'):
+                db.execute("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='dust_below_5_usdt' WHERE position_id=? AND side='SELL' AND status='PENDING'",(pid,))
+                db.execute('DELETE FROM shadow_protection WHERE position_id=?',(pid,))
+                prev_pnl=D(position['realized_pnl'] or '0') if position['realized_pnl'] is not None else Decimal('0')
+                fee=self._sell_fill(db,position,bid,now_ms,'dust_below_5_usdt_market_exit')
+                if prev_pnl:
+                    row=db.execute('SELECT realized_pnl FROM shadow_positions WHERE position_id=?',(pid,)).fetchone()
+                    db.execute('UPDATE shadow_positions SET realized_pnl=? WHERE position_id=?',(str(D(row[0])+prev_pnl),pid))
+                key=f'DUST_EXIT:{pid}:{now_ms}'
+                order_id=self._id(key)
+                notional=qty*bid
+                input_hash=digest or self._id(key)
+                db.execute("""INSERT OR IGNORE INTO shadow_orders(order_id,request_key,fingerprint,account_id,symbol,
+                    strategy_id,signal_id,side,status,limit_price,quantity,notional,reserved,position_id,
+                    created_at,expires_at,fill_at,fill_price,fee,close_reason,candidate_json,
+                    executed_quantity,executed_notional,executed_fee,protection_order)
+                    VALUES (?,?,?,?,?,?,?,'SELL','FILLED',?,?,?,'0',?,?,?,?,?,?,'dust_below_5_usdt_market_exit','{}',?,?,?,1)""",
+                    (order_id,key,order_id,self.account_id,self.symbol,position['strategy_id'],position['signal_id'],
+                     str(bid),position['quantity'],str(notional),pid,now_ms,now_ms,now_ms,str(bid),str(fee),
+                     position['quantity'],str(notional),str(fee)))
+                fill_id=self._id(f'{order_id}:{input_hash}')
+                db.execute('INSERT OR IGNORE INTO shadow_fills VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    (fill_id,order_id,pid,now_ms,'SELL',position['quantity'],str(bid),str(fee),input_hash,'DUST_BELOW_5_USDT_MARKET_EXIT'))
+                dust_fills.append({'fill_id':fill_id,'side':'SELL','quantity':position['quantity'],'price':str(bid),'fee':str(fee),'remaining':'0','order_id':order_id,'close_reason':'dust_below_5_usdt_market_exit'})
+        return dust_fills
+
     def process_quote(self,*args,**kwargs):
         raise ValueError('P3 requires synchronized depth inputs via process_market; P2 quote-only execution disabled')
 
@@ -297,9 +339,10 @@ class P3ShadowExecutor(ShadowExecutor):
             if last and int(features['update_id'])<=int(last[0]):return {'processed':False,'code':'DUPLICATE_OR_OLD_DEPTH','fills':[]}
             self._expire(db,now_ms)
             db.execute('UPDATE shadow_account SET last_quote_ms=?,bid=?,ask=?',(stamp,str(bid),str(ask)))
+            dust_fills=self._close_dust_positions(db,bid,now_ms,digest)
             locked=self._mark_risk(db,bid,now_ms)
             protections=self._protection(db,features,evidence,now_ms)
-            fills=[]
+            fills=list(dust_fills)
             # Shared per-event liquidity budget prevents each order reusing the
             # same displayed depth. No quantity exists beyond the observed book.
             levels={side:[[D(p,positive=True),floor_step(D(q,nonnegative=True)*self.participation,self.rules.step_size)]

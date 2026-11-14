@@ -77,7 +77,7 @@ def step(vault, reader=None, now=None, bid=None, evidence=None, tick=None, micro
     result = {'advanced': False}
     has_manual = vault.protection() is not None
     live_on = vault.live_state() == 'LIVE_ON'
-    has_bots = vault.has_open_bots()
+    has_bots = vault.has_open_bots(include_dust=True)
     ask = micro.get('ask') if isinstance(micro, dict) else None
     if has_manual:
         bid, tick, ask = _resolve_bid_and_tick(vault, bid, tick, micro, now)

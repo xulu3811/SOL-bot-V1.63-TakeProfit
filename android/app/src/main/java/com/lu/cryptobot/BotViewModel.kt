@@ -221,7 +221,7 @@ internal object FrameSyncHelper {
         "BINANCE_UNREACHABLE" -> "暂时连不上币安"
         "NOT_CONFIGURED" -> "还没有保存 API"
         "DENY_NOT_READY" -> "实盘开关没有打开。请确认币安现货交易权限已开启，并且提现保持关闭。"
-        "USDT_BELOW_300" -> "可用 USDT 不足 300，这次没有买入。"
+        "USDT_BELOW_500", "USDT_BELOW_300" -> "可用 USDT 不足 500，这次没有买入。"
         "SLOTS_FULL" -> "已经有 2 个策略仓，不再开新仓。"
         "TRADE_PERMISSION_REQUIRED" -> "托管止损需要现货交易权限。请保持提现关闭，只打开现货交易后再试。"
         "INSUFFICIENT_FREE_SOL" -> "可用 SOL 不足，止损单没有提交。"
