@@ -42,6 +42,11 @@ class ShadowExecutor:
     def maximum_notional(self):
         return self.risk.maximum_notional
 
+    @property
+    def maximum_slots(self):
+        override = getattr(self, "_max_slots_override", None)
+        return int(override) if override is not None and int(override) >= 1 else self.risk.maximum_slots
+
     def __init__(self, path, *, symbol="SOLUSDT", account_id="SOL-shadow", fee_rate="0.001"):
         if symbol not in SYMBOLS:
             raise ValueError("unsupported shadow symbol")
@@ -156,7 +161,8 @@ class ShadowExecutor:
         low, high = amount(candidate.get("entry_low")), amount(candidate.get("entry_high"))
         price = amount(limit_price if limit_price is not None else candidate["entry_high"])
         size = amount(notional, "notional")
-        if not low <= price <= high or not self.minimum_notional <= size <= self.maximum_notional:
+        min_bound = getattr(self, "_effective_minimum_notional", self.minimum_notional)
+        if not low <= price <= high or not min_bound <= size <= self.maximum_notional:
             raise ShadowRejected("DENY_SIZE_PRICE", "order must stay within candidate price and account notional bounds")
         encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode()) > 65_536:
@@ -176,7 +182,7 @@ class ShadowExecutor:
             if account["hard_locked"]:
                 raise ShadowRejected("DENY_HARD_LOCKED", "five percent account drawdown lock is persistent")
             slots = self._occupied_slots(db)
-            if slots >= self.risk.maximum_slots:
+            if slots >= self.maximum_slots:
                 raise ShadowRejected("DENY_MAX_SLOTS", "positions and pending buys occupy at most two slots")
             reserve = size * (1 + self.fee_rate)
             if Decimal(account["cash"]) - Decimal(account["reserved"]) < reserve:
@@ -435,7 +441,7 @@ class ShadowExecutor:
                            pending_orders=[dict(row) for row in db.execute("SELECT * FROM shadow_orders WHERE status='PENDING' ORDER BY created_at,order_id")],
                            fee_model="estimated proportional fee; no depth or partial fills",
                            guardian_status="NOT_IMPLEMENTED_FOR_LIVE", apts_status="NOT_IMPLEMENTED",
-                           initial_stop_contract="0.008", profit_protection_contract="0.01", apts_trigger_contract="0.015")
+                           initial_stop_contract="0.008", profit_protection_contract="0.008", apts_trigger_contract="0.015")
             return account
 
     def orders(self, *, limit=100):

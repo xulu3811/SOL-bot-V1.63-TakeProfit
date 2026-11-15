@@ -25,7 +25,6 @@ import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Notifications
-import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -214,7 +213,6 @@ fun TopStatusBar(
     liveState: String,
     microReady: Boolean,
     unreadAlerts: Int,
-    onRefresh: () -> Unit,
     onOpenAlerts: () -> Unit,
     onOpenConnect: () -> Unit,
     onLiveBadgeClick: () -> Unit,
@@ -335,14 +333,6 @@ fun TopStatusBar(
                             )
                         }
                     }
-                    IconButton(onClick = onRefresh, modifier = Modifier.size(38.dp)) {
-                        Icon(
-                            Icons.Outlined.Refresh,
-                            contentDescription = "刷新数据",
-                            tint = MaterialTheme.colorScheme.onSurface,
-                            modifier = Modifier.size(20.dp),
-                        )
-                    }
                     IconButton(onClick = onOpenConnect, modifier = Modifier.size(38.dp)) {
                         Icon(
                             Icons.Outlined.Link,
@@ -378,7 +368,7 @@ fun AptsTimelineCard(
 
     val steps = listOf(
         Triple("S0", initialStopLabel, bot.lossSoft to bot.loss),
-        Triple("S1", "+1.0% 保本", bot.infoSoft to bot.info),
+        Triple("S1", "+0.8% 保本", bot.infoSoft to bot.info),
         Triple("S2", "+1.5% 追尾", bot.gainSoft to bot.gain),
         Triple("长持", "不限时持仓", bot.warnSoft to bot.warn),
     )
@@ -520,7 +510,7 @@ fun AptsTimelineCard(
             Spacer(Modifier.height(8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("• S0 初始保护：策略开仓 -1.0%（人工托管 -0.8%）交易所原生挂单。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("• S1 移动保本：浮盈达 +1.0% 后，止损抬升至成本上方 +0.15% 保本位。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("• S1 移动保本：浮盈达 +0.8% 后，止损抬升至成本上方保本位（覆盖手续费与滑点）。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("• S2 动态跟踪：浮盈 ≥ +1.5% 启动动态回撤保护，需连续 2-tick 确认防插针。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("• 持续持仓规则：已取消 12h 限时退场，未触发止损或趋势衰竭前将一直持仓。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

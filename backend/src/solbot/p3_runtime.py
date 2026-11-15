@@ -20,6 +20,229 @@ from solbot.execution.p3_shadow import P3ShadowExecutor
 from solbot.storage.read_snapshot import publish
 
 SHADOW_RISK_PARAMETERS=ResearchRiskParameters(symbol='SOLUSDT',version='p3-shadow-500-1000-v1',t1_budget=Decimal('0.012'),r1_budget=Decimal('0.008'),min_notional=Decimal('500'),max_notional=Decimal('1000'),allow_cash_fallback=True)
+CROSS_STRATEGY_COOLDOWN_MS=900_000
+MAX_COMBINED_SHADOW_SLOTS=1
+
+
+def load_shared_trading_config(market_db_path=None, shadow_db_path=None):
+    candidates = []
+    env_path = os.environ.get('SOLBOT_TRADING_CONFIG_PATH', '').strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    for base in (shadow_db_path, market_db_path):
+        if base:
+            try:
+                candidates.append(Path(base).resolve().parent / 'trading-config.json')
+            except Exception:
+                pass
+    for path in candidates:
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding='utf-8'))
+                min_u = D(raw.get('min_order_usdt') or '500', positive=True)
+                max_u = D(raw.get('max_order_usdt') or str(min_u), positive=True)
+                if max_u < min_u:
+                    max_u = min_u
+                slots = max(1, min(10, int(raw.get('max_slots') or 2)))
+                return {'min_order_usdt': min_u, 'max_order_usdt': max_u, 'max_slots': slots, 'custom': True}
+        except Exception:
+            continue
+    return None
+
+
+def _inspect_shadow_db_activity(db_path, now_ms):
+    path = Path(db_path).resolve() if db_path else None
+    if path is None or not path.exists():
+        return 0, []
+    try:
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=3)) as db:
+            db.row_factory = sqlite3.Row
+            acc = db.execute("SELECT bid FROM shadow_account WHERE singleton=1").fetchone()
+            bid = D(acc['bid'], positive=True) if acc and acc['bid'] and D(acc['bid']) > 0 else None
+            pending_rows = db.execute(
+                "SELECT order_id, created_at FROM shadow_orders WHERE side='BUY' AND status='PENDING' AND expires_at>?",
+                (now_ms,),
+            ).fetchall()
+            pending_pids = {'p-' + r['order_id'] for r in pending_rows}
+            slots = set(pending_pids)
+            active_buy_times = [int(r['created_at'] or 0) for r in pending_rows if r['created_at']]
+            for pos in db.execute(
+                "SELECT position_id, signal_id, quantity, entry_price, entry_cost, opened_at FROM shadow_positions WHERE status='OPEN'"
+            ).fetchall():
+                pid = pos['position_id']
+                if pid in pending_pids:
+                    slots.add(pid)
+                    continue
+                ref = bid if bid is not None else D(pos['entry_price'])
+                val = D(pos['quantity']) * ref if ref > 0 else D(pos['entry_cost'])
+                if val >= Decimal('5'):
+                    slots.add(pid)
+                    if pos['opened_at']:
+                        active_buy_times.append(int(pos['opened_at']))
+            recent_buys = db.execute(
+                "SELECT created_at, quantity, limit_price, status FROM shadow_orders WHERE side='BUY' AND status IN ('PENDING','FILLED') ORDER BY created_at DESC LIMIT 10"
+            ).fetchall()
+            for r in recent_buys:
+                ts = int(r['created_at'] or 0)
+                if ts > 0 and D(r['quantity']) * D(r['limit_price']) >= Decimal('5'):
+                    active_buy_times.append(ts)
+            return len(slots), active_buy_times
+    except Exception:
+        return 0, []
+
+
+def _resolve_peer_shadow_db(own_shadow_db, market_db):
+    own = Path(own_shadow_db).resolve()
+    db_dir = Path(market_db).resolve().parent if market_db else own.parent
+    root_dir = db_dir.parent
+    is_r2 = 'r2' in own.name.lower() or own.parent.name.lower() == 'r2'
+    if is_r2:
+        candidates = (db_dir / 'sol-shadow.sqlite', db_dir / 'sol-shadow-read.sqlite')
+    else:
+        candidates = (
+            root_dir / 'r2' / 'r2-v2-shadow.sqlite',
+            root_dir / 'r2' / 'r2-shadow-read.sqlite',
+            db_dir / 'r2-v2-shadow.sqlite',
+            db_dir / 'r2-shadow-read.sqlite',
+        )
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+            if resolved != own and resolved.exists():
+                return resolved
+        except Exception:
+            continue
+    return None
+
+
+def _has_higher_priority_strategy_signal(strategy_db_path, signal_time, cooldown_ms):
+    if not strategy_db_path:
+        return False
+    path = Path(strategy_db_path).resolve()
+    if not path.exists():
+        return False
+    try:
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=3)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT signal_time, payload_json FROM decisions WHERE symbol='SOLUSDT' AND accepted=1 AND strategy_id IN ('T1','T2') ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row['payload_json'])
+            except Exception:
+                payload = {}
+            if payload.get('strategy_id') == 'T1' and payload.get('regime') == 'DOWNTREND':
+                continue
+            st = int(row['signal_time'] or payload.get('signal_time') or 0)
+            if st > 0 and signal_time > 0 and abs(st - int(signal_time)) < cooldown_ms:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def acquire_cross_shadow_entry_guard(
+    own_shadow_db,
+    market_db,
+    *,
+    strategy_id,
+    signal_id,
+    signal_time,
+    now_ms,
+    peer_shadow_db=None,
+    strategy_db=None,
+    guard_db=None,
+    cooldown_ms=CROSS_STRATEGY_COOLDOWN_MS,
+    max_combined_slots=None,
+):
+    """Enforce live-aligned cross-strategy cooldown, priority, and single-slot sync across P3 and R2 shadow processes."""
+    if max_combined_slots is None:
+        shared_cfg = load_shared_trading_config(market_db, own_shadow_db)
+        max_combined_slots = int(shared_cfg['max_slots']) if shared_cfg else MAX_COMBINED_SHADOW_SLOTS
+    own_path = Path(own_shadow_db).resolve()
+    if own_path.exists():
+        try:
+            with closing(sqlite3.connect(own_path.as_uri() + '?mode=ro', uri=True, timeout=3)) as db:
+                if db.execute("SELECT 1 FROM shadow_orders WHERE request_key=?", ('BUY:' + str(signal_id),)).fetchone():
+                    return False
+        except Exception:
+            pass
+    db_dir = Path(market_db).resolve().parent if market_db else own_path.parent
+    guard_path = Path(guard_db).resolve() if guard_db else (db_dir / 'shadow-entry-guard.sqlite')
+    strat_path = Path(strategy_db).resolve() if strategy_db else (db_dir / 'sol-shadow-strategy.sqlite')
+    peer_path = Path(peer_shadow_db).resolve() if peer_shadow_db else _resolve_peer_shadow_db(own_path, market_db)
+
+    guard_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(guard_path, timeout=5, isolation_level=None)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=5000')
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS shadow_entry_claims (
+                    signal_id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    signal_time INTEGER NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                "DELETE FROM shadow_entry_claims WHERE status!='CLAIMED' OR claimed_at<=?",
+                (int(now_ms) - int(cooldown_ms),),
+            )
+            if strategy_id == 'R2' and _has_higher_priority_strategy_signal(strat_path, int(signal_time or now_ms), cooldown_ms):
+                raise ShadowRejected('CROSS_STRATEGY_COOLDOWN', 'higher-priority T1/T2 signal active within cooldown window')
+
+            claims = conn.execute(
+                "SELECT signal_id, strategy_id, signal_time, claimed_at FROM shadow_entry_claims WHERE status='CLAIMED' AND signal_id!=?",
+                (str(signal_id),),
+            ).fetchall()
+            for claim in claims:
+                c_at = int(claim['claimed_at'] or 0)
+                c_sig = int(claim['signal_time'] or 0)
+                if (c_at > 0 and 0 <= int(now_ms) - c_at < cooldown_ms) or (
+                    c_sig > 0 and int(signal_time or 0) > 0 and abs(int(signal_time) - c_sig) < cooldown_ms
+                ):
+                    raise ShadowRejected('CROSS_STRATEGY_COOLDOWN', f"cross-strategy shadow entry cooldown active ({claim['strategy_id']})")
+
+            own_slots, own_times = _inspect_shadow_db_activity(own_path, now_ms)
+            peer_slots, peer_times = _inspect_shadow_db_activity(peer_path, now_ms) if peer_path else (0, [])
+            if own_slots + peer_slots >= max_combined_slots:
+                raise ShadowRejected('CROSS_SHADOW_SLOTS_FULL', 'combined shadow position slot is already occupied')
+            for ts in own_times + peer_times:
+                if ts > 0 and (
+                    0 <= int(now_ms) - ts < cooldown_ms
+                    or (int(signal_time or 0) > 0 and abs(int(signal_time) - ts) < cooldown_ms)
+                ):
+                    raise ShadowRejected('CROSS_STRATEGY_COOLDOWN', 'recent shadow buy order within 15m cooldown')
+
+            conn.execute(
+                "INSERT OR REPLACE INTO shadow_entry_claims(signal_id, strategy_id, signal_time, claimed_at, status) VALUES (?,?,?,?,'CLAIMED')",
+                (str(signal_id), str(strategy_id), int(signal_time or now_ms), int(now_ms)),
+            )
+            conn.commit()
+            return True
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def release_cross_shadow_entry_guard(market_db, signal_id, *, guard_db=None, own_shadow_db=None):
+    base_dir = Path(market_db).resolve().parent if market_db else (Path(own_shadow_db).resolve().parent if own_shadow_db else None)
+    guard_path = Path(guard_db).resolve() if guard_db else (base_dir / 'shadow-entry-guard.sqlite' if base_dir else None)
+    if guard_path is None or not guard_path.exists():
+        return
+    try:
+        with closing(sqlite3.connect(guard_path, timeout=5, isolation_level=None)) as conn:
+            conn.execute('PRAGMA busy_timeout=5000')
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute('DELETE FROM shadow_entry_claims WHERE signal_id=?', (str(signal_id),))
+            conn.commit()
+    except Exception:
+        pass
 
 def scheduler_status(report):
     """Normalize only legacy diagnostic floats, never monetary/model inputs."""
@@ -83,17 +306,36 @@ def plan_signal(payload,features,account,now,market_db_path=None):
     ref_doc=attach_reference_price({},rules,features,market_db_path,now) if rules.percent_filters else {}
     ref_kwargs=dict(reference_price=ref_doc.get('p3_reference_price'),reference_minutes=ref_doc.get('p3_reference_minutes')) if ref_doc else {}
     price=D(features['ask'])
-    quantity=floor_step(Decimal(500)/price,rules.step_size)
+    shared_cfg=load_shared_trading_config(market_db_path) if signal['symbol']=='SOLUSDT' else None
+    base_notional=shared_cfg['min_order_usdt'] if shared_cfg else Decimal(500)
+    quantity=floor_step(base_notional/price,rules.step_size)
     amount=quantity*price
     stop_dist=signal.get('stop_distance') or '0.008'
     bnb_fees=FeeSchedule(bnb_discount_enabled=True)
     cost=estimate_cost(context,entry_price=price,exit_price=price*Decimal('1.015'),quantity=quantity,fees=bnb_fees)
     execution=estimate_fill(context,features,limit_price=price,quantity=quantity,wait_ms=min(60000,max(1,signal['expires_at']-now)))
     expected=estimate_return(context,notional=amount,profit_fraction='.015',loss_fraction=stop_dist,cost=cost,execution=execution)
-    sizing_args=dict(entry_fee_rate='0.00075',exit_fee_rate='0.00075',stop_distance=stop_dist,parameters=SHADOW_RISK_PARAMETERS if signal['symbol']=='SOLUSDT' else None,**ref_kwargs)
+    if shared_cfg:
+        risk_params=ResearchRiskParameters(
+            symbol='SOLUSDT',version='p3-shadow-500-1000-v1',
+            t1_budget=Decimal('0.012'),r1_budget=Decimal('0.008'),
+            min_notional=shared_cfg['min_order_usdt'],max_notional=shared_cfg['max_order_usdt'],
+            allow_cash_fallback=True,max_open_positions=shared_cfg['max_slots'],
+        )
+    else:
+        risk_params=SHADOW_RISK_PARAMETERS if signal['symbol']=='SOLUSDT' else None
+    sizing_args=dict(entry_fee_rate='0.00075',exit_fee_rate='0.00075',stop_distance=stop_dist,parameters=risk_params,**ref_kwargs)
     bid_ref=D(features['bid'],positive=True) if features.get('bid') else None
     non_dust_positions=sum(1 for pos in account['positions'] if D(pos['quantity'])*(bid_ref or D(pos['entry_price']))>=Decimal('5'))
-    sizing=size_position(context,features,score=signal['score'],entry_price=price,equity=account['last_equity'],high_watermark=account['peak_equity'],
+    eff_equity=D(account['last_equity'])
+    eff_peak=D(account['peak_equity'])
+    if shared_cfg and not bool(account['hard_locked']):
+        min_eq=shared_cfg['max_order_usdt']*Decimal('2.5')
+        if eff_equity<min_eq:
+            delta_eq=min_eq-eff_equity
+            eff_equity=eff_equity+delta_eq
+            eff_peak=eff_peak+delta_eq
+    sizing=size_position(context,features,score=signal['score'],entry_price=price,equity=str(eff_equity),high_watermark=str(eff_peak),
         cash_balance=account['cash'],reserved_entry_notional=account['reserved'],open_positions=non_dust_positions,
         pending_entries=sum(1 for r in account['pending_orders'] if r['side']=='BUY' and not r.get('position_id')),hard_locked=bool(account['hard_locked']),**sizing_args)
     pricing=price_entry(context,features,signal_max_price=signal['entry_high'],notional=amount,
@@ -129,6 +371,10 @@ def main():
             if features is None:raise ValueError('no public depth snapshot')
             features=refresh_features(features,now)
             if args.shadow_db and ledger is None:ledger=P3ShadowExecutor(args.shadow_db,rules=SymbolRules.from_exchange_info(features['rules'],args.symbol),fee_rate='0.00075',minimum_notional='500',maximum_notional='1000')
+            if ledger:
+                shared_cfg=load_shared_trading_config(args.market_db,args.shadow_db)
+                if shared_cfg:
+                    ledger.apply_trading_config(shared_cfg['min_order_usdt'],shared_cfg['max_order_usdt'],shared_cfg['max_slots'])
             evidence=TrendEvidence();market_ready=False
             try:
                 with opener.open(f'http://127.0.0.1:{port}/health',timeout=2) as r:health=json.load(r)
@@ -177,9 +423,23 @@ def main():
                             candidate['entry_low']=str(min(D(candidate['entry_low']),D(pricing['limit_price'])))
                             limit_price=pricing['limit_price']
                         attach_reference_price(candidate,ledger.rules,features,args.market_db,now)
+                        claimed=False
                         try:
+                            claimed=acquire_cross_shadow_entry_guard(
+                                args.shadow_db,args.market_db,
+                                strategy_id=candidate['strategy_id'],
+                                signal_id=candidate['signal_id'],
+                                signal_time=int(candidate.get('signal_time') or now),
+                                now_ms=now,
+                                strategy_db=args.strategy_db,
+                            )
                             result['order']=ledger.submit_candidate(candidate,notional=sizing['notional'],limit_price=limit_price,now_ms=now)
+                            account=ledger.snapshot();status['shadow']=account
+                            publish(Path(args.shadow_db),Path(args.shadow_db).with_name('sol-shadow-read.sqlite'))
+                            last_snapshot_ms=now
                         except ShadowRejected as exc:
+                            if claimed:
+                                release_cross_shadow_entry_guard(args.market_db,candidate['signal_id'],own_shadow_db=args.shadow_db)
                             result['order_rejected']={'code':exc.code,'message':str(exc)}
                     audit.record(key,now,{'signal':normalized,'p2_original_payload':original,'features':features,'account':account},result)
             status.update(status='ready' if market_ready and features.get('ready') else 'protection_only',micro_ready=features.get('ready'),risk_policy=ledger.risk_policy if ledger else 'LIVE_DENIED')

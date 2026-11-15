@@ -53,15 +53,22 @@ object BotFormatters {
         "CANDIDATE_EXPIRED" to "超卖候选超时未突破 · 候选作废",
         "INTENT_ACKNOWLEDGED" to "反弹突破已确认并提交执行",
         "NO_RECENT_R2_CANDIDATE" to "当前无活跃超卖候选 · 实时巡检中",
+        "CROSS_STRATEGY_COOLDOWN" to "跨策略 15 分钟冷却保护中",
+        "CROSS_SHADOW_SLOTS_FULL" to "模拟盘已有活跃持仓 · 单仓上限互斥",
     )
 
     private val blockerMap = mapOf(
         "LIVE_DISABLED" to "实盘自动下单开关当前关闭（系统处于安全只读模式）",
+        "LIVE_OFF" to "实盘自动下单开关当前关闭（系统处于安全只读模式）",
         "GUARDIAN_HARD_LOCK" to "触发日内 5% 硬风控熔断保护，自动买入已锁定",
+        "HARD_LOCKED" to "触发日内 5% 硬风控熔断保护，自动买入已锁定",
         "API_KEY_MISSING" to "尚未绑定 Binance API 密钥，无法查询余额或自动交易",
+        "API_NOT_CONFIGURED" to "尚未绑定 Binance API 密钥，无法查询余额或自动交易",
         "SPOT_PERMISSION_OFF" to "当前 API 未开启「现货与杠杆交易」权限，仅支持只读对账",
-        "INSUFFICIENT_FREE_USDT" to "可用 USDT 低于单笔下限 $500.00，当前不会自动开新仓",
-        "MAX_SLOTS_REACHED" to "机器人已满 2 槽位持仓上限，暂停开立新仓",
+        "TRADE_PERMISSION_REQUIRED" to "当前 API 未开启「现货与杠杆交易」权限，仅支持只读对账",
+        "INSUFFICIENT_FREE_USDT" to "可用 USDT 低于单笔下限，当前不会自动开新仓",
+        "MAX_SLOTS_REACHED" to "机器人已满持仓槽位上限，暂停开立新仓",
+        "SLOTS_FULL" to "机器人已满持仓槽位上限，暂停开立新仓",
     )
 
     private val engineGates = mapOf(
@@ -108,10 +115,39 @@ object BotFormatters {
 
     fun reasonLabel(code: String): String = reasonMap[code] ?: code
 
-    fun blockerLabel(code: String?, freeUsdt: String?): String? {
+    fun formatUsdtCompact(raw: String?): String {
+        val bd = parseBigDecimal(raw) ?: return "—"
+        val stripped = bd.stripTrailingZeros()
+        val frac = stripped.scale().coerceIn(0, 2)
+        return formatNumber(stripped.toPlainString(), frac)
+    }
+
+    fun formatOrderRange(minRaw: String?, maxRaw: String?): String {
+        val minBd = parseBigDecimal(minRaw)
+        val maxBd = parseBigDecimal(maxRaw)
+        if (minBd == null && maxBd == null) return "$500–$1,000"
+        if (minBd == null) return "$${formatUsdtCompact(maxRaw)}"
+        if (maxBd == null || minBd.compareTo(maxBd) == 0) return "$${formatUsdtCompact(minRaw)}"
+        return "$${formatUsdtCompact(minRaw)}–$${formatUsdtCompact(maxRaw)}"
+    }
+
+    fun blockerLabel(
+        code: String?,
+        freeUsdt: String?,
+        minOrderUsdt: String = "500",
+        maxSlots: Int = 2,
+    ): String? {
         if (code.isNullOrBlank() || code.equals("null", ignoreCase = true)) return null
-        if (code == "INSUFFICIENT_FREE_USDT" && !freeUsdt.isNullOrBlank()) {
-            return "可用 USDT $${formatNumber(freeUsdt, 2)} 低于单笔下限 $500.00，新买入已暂停"
+        if (code == "INSUFFICIENT_FREE_USDT") {
+            val minLabel = "$${formatNumber(minOrderUsdt, 2)}"
+            return if (!freeUsdt.isNullOrBlank()) {
+                "可用 USDT $${formatNumber(freeUsdt, 2)} 低于单笔下限 $minLabel，新买入已暂停"
+            } else {
+                "可用 USDT 低于单笔下限 $minLabel，当前不会自动开新仓"
+            }
+        }
+        if (code == "SLOTS_FULL" || code == "MAX_SLOTS_REACHED") {
+            return "机器人已满 $maxSlots 槽位持仓上限，暂停开立新仓"
         }
         return blockerMap[code] ?: code
     }

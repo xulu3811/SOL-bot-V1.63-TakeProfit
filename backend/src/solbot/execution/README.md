@@ -23,6 +23,6 @@ Initial −0.8% stop, +1% profit protection, +1.5% APTS entry, and BNB 3/10/20-U
 
 Schema: `execution_owner` pins channel/account/symbol. Shadow uses `shadow_account`, `shadow_orders`, and `shadow_positions`; monetary values are TEXT decimal strings and times are UTC milliseconds. Live uses `live_control` and bounded `live_control_events`. These files are independent of P1 market storage and strategy snapshots.
 
-`android/LiveControl.kt` is a minimal Material 3 Compose source component with an abstract authenticated repository contract. It derives ON exclusively from server snapshots, keeps unknown state explicit after communication errors, and disables hard-lock changes. No Android project/build scaffold or transport implementation was supplied, so compilation/device behavior is not claimed verified by Python tests.
+The authenticated Android Jetpack Compose client under `android/app/` derives LIVE state exclusively from confirmed server snapshots, keeps unknown states explicit after communication errors, and disables hard-lock changes.
 
 Offline validation: `python -m unittest discover -s tests/unit -p test_p2_execution.py -v`. Tests exercise actual temporary ledgers, concurrent reservations/retries, sells and fee accounting, durable locks, per-fill drawdown gating, prewrite database isolation, and mock spies proving no secret-loader/private-client/order calls or socket connections on the checked paths.

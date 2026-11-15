@@ -121,6 +121,10 @@ class AppApiSyncUpgradeTests(unittest.TestCase):
         summary = reader.market_summary('SOLUSDT', '15m')
         self.assertEqual(summary['ema_alignment'], 'BEARISH')
         self.assertTrue(summary['micro']['ready'])
+        self.assertIn('by_timeframe', summary)
+        self.assertIn('15m', summary['by_timeframe'])
+        self.assertIsNotNone(summary['by_timeframe']['15m']['last_candle'])
+        self.assertEqual(summary['by_timeframe']['15m']['last_candle']['close'], '80.475')
 
     def test_app_endpoints_normalize_identity_expose_readiness_orders_and_shadow_pnl(self):
         from tests.unit.test_p6_independent_qa import DeviceAuthenticationQA, FakeControl
@@ -166,9 +170,44 @@ class AppApiSyncUpgradeTests(unittest.TestCase):
         client = TestClient(app, base_url='https://testserver')
         self.addCleanup(client.close)
 
-        def req(method, path):
-            h = fixture.sign(method, path, b'', session=fixture.session)
-            return client.request(method, path, headers=h)
+        def req(method, path, body=None):
+            raw = b'' if body is None else json.dumps(body).encode()
+            h = fixture.sign(method, path, raw, session=fixture.session)
+            if body is not None:
+                h['content-type'] = 'application/json'
+            return client.request(method, path, content=raw if body is not None else None, headers=h)
+
+        # /trading/config GET & POST sync across /live/status and /shadow/status
+        cfg_before = req('GET', '/api/v1/app/trading/config').json()
+        self.assertEqual(cfg_before['min_order_usdt'], '500.00')
+        self.assertEqual(cfg_before['max_order_usdt'], '1000.00')
+        self.assertEqual(cfg_before['max_slots'], 2)
+
+        cfg_post = req('POST', '/api/v1/app/trading/config', {
+            'min_order_usdt': '800',
+            'max_order_usdt': '1500',
+            'max_slots': 4,
+        }).json()
+        self.assertEqual(cfg_post['min_order_usdt'], '800.00')
+        self.assertEqual(cfg_post['max_order_usdt'], '1500.00')
+        self.assertEqual(cfg_post['max_slots'], 4)
+
+        live_after_cfg = req('GET', '/api/v1/app/live/status').json()
+        self.assertEqual(live_after_cfg['readiness']['min_order_usdt'], '800.00')
+        self.assertEqual(live_after_cfg['readiness']['max_order_usdt'], '1500.00')
+        self.assertEqual(live_after_cfg['readiness']['max_slots'], 4)
+
+        shadow_after_cfg = req('GET', '/api/v1/app/shadow/status').json()
+        self.assertEqual(shadow_after_cfg['rules']['min_order_usdt'], '800')
+        self.assertEqual(shadow_after_cfg['rules']['max_order_usdt'], '1500')
+        self.assertEqual(shadow_after_cfg['rules']['max_positions'], 4)
+
+        # Reset back to defaults for subsequent assertions
+        req('POST', '/api/v1/app/trading/config', {
+            'min_order_usdt': '500',
+            'max_order_usdt': '1000',
+            'max_slots': 2,
+        })
 
         # Account status now accurately reports orders_enabled=True
         acct = req('GET', '/api/v1/app/binance/account').json()

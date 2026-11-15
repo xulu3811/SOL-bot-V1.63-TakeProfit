@@ -13,7 +13,13 @@ from solbot.mathematics.contracts import SymbolRules
 from solbot.mathematics.decimal_utils import json_safe
 from solbot.mathematics.trend_exhaustion import TrendEvidence, from_closed_inputs
 from solbot.p2_runtime import atomic_json
-from solbot.p3_runtime import attach_reference_price, refresh_features
+from solbot.p3_runtime import (
+    acquire_cross_shadow_entry_guard,
+    attach_reference_price,
+    load_shared_trading_config,
+    refresh_features,
+    release_cross_shadow_entry_guard,
+)
 from solbot.storage.microstructure import MicrostructureStore
 from solbot.storage.r2_store import R2Store
 from solbot.storage.read_snapshot import publish
@@ -68,6 +74,9 @@ def main():
             features = refresh_features(features, now)
             if ledger is None:
                 ledger = R2ShadowExecutor(args.shadow_db, rules=SymbolRules.from_exchange_info(features['rules'], 'SOLUSDT'), fee_rate='0.00075')
+            shared_cfg = load_shared_trading_config(args.market_db, args.shadow_db)
+            if shared_cfg:
+                ledger.apply_trading_config(shared_cfg['min_order_usdt'], shared_cfg['max_order_usdt'], shared_cfg['max_slots'])
             evidence = TrendEvidence()
             with closing(sqlite3.connect(Path(args.market_db).resolve().as_uri()+'?mode=ro', uri=True)) as db:
                 latest = db.execute("SELECT close FROM market_klines WHERE interval='1m' AND is_closed=1 AND close_time<? ORDER BY close_time DESC LIMIT 1", (now,)).fetchone()
@@ -97,12 +106,23 @@ def main():
                 # the initial submission and existing protection runs above.
                 if not features.get('ready'):
                     continue
+                claimed = False
                 try:
                     attach_reference_price(intent, ledger.rules, features, args.market_db, now)
+                    claimed = acquire_cross_shadow_entry_guard(
+                        args.shadow_db,
+                        args.market_db,
+                        strategy_id='R2',
+                        signal_id=intent['signal_id'],
+                        signal_time=int(intent.get('signal_time') or now),
+                        now_ms=now,
+                    )
                     order = ledger.submit_intent(intent, now)
                     outcome = {'order_id': order['order_id'], 'status': order['status']}
                 except ShadowRejected as exc:
-                    outcome = {'rejected': str(exc)}
+                    if claimed:
+                        release_cross_shadow_entry_guard(args.market_db, intent['signal_id'], own_shadow_db=args.shadow_db)
+                    outcome = {'rejected': str(exc), 'code': exc.code}
                 store.acknowledge(intent['signal_id'], outcome)
                 outbox_changed = True
             if outbox_changed or now - last_snapshot_ms >= 5000:

@@ -18,7 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, r"D:\SOL-Bot\backend\src")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend" / "src"))
 
 from solbot.mathematics.decimal_utils import ceil_step, floor_step
 from solbot.mathematics.execution_cost import FeeSchedule
@@ -26,8 +27,8 @@ from solbot.mathematics.profit_trail import trail_line
 from solbot.mathematics.protective_stop import initial_stop, profit_floor
 from solbot.strategy import evaluate, indicators, market_regime, r1_reversal, signal_scoring, t1_pullback
 
-DB = Path(r"D:\SOL-Bot\data\solusdt_1y.sqlite")
-OUT = Path(r"D:\SOL-Bot\data\solusdt_1y_backtest_bnb.json")
+DB = ROOT / "data" / "solusdt_1y.sqlite"
+OUT = ROOT / "data" / "solusdt_1y_backtest_bnb.json"
 STEPS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 FIELDS = ("open_time", "high", "low", "close", "volume", "quote_volume")
 FEE = FeeSchedule(bnb_discount_enabled=True).rate("TAKER")

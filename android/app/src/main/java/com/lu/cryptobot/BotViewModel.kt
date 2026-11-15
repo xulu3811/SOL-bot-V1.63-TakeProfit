@@ -31,19 +31,60 @@ internal object FrameSyncHelper {
         return copy
     }
 
+    fun upsertLastCandle(candles: org.json.JSONArray?, lastCandle: JSONObject?): org.json.JSONArray? {
+        if (candles == null || candles.length() == 0 || lastCandle == null) return candles
+        val incomingOpen = lastCandle.optLong("open_time", -1L)
+        if (incomingOpen <= 0L) return candles
+        val out = org.json.JSONArray(candles.toString())
+        val lastIdx = out.length() - 1
+        val tail = out.optJSONObject(lastIdx)
+        val tailOpen = tail?.optLong("open_time", -1L) ?: -1L
+        when {
+            tailOpen == incomingOpen -> out.put(lastIdx, JSONObject(lastCandle.toString()))
+            tailOpen in 1 until incomingOpen -> {
+                val trimmed = org.json.JSONArray()
+                val start = if (out.length() >= 100) 1 else 0
+                for (i in start until out.length()) {
+                    trimmed.put(out.get(i))
+                }
+                trimmed.put(JSONObject(lastCandle.toString()))
+                return trimmed
+            }
+        }
+        return out
+    }
+
     fun overlayMarket(current: JSONObject?, summary: JSONObject): JSONObject {
         val selectedTf = current?.optString("timeframe", "").orEmpty()
         val summaryTf = summary.optString("timeframe", "1m")
-        val hasCurrentPrice = current != null && current.has("latest_price") && !current.isNull("latest_price")
-        val skip = when {
-            selectedTf.isNotEmpty() && selectedTf != summaryTf ->
-                setOf("candles", "latest_price", "timeframe", "indicators", "ema_alignment", "ema_spread_pct")
-            hasCurrentPrice ->
-                setOf("candles", "latest_price", "timeframe", "indicators")
-            else ->
-                setOf("candles", "timeframe", "indicators")
+        if (selectedTf.isNotEmpty() && selectedTf != summaryTf) {
+            val tfDoc = summary.optJSONObject("by_timeframe")?.optJSONObject(selectedTf)
+            if (tfDoc != null) {
+                val baseSkip = setOf("candles", "latest_price", "timeframe", "indicators", "ema_alignment", "ema_spread_pct", "by_timeframe", "last_candle")
+                val merged = overlay(current, summary, baseSkip)
+                val withTf = overlay(merged, tfDoc, setOf("last_candle"))
+                upsertLastCandle(withTf.optJSONArray("candles"), tfDoc.optJSONObject("last_candle"))?.let {
+                    withTf.put("candles", it)
+                }
+                return withTf
+            }
+            val skip = setOf("candles", "latest_price", "timeframe", "indicators", "ema_alignment", "ema_spread_pct", "by_timeframe", "last_candle")
+            return overlay(current, summary, skip)
         }
-        return overlay(current, summary, skip)
+        val skip = if (summary.has("candles")) {
+            setOf("by_timeframe", "last_candle")
+        } else {
+            setOf("candles", "by_timeframe", "last_candle")
+        }
+        val merged = overlay(current, summary, skip)
+        if (!summary.has("candles")) {
+            val liveTip = summary.optJSONObject("last_candle")
+                ?: summary.optJSONObject("by_timeframe")?.optJSONObject(summaryTf)?.optJSONObject("last_candle")
+            upsertLastCandle(merged.optJSONArray("candles"), liveTip)?.let {
+                merged.put("candles", it)
+            }
+        }
+        return merged
     }
 
     fun mergeFrame(currentValues: Map<String, JSONObject>, frame: JSONObject): Map<String, JSONObject> {
@@ -51,8 +92,16 @@ internal object FrameSyncHelper {
         frame.optJSONObject("status")?.let { map["live/status"] = JSONObject(it.toString()) }
         frame.optJSONObject("risk")?.let { map["live/risk"] = JSONObject(it.toString()) }
         frame.optJSONObject("positions")?.let { map["live/positions"] = JSONObject(it.toString()) }
+        frame.optJSONObject("live_orders")?.let { if (it.length() > 0) map["live/orders"] = JSONObject(it.toString()) }
+        frame.optJSONObject("binance_account")?.let { if (it.length() > 0) map["binance/account"] = JSONObject(it.toString()) }
+        frame.optJSONObject("shadow_status")?.let { if (it.length() > 0) map["shadow/status"] = JSONObject(it.toString()) }
+        frame.optJSONObject("shadow_orders")?.let { if (it.length() > 0) map["shadow/orders"] = JSONObject(it.toString()) }
+        frame.optJSONObject("trading_config")?.let { if (it.length() > 0) map["trading/config"] = JSONObject(it.toString()) }
         frame.optJSONObject("markets")?.let { summary -> map["markets"] = overlayMarket(map["markets"], summary) }
-        frame.optJSONObject("strategies")?.let { summary -> map["strategies"] = overlay(map["strategies"], summary, setOf("items")) }
+        frame.optJSONObject("strategies")?.let { summary ->
+            val skip = if (summary.has("items")) emptySet() else setOf("items")
+            map["strategies"] = overlay(map["strategies"], summary, skip)
+        }
         return map
     }
 
@@ -80,11 +129,60 @@ internal object FrameSyncHelper {
             syncSettingsSnapshot()
         }
         viewModelScope.launch { repository.frames.collect { applyFrame(it) } }
-        execute {
-            val ok = repository.ensureSession()
+        viewModelScope.launch {
+            val ok = runCatching { repository.ensureSession() }.getOrDefault(false)
             syncSettingsSnapshot()
-            if (ok) { registerPush(); BotConnectionService.start(app); refresh() }
+            if (ok) {
+                registerPush()
+                BotConnectionService.start(app)
+                syncAllSilently(mutable.value.interval)
+            }
+            startRealtimeLoop()
         }
+    }
+
+    private fun startRealtimeLoop() {
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(2_000L)
+                if (!runCatching { repository.bound() }.getOrDefault(false)) continue
+                val currentInterval = mutable.value.interval
+                val currentMarkets = mutable.value.values["markets"]
+                val candlesArr = currentMarkets?.optJSONArray("candles")
+                val needsCandles = candlesArr == null || candlesArr.length() == 0 || currentMarkets.optString("timeframe") != currentInterval
+                val wsSilentMs = System.currentTimeMillis() - repository.lastFrameAt.get()
+                if (wsSilentMs > 2_800L) {
+                    syncAllSilently(currentInterval)
+                } else if (needsCandles) {
+                    refreshCandles(currentInterval)
+                }
+            }
+        }
+    }
+
+    private suspend fun syncAllSilently(interval: String = mutable.value.interval) {
+        val map = mutable.value.values.toMutableMap()
+        val currentInterval = interval
+        for (path in listOf("status", "markets?symbol=SOLUSDT&timeframe=$currentInterval", "strategies?symbol=SOLUSDT", "live/status", "live/orders", "live/positions", "live/risk", "binance/account", "trading/config", "shadow/status", "shadow/orders")) {
+            try {
+                val key = path.substringBefore('?')
+                val fetched = repository.get(path)
+                if (key == "markets" && mutable.value.interval != currentInterval) continue
+                map[key] = fetched
+            } catch (_: Exception) {
+            }
+        }
+        val live = map["live/status"]
+        if (map.isNotEmpty()) {
+            val shown = mutable.value.error
+            val recovered = shown == "connection closed" || shown == "连接中断，请再拉一次刷新"
+            mutable.value = mutable.value.copy(
+                values = map,
+                live = if (live != null) RequestProtocol.authoritativeState(live.optString("state"), true) else mutable.value.live,
+                error = if (recovered) null else shown,
+            )
+        }
+        if ("status" in map) runCatching { repository.syncAlerts() }
     }
 
     private suspend fun syncSettingsSnapshot() {
@@ -149,26 +247,8 @@ internal object FrameSyncHelper {
 
     fun refresh(interval: String = mutable.value.interval) = run {
         mutable.value = mutable.value.copy(interval = interval)
-        execute {
-            val map = mutable.value.values.toMutableMap()
-            val errors = mutableListOf<String>()
-            val currentInterval = mutable.value.interval
-            for (path in listOf("status", "markets?symbol=SOLUSDT&timeframe=$currentInterval", "strategies?symbol=SOLUSDT", "live/status", "live/orders", "live/positions", "live/risk", "binance/account", "shadow/status", "shadow/orders")) {
-                try {
-                    val key = path.substringBefore('?')
-                    val fetched = repository.get(path)
-                    if (key == "markets" && mutable.value.interval != currentInterval) continue
-                    map[key] = fetched
-                }
-                catch (error: Exception) { errors += (error.message ?: path).take(80) }
-            }
-            val live = map["live/status"]
-            mutable.value = mutable.value.copy(
-                values = map,
-                live = RequestProtocol.authoritativeState(live?.optString("state"), live != null),
-                error = errors.firstOrNull(),
-            )
-            if ("status" in map) runCatching { repository.syncAlerts() }
+        viewModelScope.launch {
+            syncAllSilently(interval)
         }
     }
     private fun execute(block: suspend ()->Unit) { viewModelScope.launch {
@@ -210,6 +290,17 @@ internal object FrameSyncHelper {
     fun saveBinance(apiKey: String, secret: String) { execute { binance { repository.post("binance/account", JSONObject().put("api_key", apiKey).put("secret", secret)); refresh() } } }
     fun syncBinance() { execute { binance { repository.post("binance/sync"); refresh() } } }
     fun clearBinance() { execute { binance { repository.post("binance/clear"); refresh() } } }
+    fun saveTradingConfig(minOrderUsdt: String, maxOrderUsdt: String, maxSlots: Int) { execute { binance {
+        val reply = repository.post(
+            "trading/config",
+            JSONObject()
+                .put("min_order_usdt", minOrderUsdt.trim())
+                .put("max_order_usdt", maxOrderUsdt.trim().ifBlank { minOrderUsdt.trim() })
+                .put("max_slots", maxSlots)
+        )
+        mutable.value = mutable.value.copy(values = mutable.value.values + ("trading/config" to reply))
+        refresh()
+    } } }
     private suspend fun binance(block: suspend () -> Unit) {
         try { block() } catch (error: Exception) { mutable.value = mutable.value.copy(error = binanceMessage(error)) }
     }
@@ -221,8 +312,10 @@ internal object FrameSyncHelper {
         "BINANCE_UNREACHABLE" -> "暂时连不上币安"
         "NOT_CONFIGURED" -> "还没有保存 API"
         "DENY_NOT_READY" -> "实盘开关没有打开。请确认币安现货交易权限已开启，并且提现保持关闭。"
-        "USDT_BELOW_500", "USDT_BELOW_300" -> "可用 USDT 不足 500，这次没有买入。"
-        "SLOTS_FULL" -> "已经有 2 个策略仓，不再开新仓。"
+        "USDT_BELOW_500", "USDT_BELOW_300", "USDT_BELOW_MIN" -> "可用 USDT 不足配置的最小开仓金额，这次没有买入。"
+        "SLOTS_FULL" -> "已达到最大策略持仓槽位上限，不再开新仓。"
+        "INVALID_ORDER_USDT", "INVALID_TRADING_CONFIG" -> "单笔开仓金额需在 $10–$50,000 USDT 之间，且最大值不低于最小值。"
+        "INVALID_MAX_SLOTS" -> "持仓订单数量需在 1–10 槽之间。"
         "TRADE_PERMISSION_REQUIRED" -> "托管止损需要现货交易权限。请保持提现关闭，只打开现货交易后再试。"
         "INSUFFICIENT_FREE_SOL" -> "可用 SOL 不足，止损单没有提交。"
         "ENTRY_PRICE_MISSING" -> "找不到这批 SOL 的买入价，止损单没有提交。"

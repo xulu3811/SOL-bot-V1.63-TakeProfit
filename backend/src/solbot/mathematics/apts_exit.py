@@ -7,6 +7,9 @@ from .protective_stop import initial_stop,profit_floor,stop_limit_price
 from .trend_exhaustion import TrendEvidence,classify
 from .volatility_regime import trailing_distance
 
+S1_PROFIT_PROTECTION_TRIGGER = Decimal('.008')
+S2_ADAPTIVE_TRAILING_TRIGGER = Decimal('.015')
+
 
 @dataclass(frozen=True)
 class APTSState:
@@ -104,8 +107,8 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
         high=max(state.high_price,bid)
         gross=bid/state.entry_price-1
         stage=state.stage
-        if gross>Decimal('.015') and stage!='S3_TREND_EXHAUSTION':stage='S2_ADAPTIVE_TRAILING'
-        elif gross>=Decimal('.01') and stage=='S0_INITIAL_PROTECTION':stage='S1_PROFIT_PROTECTION'
+        if gross>S2_ADAPTIVE_TRAILING_TRIGGER and stage!='S3_TREND_EXHAUSTION':stage='S2_ADAPTIVE_TRAILING'
+        elif gross>=S1_PROFIT_PROTECTION_TRIGGER and stage=='S0_INITIAL_PROTECTION':stage='S1_PROFIT_PROTECTION'
         floor=state.floor_price
         candidate=state.stop_price
         if stage!='S0_INITIAL_PROTECTION':
@@ -116,12 +119,25 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
                 status='EXIT_REQUIRED'
             else:candidate=max(candidate,floor)
         if stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION'):
+            if state.scheme=='APTS':
+                if gross>=Decimal('0.030') and (regime=='WEAKENING' or evidence.failed_new_high or (evidence.adverse_move and evidence.buy_ratio<Decimal('0.48'))):
+                    distance=min(distance,Decimal('0.004'))
+                elif regime=='NORMAL_UPTREND' and evidence.higher_low_5m and not evidence.adverse_move and evidence.buy_ratio>=Decimal('0.50') and evidence.atr>0:
+                    atr_band=min(Decimal('0.0095'),max(Decimal('0.005'),(Decimal('1.5')*evidence.atr)/bid))
+                    distance=max(distance,atr_band)
             candidate=max(candidate,high*(1-distance))
+        s0_half_stop=ceil_step(state.entry_price-(state.entry_price-state.floor_price)*Decimal('0.5'),tick)
+        if stage=='S0_INITIAL_PROTECTION' and high>=state.entry_price*Decimal('1.006') and s0_half_stop<bid:
+            candidate=max(candidate,s0_half_stop)
         reversal_hits=0
         if regime in ('CONFIRMED_REVERSAL','SEVERE_ADVERSE_MOVE'):
-            # S0 keeps the resting -0.8%/-1.0% stop. A 5m pullback must not sell above it.
+            # S0 keeps the resting -0.8%/-1.0% stop on the first reversal tick, and tightens stop by 50% on persistent reversal.
             if stage=='S0_INITIAL_PROTECTION' and bid>state.stop_price:
+                reversal_hits=state.reversal_hits+1
                 reasons.append('REVERSAL_OBSERVED_S0_STOP_RETAINED')
+                if reversal_hits>=2 and s0_half_stop<bid:
+                    candidate=max(candidate,s0_half_stop)
+                    reasons.append('S0_REVERSAL_STOP_TIGHTENED')
             else:
                 reversal_hits=state.reversal_hits+1
                 confirm_needed=1 if regime=='SEVERE_ADVERSE_MOVE' else max(1,state.reversal_confirm_ticks)

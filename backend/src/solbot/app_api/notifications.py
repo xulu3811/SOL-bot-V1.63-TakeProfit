@@ -251,7 +251,10 @@ class SourceEventCollector:
             with self.store.tx() as db:db.execute("INSERT INTO notification_source_cursors VALUES('hard_lock_state',?) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor",(revision,))
         return counts
     def _poll_bot_orders(self):
-        try:rows=self.reader.read('binance_vault','SELECT signal_id,strategy_id,status,created_at,filled_at,stop_updated_at FROM bot_orders ORDER BY created_at DESC LIMIT 50',())
+        try:rows=self.reader.read('binance_vault','SELECT signal_id,strategy_id,status,created_at,filled_at,stop_updated_at,closed_at FROM bot_orders ORDER BY created_at DESC LIMIT 50',())
+        except sqlite3.OperationalError:
+            try:rows=self.reader.read('binance_vault','SELECT signal_id,strategy_id,status,created_at,filled_at,stop_updated_at FROM bot_orders ORDER BY created_at DESC LIMIT 50',())
+            except (sqlite3.Error,OSError,KeyError,TypeError):return 'UNAVAILABLE'
         except (sqlite3.Error,OSError,KeyError,TypeError):return 'UNAVAILABLE'
         emitted=0
         kind_map={'NEW':'LIVE_ORDER','FILLED':'BUY_FILL','CANCELED':'LIVE_ORDER','EXPIRED':'LIVE_ORDER','CLOSED':'APTS_EXIT'}
@@ -261,7 +264,7 @@ class SourceEventCollector:
             if not event_kind or not signal_id:continue
             identity='bot:'+hashlib.sha256(f'{signal_id}:{status}'.encode()).hexdigest()[:32]
             if status=='FILLED':at=int(row.get('filled_at') or row.get('created_at') or 0)
-            elif status=='CLOSED':at=int(row.get('stop_updated_at') or row.get('filled_at') or row.get('created_at') or 0)
+            elif status=='CLOSED':at=int(row.get('closed_at') or row.get('stop_updated_at') or row.get('filled_at') or row.get('created_at') or 0)
             else:at=int(row.get('created_at') or 0)
             details={'mode':'LIVE','strategy':row.get('strategy_id') or 'T1','status':status}
             if self.store.publish(identity,event_kind,'SOLUSDT',at or self.store.clock(),details):emitted+=1

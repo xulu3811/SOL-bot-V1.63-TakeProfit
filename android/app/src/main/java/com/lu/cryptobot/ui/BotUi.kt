@@ -19,7 +19,6 @@ import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -31,7 +30,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -59,6 +57,7 @@ import com.lu.cryptobot.ui.sheets.ConnectionSheet
 import com.lu.cryptobot.ui.sheets.CustodyConfirmSheet
 import com.lu.cryptobot.ui.sheets.LiveToggleConfirmSheet
 import com.lu.cryptobot.ui.sheets.OrderDetailSheet
+import com.lu.cryptobot.ui.sheets.TradingConfigSheet
 import com.lu.cryptobot.ui.theme.CryptoBotTheme
 import com.lu.cryptobot.ui.theme.LocalBotColors
 import org.json.JSONObject
@@ -72,7 +71,6 @@ private val DESTINATIONS = listOf(
     NavDestination("shadow", "Shadow", "影子沙盒", Icons.Outlined.Science),
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BotUi(vm: BotViewModel, start: String = "markets") {
     val state by vm.state.collectAsState()
@@ -84,6 +82,7 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
     var showConnect by remember { mutableStateOf(false) }
     var showAlerts by remember { mutableStateOf(false) }
     var showApiConfig by remember { mutableStateOf(false) }
+    var showTradingConfig by remember { mutableStateOf(false) }
     var pendingLiveToggle by remember { mutableStateOf<Boolean?>(null) }
     var pendingCustody by remember { mutableStateOf<Pair<JSONObject, Boolean>?>(null) }
     var inspectingOrder by remember { mutableStateOf<JSONObject?>(null) }
@@ -118,7 +117,6 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                         liveState = state.live,
                         microReady = microReady,
                         unreadAlerts = unreadCount,
-                        onRefresh = { vm.refresh(state.interval) },
                         onOpenAlerts = {
                             val newest = alerts.maxOfOrNull { it.receivedAt } ?: System.currentTimeMillis()
                             vm.markAlertsRead(newest)
@@ -169,15 +167,12 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                 }
             },
         ) { innerPadding ->
-            PullToRefreshBox(
-                isRefreshing = state.busy,
-                onRefresh = { vm.refresh(state.interval) },
+            Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
             ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    if (!state.busy && deviceId.isBlank() && state.values.isEmpty()) {
+                if (!state.busy && deviceId.isBlank() && state.values.isEmpty()) {
                         Surface(
                             shape = RoundedCornerShape(14.dp),
                             color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
@@ -253,6 +248,7 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                                 liveState = state.live,
                                 values = state.values,
                                 onRequestLiveToggle = { targetOn -> pendingLiveToggle = targetOn },
+                                onOpenTradingConfig = { showTradingConfig = true },
                                 onOpenApiConfig = { showApiConfig = true },
                                 onSyncBinance = { vm.syncBinance() },
                                 onRequestCustody = { pos, enabling -> pendingCustody = pos to enabling },
@@ -262,11 +258,11 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                             else -> ShadowScreen(
                                 values = state.values,
                                 onInspectOrder = { ord -> inspectingOrder = ord },
+                                onOpenTradingConfig = { showTradingConfig = true },
                                 modifier = Modifier.fillMaxSize(),
                             )
                         }
                     }
-                }
             }
         }
 
@@ -353,10 +349,46 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
             )
         }
 
+        if (showTradingConfig) {
+            val liveStatus = state.values["live/status"]
+            val readiness = liveStatus?.optJSONObject("readiness")
+            val cfgObj = state.values["trading/config"]
+                ?: readiness?.optJSONObject("trading_config")
+                ?: liveStatus?.optJSONObject("trading_config")
+                ?: state.values["shadow/status"]?.optJSONObject("trading_config")
+            val curMin = cfgObj?.optString("min_order_usdt").orEmpty()
+                .ifBlank { readiness?.optString("min_order_usdt").orEmpty() }
+                .ifBlank { "500" }
+            val curMax = cfgObj?.optString("max_order_usdt").orEmpty()
+                .ifBlank { readiness?.optString("max_order_usdt").orEmpty() }
+                .ifBlank { "1000" }
+            val curSlots = cfgObj?.optInt("max_slots", 0)?.takeIf { it > 0 }
+                ?: readiness?.optInt("max_slots", 2)?.takeIf { it > 0 } ?: 2
+            val freeUsdt = readiness?.optString("free_usdt").orEmpty()
+                .ifBlank { state.values["live/positions"]?.optJSONObject("account")?.optJSONObject("USDT")?.optString("free").orEmpty() }
+            TradingConfigSheet(
+                currentMinOrderUsdt = curMin,
+                currentMaxOrderUsdt = curMax,
+                currentMaxSlots = curSlots,
+                freeUsdt = freeUsdt,
+                onSave = { minU, maxU, slots -> vm.saveTradingConfig(minU, maxU, slots) },
+                onDismiss = { showTradingConfig = false },
+            )
+        }
+
         pendingLiveToggle?.let { enabling ->
             val binanceAcct = state.values["binance/account"]
             val liveStatus = state.values["live/status"]
             val readiness = liveStatus?.optJSONObject("readiness")
+            val cfgObj = state.values["trading/config"] ?: readiness?.optJSONObject("trading_config")
+            val curMin = cfgObj?.optString("min_order_usdt").orEmpty()
+                .ifBlank { readiness?.optString("min_order_usdt").orEmpty() }
+                .ifBlank { "500" }
+            val curMax = cfgObj?.optString("max_order_usdt").orEmpty()
+                .ifBlank { readiness?.optString("max_order_usdt").orEmpty() }
+                .ifBlank { "1000" }
+            val curSlots = cfgObj?.optInt("max_slots", 0)?.takeIf { it > 0 }
+                ?: readiness?.optInt("max_slots", 2)?.takeIf { it > 0 } ?: 2
             val ordersEnabled = binanceAcct?.optBoolean(
                 "orders_enabled",
                 readiness?.optBoolean("orders_enabled", false) ?: false,
@@ -367,6 +399,9 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                 enabling = enabling,
                 ordersEnabled = ordersEnabled,
                 freeUsdt = freeUsdt,
+                minOrderUsdt = curMin,
+                maxOrderUsdt = curMax,
+                maxSlots = curSlots,
                 onConfirm = { vm.live(enabling) },
                 onDismiss = { pendingLiveToggle = null },
             )

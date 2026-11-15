@@ -310,15 +310,117 @@ class AccountVault:
                 pass
         return None
 
+    def trading_config(self):
+        min_dec = MIN_ORDER_USDT
+        max_dec = MAX_ORDER_USDT
+        max_slots = 2
+        updated_at = 0
+        custom = False
+        if self.db_path.exists():
+            try:
+                with self._db() as db:
+                    row = db.execute(
+                        'SELECT min_order_usdt,max_order_usdt,max_slots,updated_at FROM trading_config WHERE singleton=1'
+                    ).fetchone()
+                if row:
+                    min_dec = Decimal(str(row[0] or '500'))
+                    max_dec = Decimal(str(row[1] or str(min_dec)))
+                    max_slots = max(1, min(10, int(row[2] or 2)))
+                    updated_at = int(row[3] or 0)
+                    custom = True
+            except Exception:
+                pass
+        if not custom:
+            cfg_file = self.root / 'trading-config.json'
+            if cfg_file.exists():
+                try:
+                    raw = json.loads(cfg_file.read_text(encoding='utf-8'))
+                    min_dec = Decimal(str(raw.get('min_order_usdt') or '500'))
+                    max_dec = Decimal(str(raw.get('max_order_usdt') or str(min_dec)))
+                    max_slots = max(1, min(10, int(raw.get('max_slots') or 2)))
+                    updated_at = int(raw.get('updated_at') or 0)
+                    custom = True
+                except Exception:
+                    pass
+        if max_dec < min_dec:
+            max_dec = min_dec
+        return {
+            'min_order_usdt': f'{min_dec:.2f}',
+            'max_order_usdt': f'{max_dec:.2f}',
+            'order_usdt': f'{min_dec:.2f}',
+            'fixed_mode': bool(min_dec == max_dec),
+            'max_slots': int(max_slots),
+            'updated_at': int(updated_at),
+            'sync_shadow': True,
+            'custom': bool(custom),
+        }
+
+    def save_trading_config(self, min_order_usdt, max_order_usdt=None, max_slots=2):
+        try:
+            min_dec = Decimal(str(min_order_usdt).strip()).quantize(Decimal('0.01'))
+            max_dec = (
+                Decimal(str(max_order_usdt).strip()).quantize(Decimal('0.01'))
+                if max_order_usdt not in (None, '')
+                else min_dec
+            )
+            slots_int = int(str(max_slots).strip())
+        except Exception:
+            raise ValueError('INVALID_TRADING_CONFIG') from None
+        if min_dec < Decimal('10') or min_dec > Decimal('50000') or max_dec < min_dec or max_dec > Decimal('50000'):
+            raise ValueError('INVALID_ORDER_USDT')
+        if slots_int < 1 or slots_int > 10:
+            raise ValueError('INVALID_MAX_SLOTS')
+        now = int(self.clock())
+        with self._db() as db:
+            db.execute(
+                'INSERT INTO trading_config(singleton,min_order_usdt,max_order_usdt,max_slots,updated_at) VALUES(1,?,?,?,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET min_order_usdt=excluded.min_order_usdt,'
+                'max_order_usdt=excluded.max_order_usdt,max_slots=excluded.max_slots,updated_at=excluded.updated_at',
+                (f'{min_dec:.2f}', f'{max_dec:.2f}', slots_int, now),
+            )
+        payload = {
+            'min_order_usdt': f'{min_dec:.2f}',
+            'max_order_usdt': f'{max_dec:.2f}',
+            'order_usdt': f'{min_dec:.2f}',
+            'fixed_mode': bool(min_dec == max_dec),
+            'max_slots': slots_int,
+            'updated_at': now,
+            'sync_shadow': True,
+            'custom': True,
+        }
+        mirror_paths = [self.root / 'trading-config.json']
+        env_cfg = os.environ.get('SOLBOT_TRADING_CONFIG_PATH', '').strip()
+        if env_cfg:
+            mirror_paths.append(Path(env_cfg))
+        shared_db_dir = Path('/var/lib/sol-bot/database')
+        if shared_db_dir.exists() and shared_db_dir.is_dir():
+            mirror_paths.append(shared_db_dir / 'trading-config.json')
+        encoded = json.dumps(payload, sort_keys=True)
+        for target in mirror_paths:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix('.json.tmp')
+                tmp.write_text(encoded, encoding='utf-8')
+                if os.name == 'posix':
+                    try:
+                        os.chmod(tmp, 0o644)
+                    except Exception:
+                        pass
+                tmp.replace(target)
+            except Exception:
+                continue
+        return payload
+
     def open_bot_slots(self, mark_price=None):
         mark_dec = Decimal(str(mark_price)) if mark_price is not None else self._current_mark_dec()
+        max_slots = int(self.trading_config().get('max_slots') or 2)
         rows = [
             row for row in self.bot_orders(limit=50, offset=0)
             if row.get('status') in ('NEW', 'PARTIALLY_FILLED', 'FILLED', 'EXIT_PENDING')
             and not self._is_dust_order(row.get('quantity'), row.get('price'), mark_dec, row.get('status'))
         ]
         slots = []
-        for idx, row in enumerate(rows[:2], start=1):
+        for idx, row in enumerate(rows[:max_slots], start=1):
             qty = row.get('quantity') or '0'
             price = row.get('price') or '0'
             slots.append({
@@ -430,27 +532,29 @@ class AccountVault:
         return {'accepted': True, 'state': 'LIVE_OFF', 'code': 'LIVE_OFF', 'protection': 'RETAINED', 'buy_orders': 0}
 
     @staticmethod
-    def _r2_notional(equity, stop_distance, fee_rate, score='85'):
+    def _r2_notional(equity, stop_distance, fee_rate, score='85', min_order_usdt=MIN_ORDER_USDT, max_order_usdt=MAX_ORDER_USDT):
         try:
             equity = Decimal(str(equity))
             stop = Decimal(str(stop_distance))
             fee = Decimal(str(fee_rate))
             score_dec = Decimal(str(score))
+            min_u = Decimal(str(min_order_usdt))
+            max_u = Decimal(str(max_order_usdt))
         except Exception:
             return None
         if equity <= 0 or stop < Decimal('0.005') or stop > Decimal('0.050'):
             return None
-        if fee < 0 or fee > Decimal('0.01'):
+        if fee < 0 or fee > Decimal('0.01') or min_u <= 0 or max_u < min_u:
             return None
         loss = stop + fee + fee + Decimal('0.002')
         if loss <= 0:
             return None
         span = min(Decimal('1'), max(Decimal('0'), (score_dec - Decimal('75')) / Decimal('25')))
-        score_cap = MIN_ORDER_USDT + span * (MAX_ORDER_USDT - MIN_ORDER_USDT)
+        score_cap = min_u + span * (max_u - min_u)
         risk_cap = equity * Decimal('0.010') / loss
-        if risk_cap < MIN_ORDER_USDT:
+        if risk_cap < min_u:
             return None
-        return min(MAX_ORDER_USDT, score_cap, risk_cap)
+        return min(max_u, score_cap, risk_cap)
 
     def consider_entry(self, reader, bid, tick, now, allowed_strategies=None, ask=None):
         """Place at most one SOL limit buy from an accepted live strategy signal."""
@@ -461,9 +565,14 @@ class AccountVault:
                 return {'placed': False, 'reason': 'HARD_LOCKED', 'buy_orders': 0}
         except Exception:
             pass
+        cfg = self.trading_config()
+        min_order_usdt = Decimal(str(cfg.get('min_order_usdt') or '500'))
+        max_order_usdt = Decimal(str(cfg.get('max_order_usdt') or '1000'))
+        max_slots = int(cfg.get('max_slots') or 2)
+        is_custom_cfg = bool(cfg.get('custom')) and (min_order_usdt != MIN_ORDER_USDT or max_order_usdt != MAX_ORDER_USDT)
         bid_dec = Decimal(str(bid))
         open_slots = len(self.open_bot_slots(mark_price=bid_dec if bid_dec > 0 else None))
-        if open_slots >= 2:
+        if open_slots >= max_slots:
             return {'placed': False, 'reason': 'SLOTS_FULL', 'buy_orders': 0}
         signal = self._next_signal(reader, now, allowed_strategies=allowed_strategies, mark_price=bid_dec)
         if signal is None:
@@ -482,6 +591,7 @@ class AccountVault:
         price = self._floor(raw_price, tick_dec) if tick_dec > 0 else raw_price
         if price <= 0:
             return {'placed': False, 'reason': 'INVALID_PRICE', 'buy_orders': 0}
+        below_min_code = 'USDT_BELOW_500' if min_order_usdt == Decimal('500') else 'USDT_BELOW_MIN'
         api_key, secret = self._load()
         try:
             self._require_spot(api_key, secret)
@@ -494,29 +604,37 @@ class AccountVault:
                     usdt_total = amount
                 elif row.get('asset') == 'SOL':
                     sol_total = amount
-            if free < MIN_ORDER_USDT or price <= 0:
-                return {'placed': False, 'reason': 'USDT_BELOW_500', 'buy_orders': 0}
+            if free < min_order_usdt or price <= 0:
+                return {'placed': False, 'reason': below_min_code, 'buy_orders': 0}
             ref_equity = max(Decimal('2000'), usdt_total + sol_total * bid_dec)
+            score_dec = Decimal(str(signal.get('score') or '85'))
+            span = min(Decimal('1'), max(Decimal('0'), (score_dec - Decimal('75')) / Decimal('25')))
             if signal['strategy_id'] == 'T2':
-                target_notional = risk_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal['score'])
-                if target_notional is None:
-                    return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
+                if not is_custom_cfg:
+                    target_notional = risk_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal['score'])
+                    if target_notional is None:
+                        return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
+                else:
+                    if risk_notional(max(ref_equity, Decimal('5000')), signal['stop_distance'], DEFAULT_FEE_RATE, signal['score']) is None:
+                        return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
+                    target_notional = min_order_usdt + span * (max_order_usdt - min_order_usdt)
             elif signal['strategy_id'] == 'R2':
-                target_notional = self._r2_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal.get('score') or '85')
+                eff_eq = max(ref_equity, max_order_usdt * Decimal('2.5')) if is_custom_cfg else ref_equity
+                target_notional = self._r2_notional(
+                    eff_eq, signal['stop_distance'], DEFAULT_FEE_RATE, signal.get('score') or '85',
+                    min_order_usdt=min_order_usdt, max_order_usdt=max_order_usdt,
+                )
                 if target_notional is None:
                     return {'placed': False, 'reason': 'R2_SIZE', 'buy_orders': 0}
             else:
-                target_notional = signal['notional']
-            if free < MAX_ORDER_USDT:
-                notional = free
-            else:
-                notional = min(MAX_ORDER_USDT, max(MIN_ORDER_USDT, target_notional), free)
-            if notional < MIN_ORDER_USDT:
-                return {'placed': False, 'reason': 'USDT_BELOW_500', 'buy_orders': 0}
+                target_notional = min_order_usdt + span * (max_order_usdt - min_order_usdt) if is_custom_cfg else signal['notional']
+            notional = min(max_order_usdt, max(min_order_usdt, target_notional), free)
+            if notional < min_order_usdt:
+                return {'placed': False, 'reason': below_min_code, 'buy_orders': 0}
             rules = self._get_sol_rules(now)
             qty = self._floor(notional / price, rules['step'])
             step_tolerance = price * rules['step']
-            min_notional = max(MIN_ORDER_USDT - step_tolerance, rules.get('min_notional') or Decimal('5'))
+            min_notional = max(min_order_usdt - step_tolerance, rules.get('min_notional') or Decimal('5'))
             if qty <= 0 or qty < rules['min_qty'] or qty * price < min_notional:
                 return {'placed': False, 'reason': 'BELOW_MIN_NOTIONAL', 'buy_orders': 0}
             client_id = 'cbotby' + hashlib.sha256(signal['signal_id'].encode()).hexdigest()[:16]
@@ -938,6 +1056,8 @@ class AccountVault:
         strategy_id = payload.get('strategy_id')
         if payload.get('symbol') != 'SOLUSDT' or strategy_id not in allowed or not payload.get('accepted'):
             return None
+        if strategy_id == 'T1' and payload.get('regime') == 'DOWNTREND':
+            return None
         signal_id = str(payload.get('signal_id') or '')
         if not signal_id or signal_id in used:
             return None
@@ -1090,6 +1210,7 @@ class AccountVault:
                 db.execute('UPDATE protections SET status=?,updated_at=? WHERE intent_id=?', ('CLOSED', now, current['intent_id']))
             return {'advanced': True, 'stage': 'CLOSED', 'reason': 'DUST_BELOW_5_USDT', 'buy_orders': 0}
         current_stop = Decimal(current['stop_price'])
+        limit_floor = Decimal(str(current.get('limit_price') or current['stop_price']))
         decision, stage, prev_stage = self._advance_apts_step(
             'manual:SOL', entry=entry, qty=qty, current_stop=current_stop,
             current_stage=current.get('stage') or 'S0', bid=bid, evidence=evidence,
@@ -1097,7 +1218,20 @@ class AccountVault:
             stop_distance=Decimal('0.008'),
             entry_time_ms=int(current.get('placed_at') or 0), reversal_confirm_ticks=2,
         )
-        if decision.exit_required:
+        if decision.exit_required and bid >= limit_floor:
+            from dataclasses import replace
+            peak = Decimal(str(decision.state.high_price))
+            fallback_stage = 'S2_ADAPTIVE_TRAILING' if peak >= entry * Decimal('1.015') else (
+                'S1_PROFIT_PROTECTION' if peak >= entry * Decimal('1.008') else 'S0_INITIAL_PROTECTION'
+            )
+            unlatched = replace(decision.state, stage=fallback_stage, trigger_latched=False, trigger_reason='')
+            stage = APTS_STAGE_SHORT.get(fallback_stage, prev_stage or 'S0')
+            self._save_state(unlatched, stage, 'RESTING_PROTECTIVE_STOP_ACTIVE', now, '', intent_id='manual:SOL')
+            if decision.stop_price > current_stop and decision.stop_price < bid and self._should_replace_stop(
+                current_stop, decision.stop_price, Decimal(current['quantity']), decision.quantity, current.get('updated_at'), now, stage != prev_stage
+            ):
+                self._raise_stop(decision, current, tick, now)
+        elif decision.exit_required:
             self._exit_position(decision, current, tick, now)
         elif self._should_replace_stop(current_stop, decision.stop_price, Decimal(current['quantity']), decision.quantity, current.get('updated_at'), now, stage != prev_stage):
             self._raise_stop(decision, current, tick, now)
@@ -1160,7 +1294,7 @@ class AccountVault:
                 found = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': prev_client_id}, api_key, secret, now)
                 prev_order = found
                 status = str(found.get('status') or '')
-                if status == 'FILLED':
+                if status in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
                     return Decimal('0'), {'closed_by_prev_stop': True, 'prev_active': False, 'order': found}
                 if status in ('NEW', 'PARTIALLY_FILLED'):
                     prev_active = True
@@ -1496,8 +1630,16 @@ class AccountVault:
                 raise ValueError('BINANCE_REJECTED') from None
             balances.append((asset, free, locked, clock))
         manual = []
+        active_prot = self.protection()
+        active_prot_cid = str(active_prot.get('client_order_id') or '') if active_prot else ''
         for row in orders if isinstance(orders, list) else []:
             client_id = str(row.get('clientOrderId') or '')
+            if active_prot_cid and client_id == active_prot_cid and row.get('status') in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                new_status = 'CLOSED' if row.get('status') == 'FILLED' else 'CANCELLED'
+                with self._db() as db:
+                    db.execute('UPDATE protections SET status=?,updated_at=? WHERE intent_id=?', (new_status, clock, 'manual:SOL'))
+                    db.execute('DELETE FROM custody_apts WHERE intent_id=?', ('manual:SOL',))
+                active_prot_cid = ''
             if row.get('symbol') != 'SOLUSDT' or client_id.startswith(BOT_ORDER_PREFIXES):
                 continue
             if row.get('status') not in ('NEW', 'PARTIALLY_FILLED', 'FILLED'):
@@ -1525,9 +1667,20 @@ class AccountVault:
         return self.transport.request(path, encoded + '&signature=' + signature, {'X-MBX-APIKEY': api_key}, method)
 
     def _protect(self, api_key, secret, quantity):
+        req_qty = Decimal(str(quantity))
         current = self.protection()
         if current is not None:
-            return self._custody_view(current, 0)
+            cur_qty = Decimal(str(current.get('quantity') or '0'))
+            if req_qty - cur_qty < Decimal('1.0'):
+                return self._custody_view(current, 0)
+            try:
+                clock_cancel = self._server_time()
+                self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': current['client_order_id']}, api_key, secret, clock_cancel, method='DELETE')
+            except Exception:
+                pass
+            with self._db() as db:
+                db.execute('UPDATE protections SET status=?,updated_at=? WHERE intent_id=?', ('CANCELLED', self.clock(), 'manual:SOL'))
+                db.execute('DELETE FROM custody_apts WHERE intent_id=?', ('manual:SOL',))
         clock = self._server_time()
         rights = self._signed('/sapi/v1/account/apiRestrictions', {}, api_key, secret, clock)
         if rights.get('enableWithdrawals') is True or rights.get('enableInternalTransfer') is True or rights.get('permitsUniversalTransfer') is True:
@@ -1544,9 +1697,20 @@ class AccountVault:
         entry = self._custody_entry_price(api_key, secret, clock)
         resting = self._our_stop(open_orders)
         if resting is not None:
-            self._adopt(resting, entry, clock)
-            return self._custody_view(self.protection(), 0)
-        cap = min(Decimal(str(quantity)), free)
+            r_cid = str(resting.get('clientOrderId') or '')
+            r_stop = Decimal(str(resting.get('stopPrice') or resting.get('price') or '0'))
+            r_qty = Decimal(str(resting.get('origQty') or '0'))
+            if r_cid.startswith('cbotsl') and Decimal('0') < r_stop < entry and abs(r_qty - req_qty) <= max(Decimal('0.1'), req_qty * Decimal('0.05')):
+                self._adopt(resting, entry, clock)
+                return self._custody_view(self.protection(), 0)
+            try:
+                self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': r_cid}, api_key, secret, clock, method='DELETE')
+                open_orders = [row for row in open_orders if str(row.get('clientOrderId') or '') != r_cid]
+                free += r_qty
+                locked = max(Decimal('0'), locked - r_qty)
+            except Exception:
+                pass
+        cap = min(req_qty, free)
         if cap <= 0:
             self._locked_or_short(locked, open_orders)
         info = self.transport.request('/api/v3/exchangeInfo', 'symbol=SOLUSDT', {})
@@ -1582,6 +1746,14 @@ class AccountVault:
             if found is not None:
                 placed = found
         self._remember(placed, client_id, qty, stop, limit, entry, clock)
+        if self.snapshot_path.exists():
+            try:
+                new_free = format(max(Decimal('0'), free - qty), 'f')
+                new_locked = format(locked + qty, 'f')
+                with closing(sqlite3.connect(self.snapshot_path, timeout=2)) as snap_db, snap_db:
+                    snap_db.execute("UPDATE balances SET free=?,locked=?,observed_at=? WHERE asset='SOL'", (new_free, new_locked, clock))
+            except Exception:
+                pass
         return self._custody_view(self.protection(), 1)
 
     @staticmethod
@@ -1755,7 +1927,7 @@ class AccountVault:
             quote = Decimal(str(row.get('cummulativeQuoteQty') or '0'))
         except Exception:
             return '0'
-        if price <= 0 and executed > 0 and quote > 0:
+        if executed > 0 and quote > 0:
             price = quote / executed
         return format(price, 'f')
 
@@ -1835,6 +2007,7 @@ class AccountVault:
             db.execute('ALTER TABLE custody_apts ADD COLUMN note TEXT NOT NULL DEFAULT ""')
         db.execute('CREATE TABLE IF NOT EXISTS marks(symbol TEXT PRIMARY KEY, price TEXT NOT NULL, observed_at INTEGER NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS user_live(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL, updated_at INTEGER NOT NULL, reason TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS trading_config(singleton INTEGER PRIMARY KEY CHECK(singleton=1), min_order_usdt TEXT NOT NULL, max_order_usdt TEXT NOT NULL, max_slots INTEGER NOT NULL, updated_at INTEGER NOT NULL)')
         db.execute("CREATE TABLE IF NOT EXISTS bot_orders(signal_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, exchange_order_id TEXT NOT NULL, price TEXT NOT NULL, quantity TEXT NOT NULL, quote TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)")
         bot_columns = {row[1] for row in db.execute('PRAGMA table_info(bot_orders)')}
         for name, kind in (

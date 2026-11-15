@@ -56,6 +56,7 @@ interface AppApi {
     @param:ApplicationContext private val appContext: Context,
 ) {
     val frames = MutableSharedFlow<JSONObject>(extraBufferCapacity = 32)
+    val lastFrameAt = java.util.concurrent.atomic.AtomicLong(0L)
     private val alertScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val alertMutex = Mutex()
     @Volatile private var session: String=""
@@ -130,12 +131,12 @@ interface AppApi {
     }
     suspend fun eventsLoop() {
         while (currentCoroutineContext().isActive) {
-            if (session.isEmpty() && !ensureSession()) { delay(5_000); continue }
+            if (session.isEmpty() && !ensureSession()) { delay(2_000); continue }
             val closed = CompletableDeferred<Unit>()
             val socket = openEvents(closed)
             try { closed.await() } catch (_: Exception) {}
             socket.cancel()
-            delay(2_000)
+            delay(1_000)
         }
     }
     private suspend fun openEvents(closed: CompletableDeferred<Unit>): WebSocket {
@@ -157,6 +158,7 @@ interface AppApi {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 runCatching {
                     val frame = JSONObject(text)
+                    lastFrameAt.set(System.currentTimeMillis())
                     frames.tryEmit(frame)
                     frame.optJSONObject("alerts")?.let { alertsObj ->
                         val items = alertsObj.optJSONArray("items")

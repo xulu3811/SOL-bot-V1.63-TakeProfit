@@ -26,12 +26,13 @@ class P3ShadowExecutor(ShadowExecutor):
     risk_policy='BLOCK_ENTRIES_KEEP_PROTECTION_V1'
 
     def __init__(self,path,*,rules:SymbolRules,symbol='SOLUSDT',account_id='SOL-shadow',fee_rate='0.001',
-                 participation='0.10',slippage_rate='0.0005',minimum_notional=None,maximum_notional=None):
+                 participation='0.10',slippage_rate='0.0005',minimum_notional=None,maximum_notional=None,maximum_slots=None):
         if symbol!='SOLUSDT' or account_id!='SOL-shadow' or rules.symbol!=symbol:
             raise ValueError('P3 simulation belongs only to SOL-shadow/SOLUSDT')
         self.rules=rules
         self._min_notional_override=D(minimum_notional,positive=True) if minimum_notional is not None else None
         self._max_notional_override=D(maximum_notional,positive=True) if maximum_notional is not None else Decimal('1000')
+        self._max_slots_override=int(maximum_slots) if maximum_slots is not None and int(maximum_slots)>=1 else None
         self.participation=D(participation,positive=True)
         self.slippage_rate=D(slippage_rate,nonnegative=True)
         if self.participation>Decimal('.1') or self.slippage_rate>Decimal('.01'):
@@ -83,9 +84,61 @@ class P3ShadowExecutor(ShadowExecutor):
     def maximum_notional(self):
         return self._max_notional_override
 
+    @property
+    def _effective_minimum_notional(self):
+        min_n = self.minimum_notional
+        if getattr(self, '_min_notional_override', None) is not None:
+            return max(Decimal('5'), min_n - Decimal('2'))
+        return min_n
+
+    def apply_trading_config(self, min_order_usdt=None, max_order_usdt=None, max_slots=None, *, auto_scale_virtual_cash=True):
+        if min_order_usdt is not None:
+            self._min_notional_override = D(min_order_usdt, positive=True)
+        if max_order_usdt is not None:
+            self._max_notional_override = D(max_order_usdt, positive=True)
+        if (
+            self._min_notional_override is not None
+            and self._max_notional_override is not None
+            and self._min_notional_override > self._max_notional_override
+        ):
+            self._max_notional_override = self._min_notional_override
+        if max_slots is not None and int(max_slots) >= 1:
+            self._max_slots_override = int(max_slots)
+        if auto_scale_virtual_cash and self._max_notional_override is not None:
+            required = (self.maximum_notional * Decimal(self.maximum_slots) * Decimal('1.10')).quantize(Decimal('0.01'))
+            with self._transaction() as db:
+                account = self._account(db)
+                open_cost = sum(
+                    (Decimal(row[0]) for row in db.execute("SELECT entry_cost FROM shadow_positions WHERE status='OPEN'").fetchall()),
+                    Decimal('0'),
+                )
+                current_cap = Decimal(account['cash']) + open_cost
+                peak_eq = Decimal(account['peak_equity'])
+                last_eq = Decimal(account['last_equity'])
+                if required > current_cap and required > peak_eq:
+                    delta = (required - max(current_cap, peak_eq)).quantize(Decimal('0.01'))
+                    if delta > 0:
+                        db.execute(
+                            'UPDATE shadow_account SET cash=?, peak_equity=?, last_equity=? WHERE singleton=1',
+                            (
+                                str(Decimal(account['cash']) + delta),
+                                str(peak_eq + delta),
+                                str(last_eq + delta),
+                            ),
+                        )
+                        prev_row = db.execute(
+                            "SELECT value FROM shadow_p3_metadata WHERE key='virtual_capital_added'"
+                        ).fetchone()
+                        prev_added = Decimal(prev_row[0]) if prev_row and prev_row[0] else Decimal('0')
+                        db.execute(
+                            "INSERT OR REPLACE INTO shadow_p3_metadata(key, value) VALUES ('virtual_capital_added', ?)",
+                            (str((prev_added + delta).quantize(Decimal('0.01'))),),
+                        )
+
     def _quantity(self,size,price):
         quantity=floor_step(size/price,self.rules.step_size)
-        min_allowed=max(self.rules.min_notional,self.minimum_notional-price*self.rules.step_size) if size>=self.minimum_notional else self.minimum_notional
+        eff_min=self._effective_minimum_notional
+        min_allowed=max(self.rules.min_notional,eff_min-price*self.rules.step_size) if size>=eff_min else self.minimum_notional
         if quantity*price<min_allowed or quantity<self.rules.min_qty:
             raise ShadowRejected('DENY_ROUNDED_SIZE','rounded order falls below required size')
         if quantity>self.rules.max_qty:raise ShadowRejected('DENY_QUANTITY','quantity exceeds exchange rule')

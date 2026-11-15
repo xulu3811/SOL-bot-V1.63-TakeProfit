@@ -101,6 +101,13 @@ def create_app(auth,reader,notifications,control,vault=None):
         open_slots = max(len(open_bots), len(guardian_slots))
         configured = bool(acct_status.get('configured'))
         orders_enabled = bool(acct_status.get('orders_enabled'))
+        try:
+            t_cfg = account_vault().trading_config() or {}
+        except Exception:
+            t_cfg = {}
+        min_order_dec = Decimal(str(t_cfg.get('min_order_usdt') or '500'))
+        max_order_dec = Decimal(str(t_cfg.get('max_order_usdt') or '1000'))
+        max_slots_int = int(t_cfg.get('max_slots') or 2)
         if state == 'HARD_LOCKED':
             blocker = 'HARD_LOCKED'
         elif state != 'LIVE_ON':
@@ -109,9 +116,9 @@ def create_app(auth,reader,notifications,control,vault=None):
             blocker = 'API_NOT_CONFIGURED'
         elif not orders_enabled:
             blocker = 'TRADE_PERMISSION_REQUIRED'
-        elif open_slots >= 2:
+        elif open_slots >= max_slots_int:
             blocker = 'SLOTS_FULL'
-        elif free_usdt < Decimal('500'):
+        elif free_usdt < min_order_dec:
             blocker = 'INSUFFICIENT_FREE_USDT'
         else:
             blocker = None
@@ -127,9 +134,9 @@ def create_app(auth,reader,notifications,control,vault=None):
             'total_usdt': f'{total_usdt:.2f}',
             'free_bnb': f'{free_bnb:.4f}',
             'free_sol': f'{free_sol:.3f}',
-            'min_order_usdt': '500.00',
-            'max_order_usdt': '1000.00',
-            'max_slots': 2,
+            'min_order_usdt': f'{min_order_dec:.2f}',
+            'max_order_usdt': f'{max_order_dec:.2f}',
+            'max_slots': max_slots_int,
             'open_slots': open_slots,
             'configured': configured,
             'orders_enabled': orders_enabled,
@@ -137,6 +144,7 @@ def create_app(auth,reader,notifications,control,vault=None):
             'blocker': blocker,
             'daily_drawdown_pct': str(dd_pct),
             'hard_circuit_pct': str((risk_doc or {}).get('hard_limit_pct') or '5.00'),
+            'trading_config': t_cfg,
         }
     def _apply_bot_risk(risk_doc):
         risk_copy=dict(risk_doc or {})
@@ -177,11 +185,30 @@ def create_app(auth,reader,notifications,control,vault=None):
         if base.get('symbol') in (None,'SUIUSDT'):base['symbol']='SOLUSDT'
         readiness=_build_readiness(base,risk)
         base['readiness']=readiness
+        base['trading_config']=readiness.get('trading_config')
         base['orders_enabled']=readiness['orders_enabled']
         base['configured']=readiness['configured']
         allowed_fn=getattr(reader,'_allowed_live_strategies',None)
         base['live_strategies']=list(allowed_fn()) if callable(allowed_fn) else ['T1']
         return base
+    def present_shadow_status():
+        doc=dict(reader.shadow_status() or {})
+        try:
+            t_cfg=account_vault().trading_config() or {}
+        except Exception:
+            t_cfg={}
+        if t_cfg:
+            rules=dict(doc.get('rules') or {})
+            min_dec=Decimal(str(t_cfg.get('min_order_usdt') or '500'))
+            max_dec=Decimal(str(t_cfg.get('max_order_usdt') or '1000'))
+            min_str=str(int(min_dec)) if min_dec==min_dec.to_integral_value() else f'{min_dec:.2f}'
+            max_str=str(int(max_dec)) if max_dec==max_dec.to_integral_value() else f'{max_dec:.2f}'
+            rules['min_order_usdt']=min_str
+            rules['max_order_usdt']=max_str
+            rules['max_positions']=int(t_cfg.get('max_slots') or 2)
+            doc['rules']=rules
+            doc['trading_config']=t_cfg
+        return doc
     def present_live_risk():
         base=_apply_bot_risk(reader.live_risk() or {})
         status_doc=present_live_status()
@@ -250,32 +277,44 @@ def create_app(auth,reader,notifications,control,vault=None):
         result['items']=slots+manual_list
         for item in slots+manual_list:
             intent=str(item.get('intent_id') or '')
-            item['custody_on']=intent in active or (intent=='manual:SOL' and prot.get('status')=='OPEN')
-            item['authorization_id']=active.get(intent)
             if intent=='manual:SOL':
+                is_prot_active=prot.get('status') in ('OPEN','EXITING')
+                item['custody_on']=bool(is_prot_active)
+                if not is_prot_active and intent in active:
+                    try:
+                        with auth.tx() as db:
+                            db.execute('UPDATE custody_requests SET revoked=1 WHERE request_id=?',(active[intent],))
+                    except Exception:
+                        pass
+                    active.pop(intent,None)
+                item['authorization_id']=active.get(intent) if is_prot_active else None
                 item['custody_mode']='FROM_CUSTODY_START_PRICE'
-                if prot.get('status') in ('CLOSED','CANCELLED'):
-                    item['custody_on']=False
-                elif prot.get('status') in ('OPEN','EXITING'):
-                    item['custody_on']=True
-                if prot.get('stage'):
-                    item['stage']=prot['stage']
-                elif item.get('custody_on'):
-                    item['stage']='S0'
-                if prot.get('hold_note'):
-                    item['hold_note']=prot['hold_note']
-                if prot.get('apts'):
-                    item['apts']=prot['apts']
-                if prot.get('status') in ('OPEN','EXITING'):
+                if is_prot_active:
+                    item['stage']=prot.get('stage') or 'S0'
+                    if prot.get('hold_note'):
+                        item['hold_note']=prot['hold_note']
+                    if prot.get('apts'):
+                        item['apts']=prot['apts']
                     item['stop_price']=prot.get('stop_price')
                     item['stop_order_id']=prot.get('exchange_order_id')
                     item['custody_started_at']=prot.get('placed_at')
-                    if prot.get('entry_price'):
+                    if not item.get('entry_price') and prot.get('entry_price'):
                         item['entry_price']=prot.get('entry_price')
                         item['cost']=prot.get('entry_price')
-                        item['custody_anchor_price']=prot.get('entry_price')
+                    item['custody_anchor_price']=item.get('entry_price') or prot.get('entry_price')
+            else:
+                item['custody_on']=intent in active
+                item['authorization_id']=active.get(intent)
+            mark_px=None
             if fresh.get('mark_price') and 0<=auth.clock()-int(fresh.get('observed_at') or 0)<=60000:
-                _quote(item,fresh['mark_price'],'BID')
+                mark_px=fresh['mark_price']
+            else:
+                micro_fn=getattr(reader,'_micro_snapshot',None)
+                micro=micro_fn() if callable(micro_fn) else None
+                if isinstance(micro,dict) and micro.get('ready') and not micro.get('stale') and micro.get('bid'):
+                    mark_px=micro['bid']
+            if mark_px:
+                _quote(item,mark_px,'BID')
             if intent=='manual:SOL':
                 item['protection']={
                     'active':bool(item.get('custody_on')),
@@ -291,7 +330,25 @@ def create_app(auth,reader,notifications,control,vault=None):
     @app.get(PREFIX+'/live/risk')
     async def live_risk():return present_live_risk()
     @app.get(PREFIX+'/shadow/status')
-    async def shadow_status():return reader.shadow_status()
+    async def shadow_status():return present_shadow_status()
+    @app.get(PREFIX+'/trading/config')
+    async def get_trading_config(request:Request):
+        principal(request)
+        return account_vault().trading_config()
+    @app.post(PREFIX+'/trading/config')
+    async def save_trading_config(request:Request):
+        p=principal(request)
+        if p['role'] not in ('operator','admin'):raise AuthError('CONTROL_FORBIDDEN')
+        body=await request.json()
+        min_u=body.get('min_order_usdt') if body.get('min_order_usdt') not in (None,'') else body.get('order_usdt')
+        max_u=body.get('max_order_usdt') if body.get('max_order_usdt') not in (None,'') else min_u
+        slots=body.get('max_slots',2)
+        try:
+            return account_vault().save_trading_config(min_u,max_u,slots)
+        except ValueError as exc:
+            code=str(exc)
+            allowed={'INVALID_TRADING_CONFIG','INVALID_ORDER_USDT','INVALID_MAX_SLOTS'}
+            return JSONResponse({'error':code if code in allowed else 'INVALID_TRADING_CONFIG'},status_code=400)
     @app.get(PREFIX+'/shadow/orders')
     async def shadow_orders(limit:int=50,offset:int=0):
         if not 0<=offset<=100000:raise ValueError('offset')
@@ -414,14 +471,41 @@ def create_app(auth,reader,notifications,control,vault=None):
         try:
             path=socket.url.path+('?' + socket.url.query if socket.url.query else '')
             p=auth.authenticate('GET',path,b'',socket.headers)
+            tf=socket.query_params.get('timeframe') or '1m'
+            if tf not in ('1m','5m','15m','1h','4h'):tf='1m'
             await socket.accept();cursor=0
             while auth.active(p['device_id']):
                 try:
                     batch=notifications.alerts(cursor,100);cursor=batch['next_cursor']
-                    await socket.send_json({'status':present_live_status(),'risk':present_live_risk(),'positions':present_positions(p['device_id']),'markets':reader.market_summary(),'strategies':reader.strategy_summary(),'alerts':batch,'resync_required':False})
+                    try: acct_doc=account_vault().status()
+                    except Exception: acct_doc={}
+                    try: live_ord_doc=present_live_orders(50,0)
+                    except Exception: live_ord_doc={}
+                    try: shadow_st_doc=present_shadow_status()
+                    except Exception: shadow_st_doc={}
+                    try: shadow_ord_doc=reader.shadow_orders(50,0)
+                    except Exception: shadow_ord_doc={}
+                    try: mkt_doc=reader.market_summary('SOLUSDT',tf)
+                    except TypeError: mkt_doc=reader.market_summary()
+                    try: cfg_doc=account_vault().trading_config()
+                    except Exception: cfg_doc={}
+                    await socket.send_json({
+                        'status':present_live_status(),
+                        'risk':present_live_risk(),
+                        'positions':present_positions(p['device_id']),
+                        'live_orders':live_ord_doc,
+                        'binance_account':acct_doc,
+                        'shadow_status':shadow_st_doc,
+                        'shadow_orders':shadow_ord_doc,
+                        'trading_config':cfg_doc,
+                        'markets':mkt_doc,
+                        'strategies':reader.strategy_summary(),
+                        'alerts':batch,
+                        'resync_required':False,
+                    })
                 except Exception:
                     break
-                await asyncio.sleep(2)
+                await asyncio.sleep(1.0)
             try:await socket.close(code=1000)
             except Exception:pass
         except (AuthError,WebSocketDisconnect):

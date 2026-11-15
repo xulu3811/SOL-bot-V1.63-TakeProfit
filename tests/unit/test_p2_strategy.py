@@ -249,7 +249,9 @@ class StrategyTests(unittest.TestCase):
             "1h": {"rsi6": [24.0, 22.5], "adx14": [28.0]},
             "4h": {"ema20": [80.5]},
         }
-        factors, reasons = t1_pullback.assess(candles, metrics, "DOWNTREND")
+        factors_down, reasons_down = t1_pullback.assess(candles, metrics, "DOWNTREND")
+        self.assertIn("REGIME_NOT_UPTREND", reasons_down)
+        factors, reasons = t1_pullback.assess(candles, metrics, "UPTREND")
         self.assertEqual(reasons, [])
         factors["execution"] = 0.5
         scored = score(factors)

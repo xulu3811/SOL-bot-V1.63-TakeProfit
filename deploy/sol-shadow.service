@@ -1,13 +1,14 @@
 [Unit]
-Description=SOL-bot P2 isolated research worker
+Description=SOL-bot P3 protected simulation worker
 After=network-online.target solbot-market.service
 [Service]
-ExecStart=/opt/sol-bot/venv/bin/python -m solbot.p2_runtime --symbol SOLUSDT --market-db /var/lib/sol-bot/database/market.sqlite --strategy-db /var/lib/sol-bot/database/sol-shadow-strategy.sqlite --status-path /var/lib/sol-bot/sol-shadow-status.json --shadow-db /var/lib/sol-bot/database/sol-shadow.sqlite
+Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.p3_runtime --symbol SOLUSDT --micro-db /var/lib/sol-bot/database/sol-micro.sqlite --audit-db /var/lib/sol-bot/database/sol-math-audit.sqlite --market-db /var/lib/sol-bot/database/market.sqlite --strategy-db /var/lib/sol-bot/database/sol-shadow-strategy.sqlite --status-path /var/lib/sol-bot/sol-shadow-status.json --shadow-db /var/lib/sol-bot/database/sol-shadow.sqlite
 Type=simple
 User=solbot
 Group=solbot
-WorkingDirectory=/opt/sol-bot/p2
-Environment=PYTHONPATH=/opt/sol-bot/p2/backend/src
+WorkingDirectory=/opt/sol-bot/p3
+Environment=PYTHONPATH=/opt/sol-bot/p3/backend/src
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure

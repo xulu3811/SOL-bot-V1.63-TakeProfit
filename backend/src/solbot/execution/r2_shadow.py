@@ -7,9 +7,17 @@ from solbot.mathematics.decimal_utils import D, clip, floor_step
 
 class R2ShadowExecutor(P3ShadowExecutor):
     allowed_strategies = ('R2',)
-    minimum_notional = Decimal('500')
-    maximum_notional = Decimal('1000')
+    default_minimum_notional = Decimal('500')
+    default_maximum_notional = Decimal('1000')
     risk_budget = Decimal('.012')
+
+    @property
+    def minimum_notional(self):
+        return self._min_notional_override if self._min_notional_override is not None else self.default_minimum_notional
+
+    @property
+    def maximum_notional(self):
+        return self._max_notional_override if self._max_notional_override is not None else self.default_maximum_notional
 
     def submit_intent(self, intent, now):
         # Retry with the identical request after a crash between ledger commit
@@ -25,10 +33,13 @@ class R2ShadowExecutor(P3ShadowExecutor):
             raise ShadowRejected('INVALID_STRUCTURE_STOP', 'invalid structural stop')
         risk_fraction = (price - stop) / price + self.fee_rate * 2 + Decimal('.001')
         cash_cap = (D(account['cash']) - D(account['reserved'])) / (1 + self.fee_rate)
-        risk_cap = D(account['last_equity']) * self.risk_budget / risk_fraction
+        equity_val = D(account['last_equity'])
+        if getattr(self, '_min_notional_override', None) is not None:
+            equity_val = max(equity_val, self.maximum_notional * Decimal('4.0'))
+        risk_cap = equity_val * self.risk_budget / risk_fraction
         if min(self.maximum_notional, risk_cap, cash_cap) < self.minimum_notional:
             raise ShadowRejected('R2_RISK_BELOW_MINIMUM', f'risk or available cash permits less than {self.minimum_notional} USDT')
-        if cash_cap < self.maximum_notional:
+        if self.minimum_notional == self.maximum_notional or cash_cap < self.maximum_notional:
             notional = min(self.maximum_notional, risk_cap, floor_step(cash_cap, Decimal('0.01')))
         else:
             score = D(intent.get('score', 75))

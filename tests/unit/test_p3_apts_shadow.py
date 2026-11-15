@@ -50,8 +50,8 @@ class APTSTests(unittest.TestCase):
 
     def test_stage_boundaries_and_latched_high_stage(self):
         state=self.state()
-        self.assertEqual(self.step(state,'100.99',1).state.stage,'S0_INITIAL_PROTECTION')
-        state=self.step(state,'101',2).state
+        self.assertEqual(self.step(state,'100.79',1).state.stage,'S0_INITIAL_PROTECTION')
+        state=self.step(state,'100.80',2).state
         self.assertEqual(state.stage,'S1_PROFIT_PROTECTION')
         state=self.step(state,'101.5',3).state
         self.assertEqual(state.stage,'S1_PROFIT_PROTECTION')
@@ -97,6 +97,10 @@ class APTSTests(unittest.TestCase):
         self.assertEqual(held.state.stage,'S0_INITIAL_PROTECTION')
         self.assertEqual(held.stop_price,initial_stop('83.12','.01'))
         self.assertIn('REVERSAL_OBSERVED_S0_STOP_RETAINED',held.reasons)
+        held2=self.step(held.state,'82.85',2,evidence)
+        self.assertFalse(held2.exit_required)
+        self.assertGreater(held2.stop_price,held.stop_price)
+        self.assertIn('S0_REVERSAL_STOP_TIGHTENED',held2.reasons)
         self.assertTrue(self.step(self.state(),'99.20',2,evidence).exit_required)
         weak=replace(NORMAL,failed_new_high=True,rvol=Dec(4),rsi=Dec(45),previous_rsi=Dec(70))
         self.assertEqual(classify(weak),'WEAKENING')
@@ -115,6 +119,38 @@ class APTSTests(unittest.TestCase):
         self.assertEqual(decimal_atr(rows),2)
         self.assertEqual(trailing_distance('STRONG_BREAKOUT','0.5','100'),Dec('.01'))
         self.assertEqual(trailing_distance('WEAKENING','1','100'),Dec('.004'))
+
+    def test_intraday_main_force_breakout_survives_minor_pullback_and_locks_climax_top(self):
+        state=APTSState.create(context(),'67.89','7.365','.01',stop_distance='0.011')
+        main_force=TrendEvidence(
+            ready=True,trend_4h=False,trend_1h=False,trend_15m=False,
+            higher_low_1m=True,higher_low_5m=True,
+            rvol=Dec('2.11'),buy_ratio=Dec('0.6114'),previous_buy_ratio=Dec('0.5201'),
+            rsi=Dec('78.5'),previous_rsi=Dec('61.0'),atr=Dec('0.57'),previous_atr=Dec('0.48'),
+        )
+        self.assertEqual(classify(main_force),'STRONG_BREAKOUT')
+        # Surge to 69.72 (+2.70%) enters S2 with 1.20% ATR trailing band (stop 68.89)
+        d_surge=self.step(state,'69.72',1,main_force)
+        self.assertEqual(d_surge.state.stage,'S2_ADAPTIVE_TRAILING')
+        self.assertEqual(d_surge.stop_price,Dec('68.89'))
+        # Minor 1m pullback to 69.27 (-0.65% from high, 5m higher-low intact, buy_ratio cooldown to 0.52)
+        pullback_ev=replace(main_force,higher_low_1m=False,buy_ratio=Dec('0.52'),previous_buy_ratio=Dec('0.6114'),rsi=Dec('71.0'),previous_rsi=Dec('78.5'))
+        self.assertEqual(classify(pullback_ev),'NORMAL_UPTREND')
+        d_dip=self.step(d_surge.state,'69.27',2,pullback_ev)
+        self.assertFalse(d_dip.exit_required)
+        self.assertLess(d_dip.stop_price,Dec('69.27'))
+        # Continuation wave to 70.95 (+4.51%)
+        d_cont=self.step(d_dip.state,'70.95',3,main_force)
+        self.assertFalse(d_cont.exit_required)
+        self.assertEqual(d_cont.stop_price,Dec('70.10'))
+        # Main-force exhaustion at top (failed_new_high + buy_ratio drops to 0.42) tightens trailing stop to 0.40% (70.67)
+        exhaust_ev=replace(main_force,failed_new_high=True,adverse_move=True,buy_ratio=Dec('0.42'),previous_buy_ratio=Dec('0.61'),rsi=Dec('62.0'),previous_rsi=Dec('75.0'))
+        self.assertEqual(classify(exhaust_ev),'WEAKENING')
+        d_tight=self.step(d_cont.state,'70.80',4,exhaust_ev)
+        self.assertFalse(d_tight.exit_required)
+        self.assertEqual(d_tight.stop_price,Dec('70.67'))
+        d_exit=self.step(d_tight.state,'70.66',5,exhaust_ev)
+        self.assertTrue(d_exit.exit_required)
 
 
 class P3ShadowTests(unittest.TestCase):

@@ -29,6 +29,7 @@ DEFAULTS={'SOLUSDT_market':ROOT/'market.sqlite','SUIUSDT_market':ROOT/'sui-marke
 
 class DataReader:
     def __init__(self,paths=None,clock=None):
+        self._custom_paths=set((paths or {}).keys())
         self.paths={k:Path(v).resolve() for k,v in (DEFAULTS|dict(paths or {})).items()}
         self.clock=clock or (lambda:time.time_ns()//1000000)
     @staticmethod
@@ -68,7 +69,7 @@ class DataReader:
         if value>=Decimal('1000000'):return f'{(value/Decimal("1000000")):.2f}M'
         if value>=Decimal('1000'):return f'{(value/Decimal("1000")):.2f}K'
         return f'{value:.2f}'
-    def _day_stats(self,key,symbol):
+    def _day_stats(self,key,symbol,live_price=None):
         try:
             rows=self.read(key,"SELECT open_time,open,high,low,close,volume FROM market_klines WHERE symbol=? AND interval='1m' ORDER BY open_time DESC LIMIT 1500",(symbol,))
         except (sqlite3.Error,OSError):
@@ -82,10 +83,24 @@ class DataReader:
         low=min(Decimal(row['low']) for row in window)
         volume=sum((Decimal(row['volume']) for row in window),Decimal('0'))
         first,last=Decimal(window[0]['open']),Decimal(window[-1]['close'])
+        if live_price is not None:
+            try:
+                lp=Decimal(str(live_price))
+                if lp>0:
+                    last=lp;high=max(high,lp);low=min(low,lp)
+            except Exception:
+                pass
         change=((last-first)/first*Decimal('100')) if first else None
         return {'high_24h':self._num(high),'low_24h':self._num(low),'volume_24h':self._compact_volume(volume),
                 'change_24h':None if change is None else f'{change:+.2f}%'}
     def _mark(self,symbol):
+        if symbol=='SOLUSDT':
+            micro=self._micro_snapshot()
+            if isinstance(micro,dict) and micro.get('ready') and not micro.get('stale') and micro.get('bid'):
+                try:
+                    return Decimal(str(micro['bid']))
+                except Exception:
+                    pass
         try:
             rows=self.read(symbol+'_market','SELECT close FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT 1',(symbol,'1m'))
             return Decimal(rows[0]['close']) if rows else None
@@ -106,6 +121,7 @@ class DataReader:
         items=tuple(item.strip() for item in os.environ.get('SOLBOT_LIVE_STRATEGIES','T1').split(',') if item.strip())
         return items or ('T1',)
     def _micro_snapshot(self):
+        if self._custom_paths and 'micro_status' not in self._custom_paths:return None
         path=self.paths.get('micro_status')
         if path is None or not path.exists():return None
         now=self.clock()
@@ -136,8 +152,21 @@ class DataReader:
             key=symbol+'_market'
             schema=self.read(key,"SELECT sql FROM sqlite_master WHERE name='market_klines'")[0]['sql']
             if "'"+symbol+"'" not in schema:raise ValueError('foreign market schema')
-            rows=self.read(key,'SELECT * FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT ?',(symbol,timeframe,max(limit,120)))[::-1]
-            if not rows:return {'symbol':symbol,'timeframe':timeframe,'candles':[],'latest_price':None,'state':'WARMING_UP','indicators':{},'micro':self._micro_snapshot() if symbol=='SOLUSDT' else None}
+            micro=self._micro_snapshot() if symbol=='SOLUSDT' else None
+            rows=[dict(r) for r in self.read(key,'SELECT * FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT ?',(symbol,timeframe,max(limit,120)))[::-1]]
+            if not rows:return {'symbol':symbol,'timeframe':timeframe,'candles':[],'latest_price':None,'state':'WARMING_UP','indicators':{},'micro':micro}
+            live_mid=micro.get('mid') if (isinstance(micro,dict) and micro.get('ready') and not micro.get('stale')) else None
+            if live_mid:
+                try:
+                    lp=Decimal(str(live_mid))
+                    if lp>0:
+                        tip=dict(rows[-1])
+                        tip['close']=self._num(lp)
+                        tip['high']=self._num(max(Decimal(str(tip['high'])),lp))
+                        tip['low']=self._num(min(Decimal(str(tip['low'])),lp))
+                        rows[-1]=tip
+                except Exception:
+                    pass
             from solbot.strategy.indicators import ema,rsi,atr,adx,rvol,vwap
             closes=[float(r['close']) for r in rows]
             indicators={'ema20':ema(closes,20),'ema50':ema(closes,50),'rsi6':rsi(closes,6),'atr':atr(rows),'adx':adx(rows),'rvol':rvol(rows),'vwap':vwap(rows)}
@@ -150,12 +179,31 @@ class DataReader:
                 spread=(float(ema20)-float(ema50))/float(ema50)*100.0
                 ema_spread_pct=round(spread,4)
                 ema_alignment='BULLISH' if spread>0.05 else ('BEARISH' if spread<-0.05 else 'CONVERGING')
-            return dict(symbol=symbol,timeframe=timeframe,candles=rows[-limit:],latest_price=rows[-1]['close'],price_source='LAST_CLOSED_CANDLE',updated_at=rows[-1]['ingested_at'],state='FRESH' if 0<=age<=120000 else 'STALE',indicators=latest,ema_alignment=ema_alignment,ema_spread_pct=ema_spread_pct,volume_24h_asset=symbol[:-4] if symbol.endswith('USDT') else symbol,micro=self._micro_snapshot() if symbol=='SOLUSDT' else None,**self._day_stats(key,symbol))
+            return dict(symbol=symbol,timeframe=timeframe,candles=rows[-limit:],latest_price=rows[-1]['close'],price_source='LAST_CLOSED_CANDLE',updated_at=rows[-1]['ingested_at'],state='FRESH' if 0<=age<=120000 else 'STALE',indicators=latest,ema_alignment=ema_alignment,ema_spread_pct=ema_spread_pct,volume_24h_asset=symbol[:-4] if symbol.endswith('USDT') else symbol,micro=micro,**self._day_stats(key,symbol,live_price=live_mid))
         return self._safe(load)
     def market_summary(self,symbol='SOLUSDT',timeframe='1m'):
         full=self.markets(symbol,timeframe,2)
         keep=('available','symbol','timeframe','latest_price','price_source','state','indicators','ema_alignment','ema_spread_pct','micro','change_24h','high_24h','low_24h','volume_24h','volume_24h_asset','updated_at','reason')
-        return {key:full[key] for key in keep if key in full}
+        out={key:full[key] for key in keep if key in full}
+        if full.get('candles'):
+            out['last_candle']=full['candles'][-1]
+        if symbol=='SOLUSDT' and full.get('available'):
+            by_tf={}
+            for tf in ('1m','5m','15m','1h','4h'):
+                doc=full if tf==timeframe else self.markets(symbol,tf,2)
+                if doc.get('available'):
+                    by_tf[tf]={
+                        'timeframe':tf,
+                        'latest_price':doc.get('latest_price'),
+                        'indicators':doc.get('indicators'),
+                        'ema_alignment':doc.get('ema_alignment'),
+                        'ema_spread_pct':doc.get('ema_spread_pct'),
+                        'state':doc.get('state'),
+                        'updated_at':doc.get('updated_at'),
+                        'last_candle':doc['candles'][-1] if doc.get('candles') else None,
+                    }
+            out['by_timeframe']=by_tf
+        return out
     def _last_accepted_time(self,symbol,strategy_id):
         try:
             rows=self.read(symbol+'_strategy','SELECT MAX(signal_time) AS ts FROM decisions WHERE symbol=? AND strategy_id=? AND accepted=1',(symbol,strategy_id))
@@ -308,19 +356,32 @@ class DataReader:
         return self._safe(load)
     def strategy_summary(self,symbol='SOLUSDT'):
         full=self.strategies(symbol,20)
-        keep=('available','symbol','latest','score','priority','score_factors','r1_live_allowed','allowed_live_strategies','live_strategy_id','engines','score_label','indicators_5m','reason')
+        keep=('available','symbol','items','latest','score','priority','score_factors','r1_live_allowed','allowed_live_strategies','live_strategy_id','engines','score_label','indicators_5m','reason')
         return {key:full[key] for key in keep if key in full}
     def _closed_indicators(self,symbol,timeframe):
         try:
-            rows=self.read(symbol+'_market','SELECT open_time,high,low,close,volume,quote_volume FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT 120',(symbol,timeframe))[::-1]
+            rows=[dict(r) for r in self.read(symbol+'_market','SELECT open_time,high,low,close,volume,quote_volume FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT 120',(symbol,timeframe))[::-1]]
             if len(rows)<30:return {}
-            from solbot.strategy.indicators import rsi,atr,rvol,vwap
+            micro=self._micro_snapshot() if symbol=='SOLUSDT' else None
+            live_mid=micro.get('mid') if (isinstance(micro,dict) and micro.get('ready') and not micro.get('stale')) else None
+            if live_mid:
+                try:
+                    lp=Decimal(str(live_mid))
+                    if lp>0:
+                        tip=dict(rows[-1])
+                        tip['close']=self._num(lp)
+                        tip['high']=self._num(max(Decimal(str(tip['high'])),lp))
+                        tip['low']=self._num(min(Decimal(str(tip['low'])),lp))
+                        rows[-1]=tip
+                except Exception:
+                    pass
+            from solbot.strategy.indicators import rsi,atr,adx,rvol,vwap
             closes=[float(row['close']) for row in rows]
-            series={'rsi6':rsi(closes,6),'atr':atr(rows),'rvol':rvol(rows),'vwap':vwap(rows)}
+            series={'rsi6':rsi(closes,6),'atr':atr(rows),'adx':adx(rows),'rvol':rvol(rows),'vwap':vwap(rows)}
             latest={name:(values[-1] if values else None) for name,values in series.items()}
             close=float(rows[-1]['close'])
             width=latest.get('atr')
-            return {'timeframe':timeframe,'open_time':rows[-1]['open_time'],'close':self._json_number(close),'rsi6':self._json_number(latest.get('rsi6')),'rvol':self._json_number(latest.get('rvol')),'vwap':self._json_number(latest.get('vwap')),'atr':self._json_number(width),'atr_pct':self._json_number(None if width is None or close<=0 else width/close*100)}
+            return {'timeframe':timeframe,'open_time':rows[-1]['open_time'],'close':self._json_number(close),'rsi6':self._json_number(latest.get('rsi6')),'rvol':self._json_number(latest.get('rvol')),'adx':self._json_number(latest.get('adx')),'vwap':self._json_number(latest.get('vwap')),'atr':self._json_number(width),'atr_pct':self._json_number(None if width is None or close<=0 else width/close*100)}
         except Exception:
             return {}
     @staticmethod
@@ -401,9 +462,43 @@ class DataReader:
             self._order_owner()
             return {'mode':'LIVE','symbol':'SOLUSDT','items':self.read('orders','SELECT * FROM orders ORDER BY created_at DESC,client_id LIMIT ? OFFSET ?',(limit,offset)),'offset':offset,'limit':limit}
         return self._safe(load)
+    def _trading_config(self):
+        min_u, max_u, max_slots = Decimal('500'), Decimal('1000'), 2
+        rows = self._optional('binance_vault', 'SELECT min_order_usdt,max_order_usdt,max_slots FROM trading_config WHERE singleton=1')
+        if rows:
+            try:
+                min_u = Decimal(str(rows[0].get('min_order_usdt') or '500'))
+                max_u = Decimal(str(rows[0].get('max_order_usdt') or str(min_u)))
+                max_slots = max(1, min(10, int(rows[0].get('max_slots') or 2)))
+            except Exception:
+                pass
+        else:
+            candidates = []
+            env_cfg = os.environ.get('SOLBOT_TRADING_CONFIG_PATH', '').strip()
+            if env_cfg:
+                candidates.append(Path(env_cfg))
+            mkt = self.paths.get('market')
+            if mkt:
+                candidates.append(Path(mkt).resolve().parent / 'trading-config.json')
+            for cfg_path in candidates:
+                if cfg_path.exists():
+                    try:
+                        raw = json.loads(cfg_path.read_text(encoding='utf-8'))
+                        min_u = Decimal(str(raw.get('min_order_usdt') or '500'))
+                        max_u = Decimal(str(raw.get('max_order_usdt') or str(min_u)))
+                        max_slots = max(1, min(10, int(raw.get('max_slots') or 2)))
+                        break
+                    except Exception:
+                        continue
+        if max_u < min_u:
+            max_u = min_u
+        min_str = str(int(min_u)) if min_u == min_u.to_integral_value() else f'{min_u:.2f}'
+        max_str = str(int(max_u)) if max_u == max_u.to_integral_value() else f'{max_u:.2f}'
+        return {'min_order_usdt': min_str, 'max_order_usdt': max_str, 'max_slots': max_slots}
     def live_positions(self):
         def load():
             self._live_ledger()
+            max_slots=int(self._trading_config().get('max_slots') or 2)
             mark=self._mark('SOLUSDT');slots=[];robot=Decimal('0')
             for row in self.read('guardian','SELECT * FROM robot_positions LIMIT 500'):
                 if row.get('asset')!='SOL':continue
@@ -412,7 +507,7 @@ class DataReader:
                 entry=(cost/quantity) if quantity>0 else None
                 ref_px=mark if (mark is not None and mark>0) else entry
                 if ref_px is not None and ref_px>0 and quantity*ref_px<Decimal('5'):continue
-                if len(slots)>=2:continue
+                if len(slots)>=max_slots:continue
                 stage=self._stage(row.get('protection'))
                 slots.append({'source':'ROBOT','slot':len(slots)+1,'intent_id':row['intent_id'],'asset':'SOL','symbol':'SOLUSDT','quantity':self._num(quantity),'entry_price':None if entry is None else self._num(entry),'cost':self._num(cost),'cost_usdt':self._num(cost),'stage':stage,'protection':stage,'risk':row.get('risk'),**self._performance(entry,quantity,mark,'LAST_CLOSED_CANDLE')})
             bot_open=Decimal('0')
@@ -434,7 +529,7 @@ class DataReader:
             sol=account.get('SOL')
             if sol:
                 excess=Decimal(sol['free'])+Decimal(sol['locked'])-robot-bot_open
-                entry=self._average_entry(manual_orders)
+                entry=self._average_entry(manual_orders,target_qty=excess)
                 if entry is None:
                     buys=[row for row in manual_orders if row.get('side')=='BUY' and row.get('status')=='FILLED' and Decimal(str(row.get('price') or '0'))>0]
                     if buys:
@@ -473,7 +568,41 @@ class DataReader:
             observed=row['observed_at'] if observed is None else max(observed,row['observed_at'])
         return account,observed,orders
     @staticmethod
-    def _average_entry(orders):
+    def _average_entry(orders,target_qty=None):
+        if target_qty is not None:
+            try:
+                needed=Decimal(str(target_qty))
+            except Exception:
+                needed=Decimal(0)
+            if needed>0:
+                rev_rows=sorted(
+                    (row for row in orders if row.get('status')=='FILLED' and row.get('side') in ('BUY','SELL')),
+                    key=lambda row: int(row.get('time') or 0),
+                    reverse=True,
+                )
+                sell_offset,acc_qty,acc_cost=Decimal(0),Decimal(0),Decimal(0)
+                for row in rev_rows:
+                    try:
+                        executed=Decimal(str(row.get('executed_qty') or row.get('quantity') or '0'))
+                        price=Decimal(str(row.get('price') or '0'))
+                    except Exception:
+                        continue
+                    if executed<=0 or price<=0: continue
+                    if row.get('side')=='SELL':
+                        sell_offset+=executed
+                    else:
+                        used_offset=min(executed,sell_offset)
+                        sell_offset-=used_offset
+                        avail=executed-used_offset
+                        if avail<=0: continue
+                        take=min(avail,needed)
+                        acc_qty+=take
+                        acc_cost+=take*price
+                        needed-=take
+                        if needed<=Decimal('0.001'):
+                            break
+                if acc_qty>0 and acc_cost>0:
+                    return (acc_cost/acc_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         qty,cost=Decimal(0),Decimal(0)
         rows=sorted((row for row in orders if row.get('status')=='FILLED' and row.get('side') in ('BUY','SELL')), key=lambda row: int(row.get('time') or 0))
         for row in rows:
@@ -500,7 +629,10 @@ class DataReader:
         try:return self.read(key,sql,args)
         except (sqlite3.Error,OSError):return []
     def _read_r2(self,base_key,sql,args=()):
-        for key in (base_key+'_read',base_key):
+        if self._custom_paths and base_key not in self._custom_paths and base_key+'_read' not in self._custom_paths:
+            return []
+        keys=(base_key,) if (base_key in self._custom_paths and base_key+'_read' not in self._custom_paths) else (base_key+'_read',base_key)
+        for key in keys:
             path=self.paths.get(key)
             if path is not None and path.exists():
                 try:
@@ -537,12 +669,16 @@ class DataReader:
         def load():
             self._shadow_identity()
             account=self.read('shadow','SELECT * FROM shadow_account')[0]
-            initial=Decimal('2000')
+            p3_topup_rows=self._optional('shadow',"SELECT value FROM shadow_p3_metadata WHERE key='virtual_capital_added'")
+            p3_topup=Decimal(str(p3_topup_rows[0]['value'])) if p3_topup_rows and p3_topup_rows[0].get('value') else Decimal('0')
+            initial=Decimal('2000')+p3_topup
             equity=Decimal(account['last_equity'])
             r2_acct=self._read_r2('r2_shadow','SELECT * FROM shadow_account')
             if r2_acct:
                 try:
-                    equity+=Decimal(str(r2_acct[0].get('last_equity') or '2000'))-Decimal('2000')
+                    r2_topup_rows=self._read_r2('r2_shadow',"SELECT value FROM shadow_p3_metadata WHERE key='virtual_capital_added'")
+                    r2_topup=Decimal(str(r2_topup_rows[0]['value'])) if r2_topup_rows and r2_topup_rows[0].get('value') else Decimal('0')
+                    equity+=Decimal(str(r2_acct[0].get('last_equity') or '2000'))-Decimal('2000')-r2_topup
                 except Exception:
                     pass
             pnl=equity-initial
@@ -561,11 +697,18 @@ class DataReader:
                 except (KeyError,TypeError,ValueError):
                     pass
             mark=None
-            try:
-                if account.get('bid') is not None and Decimal(str(account['bid']))>0:
-                    mark=Decimal(str(account['bid']))
-            except Exception:
-                mark=None
+            micro=self._micro_snapshot()
+            if isinstance(micro,dict) and micro.get('ready') and not micro.get('stale') and micro.get('bid'):
+                try:
+                    mark=Decimal(str(micro['bid']))
+                except Exception:
+                    mark=None
+            if mark is None:
+                try:
+                    if account.get('bid') is not None and Decimal(str(account['bid']))>0:
+                        mark=Decimal(str(account['bid']))
+                except Exception:
+                    mark=None
             if mark is None:
                 mark=self._mark('SOLUSDT')
             raw_positions=self.read('shadow',"SELECT * FROM shadow_positions WHERE status='OPEN' LIMIT 500")+r2_open_positions
@@ -611,7 +754,8 @@ class DataReader:
                 enriched['reversal_hits']=reversal_hits
                 enriched['max_reversal_hits']=max_hits
                 positions.append(enriched)
-            return {'mode':'SIMULATED','symbol':'SOLUSDT','synced':True,'is_preview':False,'initial_capital':f'{initial:.2f}','equity':f'{equity:.2f}','pnl':f'{pnl:+.2f}','pnl_pct':f'{(pnl/initial*Decimal("100")):+.2f}%','win_rate':f'{rate:.1f}%','total_trades':trades,'active_positions':opens,'fee_asset':'BNB','fee_rate':'0.00075','fee_rate_label':'0.075%','bnb_cap_usdt':'20','bnb_refill_below_usdt':'3','bnb_refill_target_usdt':'10','ledger_fee_rate':account.get('fee_rate'),'bid':account.get('bid'),'ask':account.get('ask'),'account':account,'positions':positions,'protection':prot_rows,'rules':{'min_order_usdt':'500','max_order_usdt':'1000','t1_stop_distance':'0.010','stag_hours':0,'max_positions':2}}
+            t_cfg=self._trading_config()
+            return {'mode':'SIMULATED','symbol':'SOLUSDT','synced':True,'is_preview':False,'initial_capital':f'{initial:.2f}','equity':f'{equity:.2f}','pnl':f'{pnl:+.2f}','pnl_pct':f'{(pnl/initial*Decimal("100")):+.2f}%','win_rate':f'{rate:.1f}%','total_trades':trades,'active_positions':opens,'fee_asset':'BNB','fee_rate':'0.00075','fee_rate_label':'0.075%','bnb_cap_usdt':'20','bnb_refill_below_usdt':'3','bnb_refill_target_usdt':'10','ledger_fee_rate':account.get('fee_rate'),'bid':account.get('bid'),'ask':account.get('ask'),'account':account,'positions':positions,'protection':prot_rows,'rules':{'min_order_usdt':t_cfg['min_order_usdt'],'max_order_usdt':t_cfg['max_order_usdt'],'t1_stop_distance':'0.010','stag_hours':0,'max_positions':t_cfg['max_slots']}}
         result = self._safe(load)
         health = self._shadow_health()
         if not result.get('available'):

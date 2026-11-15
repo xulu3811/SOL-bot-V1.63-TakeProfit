@@ -13,19 +13,49 @@ logger = logging.getLogger(__name__)
 
 def _fallback_evidence(candles, micro_features):
     five = candles.get('5m') or []
+    one = candles.get('1m') or []
     buy_ratio = Decimal('0.5')
-    if isinstance(micro_features, dict) and micro_features.get('ready') and micro_features.get('buy_ratio'):
-        buy_ratio = Decimal(str(micro_features['buy_ratio']))
-    elif five:
+    prev_buy_ratio = Decimal('0.5')
+    if five:
         quote = Decimal(str(five[-1].get('quote_volume') or '0'))
         bought = Decimal(str(five[-1].get('taker_buy_quote_volume') or '0'))
         if quote > 0:
             buy_ratio = bought / quote
+            prev_buy_ratio = buy_ratio
+        if len(five) >= 2:
+            p_quote = Decimal(str(five[-2].get('quote_volume') or '0'))
+            p_bought = Decimal(str(five[-2].get('taker_buy_quote_volume') or '0'))
+            if p_quote > 0:
+                prev_buy_ratio = p_bought / p_quote
+    if len(one) >= 3:
+        r_quote = sum((Decimal(str(r.get('quote_volume') or '0')) for r in one[-5:]), Decimal(0))
+        r_bought = sum((Decimal(str(r.get('taker_buy_quote_volume') or '0')) for r in one[-5:]), Decimal(0))
+        if r_quote > 0:
+            buy_ratio = max(buy_ratio, r_bought / r_quote)
+    if isinstance(micro_features, dict) and micro_features.get('ready') and micro_features.get('buy_ratio'):
+        m_buy = Decimal(str(micro_features['buy_ratio']))
+        buy_ratio = m_buy if m_buy < Decimal('0.45') else max(buy_ratio, m_buy)
     if len(five) > 16:
-        return TrendEvidence(ready=True, atr=decimal_atr(five), previous_atr=decimal_atr(five[:-1]),
-                             buy_ratio=buy_ratio, previous_buy_ratio=buy_ratio)
+        hl_5m = len(five) >= 3 and Decimal(str(five[-1]['low'])) >= Decimal(str(five[-2]['low'])) >= Decimal(str(five[-3]['low'])) and Decimal(str(five[-1]['low'])) > Decimal(str(five[-3]['low']))
+        hl_1m = len(one) >= 3 and Decimal(str(one[-1]['low'])) >= Decimal(str(one[-2]['low'])) >= Decimal(str(one[-3]['low'])) and Decimal(str(one[-1]['low'])) > Decimal(str(one[-3]['low']))
+        avg_vol = sum((Decimal(str(r.get('volume') or '0')) for r in five[-21:-1]), Decimal(0)) / Decimal(min(20, max(1, len(five) - 1)))
+        cur_vol = max(
+            Decimal(str(five[-1].get('volume') or '0')),
+            sum((Decimal(str(r.get('volume') or '0')) for r in one[-5:]), Decimal(0)) if len(one) >= 5 else Decimal(0),
+        )
+        rvol = cur_vol / avg_vol if avg_vol > 0 else Decimal(0)
+        return TrendEvidence(
+            ready=True,
+            higher_low_1m=hl_1m,
+            higher_low_5m=hl_5m,
+            rvol=rvol,
+            atr=decimal_atr(five),
+            previous_atr=decimal_atr(five[:-1]),
+            buy_ratio=buy_ratio,
+            previous_buy_ratio=prev_buy_ratio,
+        )
     return TrendEvidence(ready=True, atr=Decimal('0.4'), previous_atr=Decimal('0.4'),
-                         buy_ratio=buy_ratio, previous_buy_ratio=buy_ratio)
+                         buy_ratio=buy_ratio, previous_buy_ratio=prev_buy_ratio)
 
 
 def evidence_for(reader, now, micro_features=None):
@@ -33,9 +63,16 @@ def evidence_for(reader, now, micro_features=None):
     if reader is not None:
         for interval in ('1m', '5m', '15m', '1h', '4h'):
             try:
-                rows = reader.read('SOLUSDT_market', 'SELECT * FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT 120', ('SOLUSDT', interval))
+                rows = reader.read(
+                    'SOLUSDT_market',
+                    'SELECT * FROM market_klines WHERE symbol=? AND interval=? AND is_closed=1 AND close_time<=? ORDER BY open_time DESC LIMIT 120',
+                    ('SOLUSDT', interval, int(now)),
+                )
             except Exception:
-                rows = []
+                try:
+                    rows = reader.read('SOLUSDT_market', 'SELECT * FROM market_klines WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT 120', ('SOLUSDT', interval))
+                except Exception:
+                    rows = []
             candles[interval] = list(reversed(rows))
     fallback = _fallback_evidence(candles, micro_features)
     features = {'symbol': 'SOLUSDT', 'ready': True, 'buy_ratio': format(fallback.buy_ratio, 'f')}
@@ -43,12 +80,23 @@ def evidence_for(reader, now, micro_features=None):
         for key in ('bid', 'ask', 'short_volatility', 'imbalance', 'spread_bps', 'exchange_time_ms'):
             if micro_features.get(key) is not None:
                 features[key] = micro_features[key]
-    try:
-        evidence = from_closed_inputs('SOLUSDT', candles, features, now)
-        if evidence.ready:
-            return evidence
-    except Exception:
-        pass
+    candidate_times = [int(now)]
+    one = candles.get('1m') or []
+    if one and one[-1].get('close_time') is not None:
+        c1 = int(one[-1]['close_time'])
+        if 0 <= int(now) - c1 <= 180_000 and c1 not in candidate_times:
+            candidate_times.append(c1)
+    if len(one) >= 2 and one[-2].get('close_time') is not None:
+        c2 = int(one[-2]['close_time'])
+        if 0 <= int(now) - c2 <= 240_000 and c2 not in candidate_times:
+            candidate_times.append(c2)
+    for as_of in candidate_times:
+        try:
+            evidence = from_closed_inputs('SOLUSDT', candles, features, as_of)
+            if evidence.ready:
+                return evidence
+        except Exception:
+            continue
     return fallback
 
 
@@ -69,6 +117,11 @@ def _resolve_bid_and_tick(vault, bid, tick, micro, now):
 def step(vault, reader=None, now=None, bid=None, evidence=None, tick=None, micro_path=None, sync_account=True):
     now = int(now if now is not None else time.time_ns() // 1_000_000)
     micro = read_micro_snapshot(micro_path, now_ms=now)
+    if isinstance(micro, dict) and micro.get('bid') and getattr(vault, 'db_path', None) is not None and vault.db_path.exists():
+        try:
+            vault._remember_mark(Decimal(str(micro['bid'])), now)
+        except Exception:
+            pass
     if sync_account:
         try:
             vault.refresh_account()

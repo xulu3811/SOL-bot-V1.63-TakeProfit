@@ -14,8 +14,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-YEAR = Path(r"D:\SOL-Bot\data\solusdt_1y.sqlite")
-OUT = Path(r"D:\SOL-Bot\data\solusdt_6m.sqlite")
+ROOT = Path(__file__).resolve().parents[1]
+YEAR = ROOT / "data" / "solusdt_1y.sqlite"
+OUT = ROOT / "data" / "solusdt_6m.sqlite"
 SYMBOL = "SOLUSDT"
 STEPS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 WINDOW_START = datetime(2026, 5, 13, tzinfo=timezone.utc)

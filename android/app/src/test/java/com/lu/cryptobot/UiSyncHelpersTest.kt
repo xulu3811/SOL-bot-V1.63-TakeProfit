@@ -68,6 +68,69 @@ class UiSyncHelpersTest {
     }
 
     @Test
+    fun wsSummaryWithByTimeframeUpdatesSelectedTimeframeIndicatorsAndAllPanels() {
+        val currentMarkets = JSONObject()
+            .put("timeframe", "15m")
+            .put("latest_price", "80.40")
+            .put("ema_alignment", "BEARISH")
+            .put("ema_spread_pct", -0.31)
+            .put(
+                "candles",
+                JSONArray().put(
+                    JSONObject()
+                        .put("open_time", 1000L)
+                        .put("open", "80.00")
+                        .put("high", "80.50")
+                        .put("low", "79.80")
+                        .put("close", "80.40"),
+                ),
+            )
+
+        val tf15 = JSONObject()
+            .put("timeframe", "15m")
+            .put("latest_price", "80.95")
+            .put("ema_alignment", "BULLISH")
+            .put("ema_spread_pct", 0.22)
+            .put("indicators", JSONObject().put("rsi6", 61.4).put("adx", 26.8))
+            .put(
+                "last_candle",
+                JSONObject()
+                    .put("open_time", 1000L)
+                    .put("open", "80.00")
+                    .put("high", "81.00")
+                    .put("low", "79.80")
+                    .put("close", "80.95"),
+            )
+
+        val wsMarkets = JSONObject()
+            .put("timeframe", "1m")
+            .put("latest_price", "80.95")
+            .put("change_24h", "+1.25%")
+            .put("by_timeframe", JSONObject().put("15m", tf15))
+
+        val frame = JSONObject()
+            .put("markets", wsMarkets)
+            .put("shadow_status", JSONObject().put("equity", "2018.50").put("pnl", "+18.50"))
+            .put("shadow_orders", JSONObject().put("items", JSONArray().put(JSONObject().put("order_id", "sh-1"))))
+            .put("live_orders", JSONObject().put("bot_orders", JSONArray().put(JSONObject().put("client_order_id", "cbotby1"))))
+            .put("binance_account", JSONObject().put("configured", true).put("orders_enabled", true))
+            .put("strategies", JSONObject().put("score", 78.5).put("items", JSONArray().put(JSONObject().put("event_id", 99))))
+
+        val updated = FrameSyncHelper.mergeFrame(mapOf("markets" to currentMarkets), frame)
+        val mergedMarkets = updated["markets"]!!
+        assertEquals("15m", mergedMarkets.getString("timeframe"))
+        assertEquals("80.95", mergedMarkets.getString("latest_price"))
+        assertEquals("BULLISH", mergedMarkets.getString("ema_alignment"))
+        assertEquals(61.4, mergedMarkets.getJSONObject("indicators").getDouble("rsi6"), 1e-6)
+        assertEquals("80.95", mergedMarkets.getJSONArray("candles").getJSONObject(0).getString("close"))
+        assertEquals("2018.50", updated["shadow/status"]?.getString("equity"))
+        assertEquals(1, updated["shadow/orders"]?.getJSONArray("items")?.length())
+        assertEquals(1, updated["live/orders"]?.getJSONArray("bot_orders")?.length())
+        assertEquals(true, updated["binance/account"]?.getBoolean("orders_enabled"))
+        assertEquals(1, updated["strategies"]?.getJSONArray("items")?.length())
+    }
+
+    @Test
     fun formattersNormalizeLongDecimalsAlignmentsAndBlockers() {
         assertEquals("1.24", BotFormatters.formatNumber("1.2438584489085142", 2))
         assertEquals("2,000.00", BotFormatters.formatNumber("2000.00", 2))
@@ -85,6 +148,15 @@ class UiSyncHelpersTest {
         assertEquals("3.34M SOL", BotFormatters.formatCompactVolume("3340000", "SOL"))
         assertEquals("850.12K SOL", BotFormatters.formatCompactVolume("850.12K", "SOL"))
         assertEquals("—", BotFormatters.formatCompactVolume("null", "SOL"))
+        assertEquals("$800", BotFormatters.formatOrderRange("800.00", "800.00"))
+        assertEquals("$500–$1,000", BotFormatters.formatOrderRange("500.00", "1000.00"))
+        val customBlocker = BotFormatters.blockerLabel("SLOTS_FULL", "2500.00", "800.00", 4).orEmpty()
+        assertTrue(customBlocker.contains("4"))
+        val frameCfg = FrameSyncHelper.mergeFrame(
+            emptyMap(),
+            JSONObject().put("trading_config", JSONObject().put("min_order_usdt", "800.00").put("max_order_usdt", "1200.00").put("max_slots", 3)),
+        )
+        assertEquals(3, frameCfg["trading/config"]?.getInt("max_slots"))
     }
 
     @Test

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(r"D:\SOL-Bot")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
 from solbot.mathematics.decimal_utils import ceil_step, clip, floor_step

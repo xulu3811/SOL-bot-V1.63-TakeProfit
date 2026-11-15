@@ -3,6 +3,7 @@ package com.lu.cryptobot.ui.screens
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ReceiptLong
@@ -21,11 +23,13 @@ import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Science
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,6 +47,7 @@ import com.lu.cryptobot.ui.components.BotSurfaceCard
 import com.lu.cryptobot.ui.components.OrderListItem
 import com.lu.cryptobot.ui.components.SectionHeader
 import com.lu.cryptobot.ui.components.StatusBadge
+import com.lu.cryptobot.ui.components.optCleanString
 import com.lu.cryptobot.ui.theme.LocalBotColors
 import com.lu.cryptobot.ui.theme.tnum
 import org.json.JSONObject
@@ -51,6 +56,7 @@ import org.json.JSONObject
 fun ShadowScreen(
     values: Map<String, JSONObject>,
     onInspectOrder: (JSONObject) -> Unit,
+    onOpenTradingConfig: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val bot = LocalBotColors.current
@@ -64,7 +70,14 @@ fun ShadowScreen(
     val winRate = shadow?.optString("win_rate", "0.0%").orEmpty().ifBlank { "0.0%" }
     val totalTrades = shadow?.optInt("total_trades", 0) ?: 0
     val rules = shadow?.optJSONObject("rules")
-    val maxPos = rules?.optInt("max_positions", 2) ?: 2
+    val tradingConfig = values["trading/config"] ?: shadow?.optJSONObject("trading_config")
+    val minOrderUsdt = tradingConfig.optCleanString("min_order_usdt")
+        .ifBlank { rules.optCleanString("min_order_usdt", "500") }
+    val maxOrderUsdt = tradingConfig.optCleanString("max_order_usdt")
+        .ifBlank { rules.optCleanString("max_order_usdt", "1000") }
+    val maxPos = tradingConfig?.optInt("max_slots", 0)?.takeIf { it > 0 }
+        ?: rules?.optInt("max_positions", 2)?.takeIf { it > 0 } ?: 2
+    val orderRangeText = BotFormatters.formatOrderRange(minOrderUsdt, maxOrderUsdt)
     val activePosCount = shadow?.optInt("active_positions", 0) ?: 0
     val feeLabel = shadow?.optString("fee_rate_label", "0.075%").orEmpty().ifBlank { "0.075%" }
     val bnbCap = shadow?.optString("bnb_cap_usdt", "20").orEmpty().ifBlank { "20" }
@@ -126,7 +139,27 @@ fun ShadowScreen(
                         Text("Shadow-bot", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         StatusBadge("影子沙盒账本", bot.infoSoft, bot.info)
                     }
-                    StatusBadge("与实盘同源行情", bot.gainSoft, bot.gain)
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onOpenTradingConfig() },
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Icon(Icons.Outlined.Tune, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(13.dp))
+                            Text(
+                                text = "配置同步",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                        }
+                    }
                 }
 
                 Spacer(Modifier.height(6.dp))
@@ -249,7 +282,7 @@ fun ShadowScreen(
                             ) {
                                 Icon(Icons.AutoMirrored.Outlined.ReceiptLong, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
                                 Text(
-                                    text = "BNB $feeLabel · 单笔 $500–$1000 · T1/T2/R2 · 长持",
+                                    text = "BNB $feeLabel · 单笔 $orderRangeText · ${maxPos}槽 · 同步实盘",
                                     fontSize = 11.sp,
                                     lineHeight = 14.sp,
                                     style = MaterialTheme.typography.labelSmall.tnum(),
@@ -271,16 +304,32 @@ fun ShadowScreen(
                             HorizontalDivider(color = bot.hairline)
                             Spacer(Modifier.height(6.dp))
                             Text(
+                                text = "• 当前同步规则：单笔开仓 $orderRangeText USDT，最多同时持仓 $maxPos 个策略槽位（与 Trading-bot 实盘配置同步）。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
                                 text = "• 模拟撮合使用真实盘口 Bid/Ask，扣除 $feeLabel BNB 等效手续费（储备上限 $${bnbCap} USDT，独立 SQLite 账本持久化）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                text = "• 与实盘共享 T1/T2/R2 信号及 APTS v2 移动止损状态机（S0 初始保护 → S1 +1.0% 保本 → S2 +1.5%+ 双 tick 追踪，未触发止损一直持仓）。",
+                                text = "• 与实盘共享 T1/T2/R2 信号（跨策略 15m 冷却与槽位上限同步）及 APTS v2 移动止损状态机（S0 初始保护 → S1 +0.8% 保本 → S2 +1.5%+ 双 tick 追踪，未触发止损一直持仓）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            Spacer(Modifier.height(4.dp))
+                            TextButton(
+                                onClick = onOpenTradingConfig,
+                                modifier = Modifier.align(Alignment.End),
+                            ) {
+                                Icon(Icons.Outlined.Tune, null, modifier = Modifier.size(15.dp))
+                                Spacer(Modifier.size(4.dp))
+                                Text("调整实盘与 Shadow 交易配置", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            }
                         }
                     }
                 }

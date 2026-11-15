@@ -197,3 +197,67 @@ class R2Tests(unittest.TestCase):
             self.assertEqual(st['total_trades'], 1)
             self.assertEqual(st['active_positions'], 1)
             self.assertEqual(len(st['positions']), 1)
+
+    def test_cross_shadow_entry_guard_prevents_double_buy_and_syncs_with_live(self):
+        from decimal import Decimal
+        from solbot.app_api.binance_account import AccountVault
+        from solbot.execution.p3_shadow import P3ShadowExecutor
+        from solbot.execution.r2_shadow import R2ShadowExecutor
+        from solbot.execution.shadow import ShadowRejected
+        from solbot.mathematics.apts_exit import APTSState, update_protection
+        from solbot.p3_runtime import acquire_cross_shadow_entry_guard, release_cross_shadow_entry_guard
+        from test_p3_apts_shadow import RULES, NOW, context, NORMAL
+
+        # 1. Live AccountVault rejects T1 in DOWNTREND while accepting R2
+        t1_down = {
+            'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'accepted': True,
+            'regime': 'DOWNTREND', 'signal_id': 't1-down-1', 'signal_time': NOW,
+            'expires_at': NOW + 300_000, 'entry_low': '74.08', 'entry_high': '74.15', 'score': '94.3',
+        }
+        self.assertIsNone(AccountVault._parse_signal_payload(t1_down, set(), ('T1', 'R2'), NOW))
+        t1_up = dict(t1_down, regime='UPTREND', signal_id='t1-up-1')
+        self.assertIsNotNone(AccountVault._parse_signal_payload(t1_up, set(), ('T1', 'R2'), NOW))
+
+        # 2. APTS S1 triggers at +0.80% (e.g. 75.45 -> 76.19 is +0.98% >= +0.80%), locking profit floor 75.63
+        st_1616 = APTSState.create(
+            context(NOW), '75.45', '6.555', '0.01',
+            entry_fee_rate='0.00075', exit_fee_rate='0.00075', slippage_rate='0.00075',
+            stop_distance='0.0067', entry_time_ms=NOW,
+        )
+        dec_1745 = update_protection(st_1616, context(NOW + 1000), '76.19', NORMAL, tick_size='0.01')
+        self.assertEqual(dec_1745.state.stage, 'S1_PROFIT_PROTECTION')
+        self.assertEqual(dec_1745.stop_price, Decimal('75.63'))
+
+        # 3. Cross-shadow guard blocks simultaneous T1 + R2 double buy across separate DBs
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            db_dir = root / 'database'
+            r2_dir = root / 'r2'
+            db_dir.mkdir(parents=True, exist_ok=True)
+            r2_dir.mkdir(parents=True, exist_ok=True)
+            market_db = db_dir / 'market.sqlite'
+            market_db.touch()
+            p3_db = db_dir / 'sol-shadow.sqlite'
+            r2_db = r2_dir / 'r2-v2-shadow.sqlite'
+            P3ShadowExecutor(p3_db, rules=RULES, fee_rate='0.00075', minimum_notional='500', maximum_notional='1000')
+            R2ShadowExecutor(r2_db, rules=RULES, fee_rate='0.00075')
+
+            # First strategy claims entry at NOW
+            claimed = acquire_cross_shadow_entry_guard(
+                p3_db, market_db, strategy_id='T1', signal_id='sig-t1-1', signal_time=NOW, now_ms=NOW
+            )
+            self.assertTrue(claimed)
+            # Second strategy (R2) at the same millisecond is blocked by CROSS_STRATEGY_COOLDOWN
+            with self.assertRaises(ShadowRejected) as ctx_err:
+                acquire_cross_shadow_entry_guard(
+                    r2_db, market_db, strategy_id='R2', signal_id='sig-r2-1', signal_time=NOW, now_ms=NOW + 50
+                )
+            self.assertEqual(ctx_err.exception.code, 'CROSS_STRATEGY_COOLDOWN')
+
+            # If T1 submission fails and releases guard, R2 can then acquire
+            release_cross_shadow_entry_guard(market_db, 'sig-t1-1')
+            claimed_r2 = acquire_cross_shadow_entry_guard(
+                r2_db, market_db, strategy_id='R2', signal_id='sig-r2-1', signal_time=NOW, now_ms=NOW + 100
+            )
+            self.assertTrue(claimed_r2)
+

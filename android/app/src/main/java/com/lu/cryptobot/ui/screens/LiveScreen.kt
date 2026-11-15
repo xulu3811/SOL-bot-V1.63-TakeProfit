@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -62,6 +63,7 @@ fun LiveScreen(
     liveState: String,
     values: Map<String, JSONObject>,
     onRequestLiveToggle: (targetOn: Boolean) -> Unit,
+    onOpenTradingConfig: () -> Unit,
     onOpenApiConfig: () -> Unit,
     onSyncBinance: () -> Unit,
     onRequestCustody: (position: JSONObject, enabling: Boolean) -> Unit,
@@ -78,6 +80,15 @@ fun LiveScreen(
     val configured = binanceAccount?.optBoolean("configured", false) ?: false
     val fingerprint = binanceAccount.optCleanString("key_fingerprint")
     val readiness = liveStatus?.optJSONObject("readiness") ?: liveRisk?.optJSONObject("readiness")
+    val tradingConfig = values["trading/config"] ?: readiness?.optJSONObject("trading_config") ?: liveStatus?.optJSONObject("trading_config")
+    val minOrderUsdt = tradingConfig.optCleanString("min_order_usdt")
+        .ifBlank { readiness.optCleanString("min_order_usdt", "500") }
+    val maxOrderUsdt = tradingConfig.optCleanString("max_order_usdt")
+        .ifBlank { readiness.optCleanString("max_order_usdt", "1000") }
+    val maxSlots = tradingConfig?.optInt("max_slots", 0)?.takeIf { it > 0 }
+        ?: readiness?.optInt("max_slots", 2)?.takeIf { it > 0 } ?: 2
+    val orderRangeText = BotFormatters.formatOrderRange(minOrderUsdt, maxOrderUsdt)
+    val minCompact = BotFormatters.formatUsdtCompact(minOrderUsdt)
     val spotEnabled = binanceAccount?.optBoolean(
         "orders_enabled",
         readiness?.optBoolean("orders_enabled", false) ?: false,
@@ -113,7 +124,7 @@ fun LiveScreen(
     val riskDanger = drawdownNum >= hardLimitNum * 0.7f
     val riskFg = if (riskDanger) bot.loss else bot.gain
     val riskBg = if (riskDanger) bot.lossSoft else bot.gainSoft
-    val blockerMessage = BotFormatters.blockerLabel(blocker, freeUsdt)
+    val blockerMessage = BotFormatters.blockerLabel(blocker, freeUsdt, minOrderUsdt, maxSlots)
 
     Column(
         modifier = modifier
@@ -235,32 +246,32 @@ fun LiveScreen(
 
             Spacer(Modifier.height(9.dp))
 
-            // Compact Risk Guard Mini Icon Card + API & Sync Actions Row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // Risk Guard Bar + Trading Config / API / Sync Actions
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(MaterialTheme.shapes.small)
+                    .clickable { riskExpanded = !riskExpanded },
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, if (riskDanger) bot.loss.copy(alpha = 0.4f) else bot.hairline),
             ) {
-                Surface(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(MaterialTheme.shapes.small)
-                        .clickable { riskExpanded = !riskExpanded },
-                    shape = MaterialTheme.shapes.small,
-                    color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, if (riskDanger) bot.loss.copy(alpha = 0.4f) else bot.hairline),
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
                             Surface(
-                                modifier = Modifier.size(24.dp),
-                                shape = RoundedCornerShape(7.dp),
+                                modifier = Modifier.size(22.dp),
+                                shape = RoundedCornerShape(6.dp),
                                 color = riskBg,
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
@@ -268,47 +279,83 @@ fun LiveScreen(
                                         Icons.Outlined.Shield,
                                         contentDescription = "日内风控",
                                         tint = riskFg,
-                                        modifier = Modifier.size(14.dp),
+                                        modifier = Modifier.size(13.dp),
                                     )
                                 }
                             }
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "风控 $drawdownPctStr%/$hardLimitPctStr%",
-                                    style = MaterialTheme.typography.labelSmall.tnum(),
-                                    fontWeight = FontWeight.Bold,
-                                    color = riskFg,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
-                                Text(
-                                    text = "2槽 · $500–1000",
-                                    fontSize = 10.sp,
-                                    lineHeight = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.labelSmall.tnum(),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
+                            Text(
+                                text = "风控 $drawdownPctStr%/$hardLimitPctStr%",
+                                style = MaterialTheme.typography.labelSmall.tnum(),
+                                fontWeight = FontWeight.Bold,
+                                color = riskFg,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
                         }
-                        LinearProgressIndicator(
-                            progress = { (drawdownNum / hardLimitNum).coerceIn(0f, 1f) },
+                        Surface(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(3.dp)
-                                .clip(RoundedCornerShape(999.dp)),
-                            color = riskFg,
-                            trackColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        )
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { onOpenTradingConfig() },
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f),
+                        ) {
+                            Text(
+                                text = "${maxSlots}槽 · $orderRangeText · 实盘/Shadow同步",
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                fontSize = 10.sp,
+                                lineHeight = 13.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.labelSmall.tnum(),
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
+                    LinearProgressIndicator(
+                        progress = { (drawdownNum / hardLimitNum).coerceIn(0f, 1f) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(3.dp)
+                            .clip(RoundedCornerShape(999.dp)),
+                        color = riskFg,
+                        trackColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    )
                 }
+            }
 
+            Spacer(Modifier.height(7.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FilledTonalButton(
+                    onClick = onOpenTradingConfig,
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp),
+                ) {
+                    Icon(Icons.Outlined.Tune, null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.size(4.dp))
+                    Text(
+                        text = "配置",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                }
                 FilledTonalButton(
                     onClick = onOpenApiConfig,
                     shape = RoundedCornerShape(10.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                    modifier = Modifier.height(44.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp),
                 ) {
                     Icon(Icons.Outlined.Key, null, modifier = Modifier.size(15.dp))
                     Spacer(Modifier.size(4.dp))
@@ -323,7 +370,9 @@ fun LiveScreen(
                     onClick = onSyncBinance,
                     shape = RoundedCornerShape(10.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                    modifier = Modifier.height(44.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp),
                 ) {
                     Icon(Icons.Outlined.Sync, null, modifier = Modifier.size(15.dp))
                     Spacer(Modifier.size(4.dp))
@@ -344,7 +393,7 @@ fun LiveScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        text = "日内回撤 $drawdownPctStr% / 熔断 $hardLimitPctStr% · 单笔 $500–$1000 动态定仓(不足$1000按可用全额·低于$500拒开) · 上限 2 个策略槽位 · 风控参考额度 $$guardianCap USDT(不含手动亏损)",
+                        text = "日内回撤 $drawdownPctStr% / 熔断 $hardLimitPctStr% · 单笔 $orderRangeText 定仓(低于 $$minCompact 拒开) · 上限 $maxSlots 个策略槽位(与 Shadow-bot 同步) · 风控参考额度 $$guardianCap USDT(不含手动亏损)",
                         modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelSmall.tnum(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -420,7 +469,7 @@ fun LiveScreen(
             1 -> OrdersFeedSection(
                 orders = botOrdersArr,
                 isBot = true,
-                emptyText = "暂无机器人自动下单记录，触发 T1/T2/R2 高分信号且可用 USDT ≥ $500 时将自动挂单。",
+                emptyText = "暂无机器人自动下单记录，触发 T1/T2/R2 高分信号且可用 USDT ≥ $$minCompact 时将自动挂单。",
                 onInspectOrder = onInspectOrder,
             )
             else -> OrdersFeedSection(

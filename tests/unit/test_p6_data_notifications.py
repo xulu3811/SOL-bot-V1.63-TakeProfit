@@ -183,9 +183,12 @@ class NotificationsTests(unittest.TestCase):
             db.execute("UPDATE bot_orders SET status='FILLED',filled_at=? WHERE signal_id='sig-1'",(self.now+1000,))
         self.assertEqual(collector.poll()['binance_vault'],1)
         with closing(sqlite3.connect(vault_db)) as db,db:
-            db.execute("UPDATE bot_orders SET status='CLOSED',stop_updated_at=? WHERE signal_id='sig-1'",(self.now+5000,))
+            db.execute("ALTER TABLE bot_orders ADD COLUMN closed_at INTEGER")
+            db.execute("UPDATE bot_orders SET status='CLOSED',stop_updated_at=?,closed_at=? WHERE signal_id='sig-1'",(self.now+2000,self.now+5000))
         self.assertEqual(collector.poll()['binance_vault'],1)
         self.assertEqual(collector.poll()['binance_vault'],0)
+        closed_alert=self.store.alerts()['items'][-1]
+        self.assertEqual((closed_alert['kind'],closed_alert['details'].get('status'),closed_alert['created_at']),('APTS_EXIT','CLOSED',self.now+5000))
         kinds=[(i['kind'],i['details'].get('status')) for i in self.store.alerts()['items'][-2:]]
         self.assertEqual(kinds,[('BUY_FILL','FILLED'),('APTS_EXIT','CLOSED')])
 

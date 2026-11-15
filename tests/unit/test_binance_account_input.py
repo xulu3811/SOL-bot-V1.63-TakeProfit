@@ -647,17 +647,31 @@ class BinanceAccountInputTests(unittest.TestCase):
         self.assertFalse(rejected['placed'])
         self.assertEqual(rejected['reason'], 'USDT_BELOW_500')
 
-        # 500 <= free < 1000 (720 USDT) opens with max available (~720 USDT / 80 = 9.0 SOL)
+        # 500 <= free < 1000 (720 USDT): respects target_notional (500 USDT -> 6.250 SOL for score=75) and caps at free (720 USDT -> 9.000 SOL for score=95)
         transport.usdt_free = '720'
         fb_dir = self.root / 'fb'
         fb_dir.mkdir(exist_ok=True)
         vault_fb = AccountVault(fb_dir, clock=lambda: 1800000000000, transport=transport)
         vault_fb.save(self.key, self.secret)
         vault_fb.enable_live()
-        r_fb = DataReader({'SOLUSDT_strategy': make_strat('s_fb.sqlite', 't1-fb', '75', 1800000000000)}, clock=lambda: 1800000000000)
-        fb = vault_fb.consider_entry(r_fb, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
-        self.assertTrue(fb['placed'])
-        self.assertEqual(Decimal(fb['quantity']), Decimal('9.000'))
+        r_fb75 = DataReader({'SOLUSDT_strategy': make_strat('s_fb75.sqlite', 't1-fb75', '75', 1800000000000)}, clock=lambda: 1800000000000)
+        fb75 = vault_fb.consider_entry(r_fb75, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertTrue(fb75['placed'])
+        self.assertEqual(Decimal(fb75['quantity']), Decimal('6.250'))
+
+        fb2_dir = self.root / 'fb2'
+        fb2_dir.mkdir(exist_ok=True)
+        vault_fb2 = AccountVault(fb2_dir, clock=lambda: 1800000000000, transport=transport)
+        vault_fb2.save(self.key, self.secret)
+        vault_fb2.enable_live()
+        r_fb95 = DataReader({'SOLUSDT_strategy': make_strat('s_fb95.sqlite', 't1-fb95', '95', 1800000000000)}, clock=lambda: 1800000000000)
+        fb95 = vault_fb2.consider_entry(r_fb95, Decimal('80.00'), Decimal('0.01'), 1800000000000, ask=Decimal('80.00'))
+        self.assertTrue(fb95['placed'])
+        self.assertEqual(Decimal(fb95['quantity']), Decimal('9.000'))
+        self.assertEqual(
+            Decimal(AccountVault._fill_price({'price': '72.03', 'executedQty': '6.854', 'cummulativeQuoteQty': '495.2015'})),
+            Decimal('72.25'),
+        )
 
         # Plenty of cash: score=75 opens ~500 USDT (6.25 SOL), score=100 opens ~1000 USDT (12.5 SOL), 3rd signal blocked by SLOTS_FULL
         transport.usdt_free = '3000'
@@ -815,6 +829,92 @@ class BinanceAccountInputTests(unittest.TestCase):
         risk_after = reader.live_risk()
         self.assertEqual(risk_after['daily_loss_usdt'], '12.50')
         self.assertEqual(risk_after['drawdown_pct'], '0.62')
+
+    def test_manual_cost_matches_latest_lots_and_custody_does_not_force_dump_above_stop(self):
+        from solbot.mathematics.trend_exhaustion import TrendEvidence
+        orders = [
+            {'side': 'BUY', 'status': 'FILLED', 'price': '82.11', 'executed_qty': '12.571', 'time': 100},
+            {'side': 'BUY', 'status': 'FILLED', 'price': '75.88', 'executed_qty': '25.384', 'time': 200},
+            {'side': 'BUY', 'status': 'FILLED', 'price': '70.79', 'executed_qty': '11.294', 'time': 300},
+            {'side': 'BUY', 'status': 'FILLED', 'price': '70.92', 'executed_qty': '9.873', 'time': 400},
+        ]
+        # Even when earlier lots were closed by cbotsl (not in manual_orders), target_qty=9.873881 matches the latest buy lot ($70.92)
+        self.assertEqual(DataReader._average_entry(orders, target_qty=Decimal('9.873881')), Decimal('70.92'))
+        orders.append({'side': 'BUY', 'status': 'FILLED', 'price': '71.90', 'executed_qty': '15.949', 'time': 500})
+        self.assertEqual(DataReader._average_entry(orders, target_qty=Decimal('25.822881')), Decimal('71.53'))
+
+        # Verify manual custody in S1/S2 does NOT cancel the resting stop to market-dump when CONFIRMED_REVERSAL hits above limit_price
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), sol_free='10.0', sol_locked='0')
+        vault = self.vault(transport)
+        vault.save(self.key, self.secret)
+        vault.protect_manual('10.0')
+        rev_ev = TrendEvidence(
+            ready=True, higher_low_1m=False, higher_low_5m=False,
+            rvol=Decimal('2.0'), atr=Decimal('0.80'), previous_atr=Decimal('0.35'),
+            buy_ratio=Decimal('0.30'), previous_buy_ratio=Decimal('0.60'), adverse_move=True,
+        )
+        # Advance into S1 (+1.0%) with severe adverse move: must stay OPEN and raise stop, NOT switch to EXITING/cbotex
+        s1 = vault.advance(Decimal('82.84') * Decimal('1.010'), rev_ev, Decimal('0.01'), 1800000020000)
+        self.assertEqual(vault.protection()['status'], 'OPEN')
+        self.assertTrue(vault.protection()['client_order_id'].startswith('cbotsl'))
+        self.assertEqual(s1['stage'], 'S1')
+
+    def test_trading_config_customizes_order_usdt_and_max_slots_for_live_and_shadow(self):
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='5000', sol_free='0', sol_locked='0')
+        vault_dir = self.root / 'vault_cfg'
+        vault_dir.mkdir(exist_ok=True)
+        vault = AccountVault(vault_dir, clock=lambda: 1800000005000, transport=transport)
+        vault.save(self.key, self.secret)
+        vault.enable_live()
+
+        # Default config is 500-1000 USDT, 2 slots
+        default_cfg = vault.trading_config()
+        self.assertEqual(default_cfg['min_order_usdt'], '500.00')
+        self.assertEqual(default_cfg['max_order_usdt'], '1000.00')
+        self.assertEqual(default_cfg['max_slots'], 2)
+
+        # Save custom fixed $1200 per order and 3 slots
+        saved = vault.save_trading_config('1200', '1200', 3)
+        self.assertEqual(saved['min_order_usdt'], '1200.00')
+        self.assertEqual(saved['max_order_usdt'], '1200.00')
+        self.assertTrue(saved['fixed_mode'])
+        self.assertEqual(saved['max_slots'], 3)
+        self.assertTrue((vault_dir / 'trading-config.json').exists())
+
+        class Reader:
+            def read(self, key, sql, args=()):
+                return [{
+                    'payload_json': json.dumps({
+                        'symbol': 'SOLUSDT', 'strategy_id': 'T1', 'accepted': True,
+                        'signal_id': 'sig-cfg-1', 'expires_at': 1900000000000,
+                        'entry_low': '80', 'score': 80,
+                    }),
+                }]
+
+        placed = vault.consider_entry(Reader(), Decimal('80'), Decimal('0.01'), 1800000005000)
+        self.assertTrue(placed['placed'])
+        self.assertEqual(Decimal(placed['quantity']) * Decimal(placed['price']), Decimal('1200.00'))
+
+        # Verify P3ShadowExecutor and R2ShadowExecutor sync with the custom config (including virtual cash scaling for 3 x $1200)
+        from solbot.execution.p3_shadow import P3ShadowExecutor
+        from solbot.execution.r2_shadow import R2ShadowExecutor
+        from solbot.mathematics.contracts import SymbolRules
+        rules = SymbolRules(
+            'SOLUSDT', Decimal('0.01'), Decimal('0.001'), Decimal('0.01'), Decimal('100000'),
+            Decimal('0.001'), Decimal('100000'), Decimal('5'), Decimal('1000000'),
+        )
+        p3_exec = P3ShadowExecutor(self.root / 'p3_cfg.sqlite', rules=rules)
+        p3_exec.apply_trading_config('1200', '1200', 3)
+        self.assertEqual(p3_exec.minimum_notional, Decimal('1200'))
+        self.assertEqual(p3_exec.maximum_notional, Decimal('1200'))
+        self.assertEqual(p3_exec.maximum_slots, 3)
+        self.assertGreaterEqual(Decimal(p3_exec.snapshot()['cash']), Decimal('3600'))
+
+        r2_exec = R2ShadowExecutor(self.root / 'r2_cfg.sqlite', rules=rules)
+        r2_exec.apply_trading_config('1200', '1200', 3)
+        self.assertEqual(r2_exec.minimum_notional, Decimal('1200'))
+        self.assertEqual(r2_exec.maximum_notional, Decimal('1200'))
+        self.assertEqual(r2_exec.maximum_slots, 3)
 
 
 if __name__ == '__main__':

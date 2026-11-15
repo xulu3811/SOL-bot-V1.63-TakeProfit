@@ -8,40 +8,36 @@ venv/
 .pytest_cache/
 .mypy_cache/
 
-# Android / Gradle
+# Android / Gradle / Releases
 android/.gradle/
 android/**/build/
 android/local.properties
+release/
 *.apk
 *.aab
 *.ap_
 *.dex
 *.jks
 *.keystore
+*.p12
 
 # Secrets and machine-local credentials
-FCM-Serv/*.txt
-FCM-Serv/*.json
+FCM-Serv/
 **/*adminsdk*.json
+*credentials*.json
 .env
 .env.*
 credentials.json
+*.pem
+*.key
 
-# Local market data and delivery dumps (kept on disk, not in git)
-data/*.sqlite
-data/*.sqlite-*
-data/*.pkl
-data/*.tar.gz
-data/*.json
-data/*.jsonl
-data/*.txt
-data/p*-server/
-data/**/*.sqlite
-data/**/*.sqlite-*
-data/**/*.tar.gz
-data/**/*.csv
-data/rebound-*/
-data/audit-*/
+# Local databases, logs, and scratch dumps (kept on disk, not in git)
+data/
+scratch/
+*.sqlite
+*.sqlite-*
+*.db
+*.tar.gz
 1年SOL历史数据存放位置.txt
 止盈止损策略优化---gemini-code-*.md
 

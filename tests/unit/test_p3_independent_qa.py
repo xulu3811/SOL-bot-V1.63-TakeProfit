@@ -263,9 +263,9 @@ class IndependentAPTSMathTests(unittest.TestCase):
     def test_one_percent_and_strict_one_point_five_percent_stages(self):
         state = self.state()
         ordinary = TrendEvidence(ready=True)
-        below = update_protection(state, context(1), "100.999", ordinary, tick_size="0.01")
+        below = update_protection(state, context(1), "100.799", ordinary, tick_size="0.01")
         self.assertEqual(below.state.stage, "S0_INITIAL_PROTECTION")
-        protected = update_protection(below.state, context(2), "101", ordinary, tick_size="0.01")
+        protected = update_protection(below.state, context(2), "100.80", ordinary, tick_size="0.01")
         self.assertEqual(protected.state.stage, "S1_PROFIT_PROTECTION")
         exact = update_protection(protected.state, context(3), "101.5", ordinary, tick_size="0.01")
         self.assertEqual(exact.state.stage, "S1_PROFIT_PROTECTION")

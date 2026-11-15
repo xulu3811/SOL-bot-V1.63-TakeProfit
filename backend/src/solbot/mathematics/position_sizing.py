@@ -15,6 +15,7 @@ class ResearchRiskParameters:
     min_notional: Decimal = Decimal("300")
     max_notional: Decimal = Decimal("700")
     allow_cash_fallback: bool = False
+    max_open_positions: int = 2
 
 
 PARAMETERS = {symbol: ResearchRiskParameters(symbol, symbol.lower() + "-risk-research-1")
@@ -58,7 +59,8 @@ def size_position(context, features, *, score, entry_price, equity, high_waterma
         reasons.append("SCORE_OUTSIDE_ENTRY_RANGE")
     if hard_locked or (high - net) / high >= Decimal("0.05"):
         reasons.append("HARD_DRAWDOWN_LOCK")
-    if open_positions + pending_entries >= 2:
+    max_slots = int(getattr(parameters, "max_open_positions", 2) or 2)
+    if open_positions + pending_entries >= max_slots:
         reasons.append("TWO_SLOTS_OCCUPIED")
     if reserved > cash:
         reasons.append("RESERVATIONS_EXCEED_CASH")

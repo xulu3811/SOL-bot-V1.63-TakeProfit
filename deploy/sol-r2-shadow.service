@@ -2,6 +2,7 @@
 Description=SOL R2 isolated rebound paper worker
 After=network-online.target solbot-market.service solbot-micro-sol.service
 [Service]
+Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
 Type=simple
 User=solbot
 Group=solbot
@@ -17,6 +18,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/sol-bot/r2 /var/lib/sol-bot/database
+ReadOnlyPaths=/var/lib/sol-bot/shared
 PrivateTmp=true
 PrivateDevices=true
 RestrictAddressFamilies=AF_UNIX

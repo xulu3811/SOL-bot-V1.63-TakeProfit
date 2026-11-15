@@ -64,8 +64,9 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     one_rows = candles.get("1m") or []
     confirm_1m_rebound = confirmed or (bool(one_rows) and float(one_rows[-1]["low"]) >= recent_low and rebound_structure)
 
-    if mtf_oversold and climax_rvol and rsi_exhaustion_turn and rebound_structure:
+    if regime == "UPTREND" and mtf_oversold and climax_rvol and rsi_exhaustion_turn and rebound_structure:
         rebound_checks = {
+            "REGIME_NOT_UPTREND": regime == "UPTREND",
             "ONE_MINUTE_BREAKOUT_UNCONFIRMED": confirm_1m_rebound,
             "ONE_MINUTE_CHASE_EXCEEDED": no_chase_1m,
         }

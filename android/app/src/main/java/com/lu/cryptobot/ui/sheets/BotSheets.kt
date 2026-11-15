@@ -15,11 +15,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -37,6 +39,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,6 +47,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -476,10 +480,22 @@ fun LiveToggleConfirmSheet(
     enabling: Boolean,
     ordersEnabled: Boolean,
     freeUsdt: String?,
+    minOrderUsdt: String = "500",
+    maxOrderUsdt: String = "1000",
+    maxSlots: Int = 2,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val bot = LocalBotColors.current
+    val orderRangeText = BotFormatters.formatOrderRange(minOrderUsdt, maxOrderUsdt)
+    val minCompact = BotFormatters.formatUsdtCompact(minOrderUsdt)
+    val maxCompact = BotFormatters.formatUsdtCompact(maxOrderUsdt)
+    val minEqualsMax = (BotFormatters.parseBigDecimal(minOrderUsdt)?.compareTo(BotFormatters.parseBigDecimal(maxOrderUsdt)) == 0)
+    val orderRuleDesc = if (minEqualsMax) {
+        "• 单笔限价买入固定 $$minCompact USDT（低于 $$minCompact 拒开），上限 $maxSlots 个策略仓，未触发止损一直持仓，仅策略交易计入日内 5.0% 亏损熔断。"
+    } else {
+        "• 单笔限价买入 $orderRangeText USDT（不足 $$maxCompact 按最大可用开仓，低于 $$minCompact 拒开），上限 $maxSlots 个策略仓，未触发止损一直持仓，仅策略交易计入日内 5.0% 亏损熔断。"
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -516,7 +532,7 @@ fun LiveToggleConfirmSheet(
                 ) {
                     if (enabling) {
                         Text("• 实盘默认授权 T1 顺势 / T2 波段 / R2 超卖反弹策略（R1 震荡默认禁用）。", style = MaterialTheme.typography.bodySmall)
-                        Text("• 单笔限价买入 $500–$1000 USDT（不足 $1000 按最大可用开仓，低于 $500 拒开），上限 2 个策略仓，未触发止损一直持仓，仅策略交易计入日内 5.0% 亏损熔断。", style = MaterialTheme.typography.bodySmall)
+                        Text(orderRuleDesc, style = MaterialTheme.typography.bodySmall)
                         Text(
                             text = "• API 现货权限: ${if (ordersEnabled) "已就绪" else "未开启"} · 当前可用 USDT: $${BotFormatters.formatNumber(freeUsdt, 2)}",
                             style = MaterialTheme.typography.bodySmall.tnum(),
@@ -592,7 +608,7 @@ fun CustodyConfirmSheet(
             )
             Text(
                 text = if (enabling) {
-                    "系统将以点击托管时刻的实时市价（当前约 $$liveRef）为起算基准，为当前 $qty SOL 挂出交易所原生止损单：初始硬止损 -0.8%，随后随涨幅自动上移（+1.0% 保本 / +1.5%+ 动态追尾），不以历史买入价计算。"
+                    "系统将以点击托管时刻的实时市价（当前约 $$liveRef）为起算基准，为当前 $qty SOL 挂出交易所原生止损单：初始硬止损 -0.8%，随后随涨幅自动上移（+0.8% 保本 / +1.5%+ 动态追尾），不以历史买入价计算。"
                 } else {
                     "撤销后，系统将撤回在 Binance 为人工 SOL 仓位挂出的原生止损委托，释放锁定的 SOL。"
                 },
@@ -679,6 +695,320 @@ fun OrderDetailSheet(
                 }
             }
             Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TradingConfigSheet(
+    currentMinOrderUsdt: String,
+    currentMaxOrderUsdt: String,
+    currentMaxSlots: Int,
+    freeUsdt: String?,
+    onSave: (minOrderUsdt: String, maxOrderUsdt: String, maxSlots: Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val bot = LocalBotColors.current
+    val initialMinBd = BotFormatters.parseBigDecimal(currentMinOrderUsdt) ?: java.math.BigDecimal("500")
+    val initialMaxBd = BotFormatters.parseBigDecimal(currentMaxOrderUsdt) ?: java.math.BigDecimal("1000")
+    val initialFixed = initialMinBd.compareTo(initialMaxBd) == 0
+
+    var rangeMode by remember(currentMinOrderUsdt, currentMaxOrderUsdt) { mutableStateOf(!initialFixed) }
+    var minAmount by remember(currentMinOrderUsdt) {
+        mutableStateOf(initialMinBd.stripTrailingZeros().toPlainString())
+    }
+    var maxAmount by remember(currentMaxOrderUsdt) {
+        mutableStateOf(initialMaxBd.stripTrailingZeros().toPlainString())
+    }
+    var maxSlots by remember(currentMaxSlots) { mutableIntStateOf(currentMaxSlots.coerceIn(1, 10)) }
+
+    val parsedMin = BotFormatters.parseBigDecimal(minAmount)
+    val parsedMax = if (rangeMode) BotFormatters.parseBigDecimal(maxAmount) else parsedMin
+    val validationError = when {
+        parsedMin == null -> "请输入有效的单笔开仓金额"
+        parsedMin < java.math.BigDecimal("10") || parsedMin > java.math.BigDecimal("50000") -> "单笔最小金额需在 $10 – $50,000 USDT"
+        parsedMax == null -> "请输入有效的最大开仓金额"
+        parsedMax < parsedMin -> "最大金额不能低于最小金额"
+        parsedMax > java.math.BigDecimal("50000") -> "单笔最大金额不能超过 $50,000 USDT"
+        maxSlots !in 1..10 -> "持仓订单数量需在 1 – 10 槽之间"
+        else -> null
+    }
+
+    val estExposure = (parsedMax ?: java.math.BigDecimal.ZERO).multiply(java.math.BigDecimal(maxSlots))
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Outlined.Tune, null, tint = MaterialTheme.colorScheme.primary)
+                    Column {
+                        Text("交易仓位与金额配置", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text("Trading-bot 实盘与 Shadow-bot 模拟盘同步生效", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                TextButton(
+                    onClick = {
+                        rangeMode = true
+                        minAmount = "500"
+                        maxAmount = "1000"
+                        maxSlots = 2
+                    },
+                ) {
+                    Text("默认", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = bot.infoSoft,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = buildString {
+                        append("当前生效: $maxSlots 个持仓槽 · 单笔 ")
+                        append(BotFormatters.formatOrderRange(currentMinOrderUsdt, currentMaxOrderUsdt))
+                        append(" · 实盘可用 USDT $${BotFormatters.formatNumber(freeUsdt, 2)}")
+                    },
+                    modifier = Modifier.padding(10.dp),
+                    style = MaterialTheme.typography.bodySmall.tnum(),
+                    color = bot.info,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+
+            // Mode toggle: Fixed vs Dynamic Range
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable {
+                            rangeMode = false
+                            if (maxAmount.isBlank() || parsedMax == null) maxAmount = minAmount
+                        },
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (!rangeMode) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                    border = BorderStroke(1.dp, if (!rangeMode) MaterialTheme.colorScheme.primary else bot.hairline),
+                ) {
+                    Text(
+                        text = "固定单笔金额",
+                        modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = if (!rangeMode) FontWeight.Bold else FontWeight.Medium,
+                        color = if (!rangeMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable {
+                            rangeMode = true
+                            val curMin = BotFormatters.parseBigDecimal(minAmount)
+                            val curMax = BotFormatters.parseBigDecimal(maxAmount)
+                            if (curMin != null && (curMax == null || curMax < curMin)) {
+                                maxAmount = minAmount
+                            }
+                        },
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (rangeMode) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                    border = BorderStroke(1.dp, if (rangeMode) MaterialTheme.colorScheme.primary else bot.hairline),
+                ) {
+                    Text(
+                        text = "评分动态区间",
+                        modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = if (rangeMode) FontWeight.Bold else FontWeight.Medium,
+                        color = if (rangeMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            // Quick amount presets
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                listOf("200", "500", "800", "1000", "1500").forEach { preset ->
+                    val selected = !rangeMode && minAmount == preset
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                rangeMode = false
+                                minAmount = preset
+                                maxAmount = preset
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else bot.hairline),
+                    ) {
+                        Text(
+                            text = "$$preset",
+                            modifier = Modifier.padding(vertical = 6.dp),
+                            style = MaterialTheme.typography.labelSmall.tnum(),
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        )
+                    }
+                }
+            }
+
+            if (!rangeMode) {
+                OutlinedTextField(
+                    value = minAmount,
+                    onValueChange = {
+                        minAmount = it
+                        maxAmount = it
+                    },
+                    label = { Text("单笔开仓金额 (USDT)") },
+                    suffix = { Text("USDT") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                )
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    OutlinedTextField(
+                        value = minAmount,
+                        onValueChange = { minAmount = it },
+                        label = { Text("单笔最小 (USDT)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        shape = MaterialTheme.shapes.small,
+                    )
+                    OutlinedTextField(
+                        value = maxAmount,
+                        onValueChange = { maxAmount = it },
+                        label = { Text("单笔最大 (USDT)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        shape = MaterialTheme.shapes.small,
+                    )
+                }
+            }
+
+            // Max Open Position Slots Selector
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "持仓订单数量上限 (策略槽位)",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "最多可占用 $${BotFormatters.formatNumber(estExposure.toPlainString(), 0)} USDT",
+                        style = MaterialTheme.typography.labelSmall.tnum(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    (1..5).forEach { slot ->
+                        val selected = maxSlots == slot
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { maxSlots = slot },
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                            border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else bot.hairline),
+                        ) {
+                            Text(
+                                text = "${slot}单",
+                                modifier = Modifier.padding(vertical = 8.dp),
+                                style = MaterialTheme.typography.labelMedium.tnum(),
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { if (maxSlots > 1) maxSlots-- },
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
+                        Text("-")
+                    }
+                    OutlinedButton(
+                        onClick = { if (maxSlots < 10) maxSlots++ },
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
+                        Text("+")
+                    }
+                }
+            }
+
+            if (validationError != null) {
+                Text(
+                    text = validationError,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = bot.loss,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(0.36f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("取消")
+                }
+                Button(
+                    onClick = {
+                        val finalMin = minAmount.trim()
+                        val finalMax = if (rangeMode) maxAmount.trim() else finalMin
+                        onSave(finalMin, finalMax, maxSlots)
+                        onDismiss()
+                    },
+                    enabled = validationError == null,
+                    modifier = Modifier.weight(0.64f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("保存并同步实盘/模拟")
+                }
+            }
+            Spacer(Modifier.height(8.dp))
         }
     }
 }

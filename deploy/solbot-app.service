@@ -3,6 +3,7 @@ Description=SOL-bot P7 local authenticated app API
 After=network.target
 
 [Service]
+Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
 User=solbot-app
 Group=solbot-app
 SupplementaryGroups=solbot
@@ -21,7 +22,7 @@ PrivateDevices=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET
-ReadWritePaths=/var/lib/sol-bot-app
+ReadWritePaths=/var/lib/sol-bot-app /var/lib/sol-bot/shared
 ReadOnlyPaths=/opt/sol-bot/p5 /var/lib/sol-bot/database /var/lib/sol-bot-execution /var/lib/sol-bot/r2
 MemoryMax=256M
 CPUQuota=20%
