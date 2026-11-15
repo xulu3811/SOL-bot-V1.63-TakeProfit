@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from .auth import AuthStore,AuthError
 from .data import DataReader
 from .notifications import NotificationStore
+from .ops_monitor import OpsMonitor
 
 PREFIX='/api/v1/app'
 def _quote(item,mark,source):
@@ -19,14 +20,46 @@ def _quote(item,mark,source):
     change=(price-entry)/entry*Decimal('100')
     pnl=(price-entry)*qty
     item.update(mark_price=format(price,'f'),change_pct=f'{change:+.2f}%',pnl_usdt=f'{pnl:+.2f}',price_source=source)
-def create_app(auth,reader,notifications,control,vault=None):
+def _client_ip(headers,client):
+    fwd=headers.get('x-forwarded-for')
+    if fwd:
+        first=fwd.split(',')[0].strip()
+        if first:return first
+    return client.host if client else 'unknown'
+
+def _alert_auth_failure(notifications,exc,source_ip):
+    if notifications is None or not callable(getattr(notifications,'publish_security_alert',None)):return
+    err=str(exc)
+    if err in ('ADMIN_REQUIRED','CONTROL_FORBIDDEN','NOT_AUTHORIZED','RISK_CONFIRMATION_REQUIRED'):return
+    code={
+        'PAIRING_LOCKED':'PAIRING_BLOCKED',
+        'PASSPHRASE_REJECTED':'PAIRING_BLOCKED',
+        'INVALID_PASSPHRASE':'PAIRING_BLOCKED',
+        'DEVICE_ALREADY_PAIRED':'PAIRING_BLOCKED',
+        'INVALID_SIGNATURE_OR_TIME':'INVALID_SIGNATURE',
+        'INVALID_KEY':'INVALID_SIGNATURE',
+        'P256_REQUIRED':'INVALID_SIGNATURE',
+        'REPLAY_REJECTED':'REPLAY_BLOCKED',
+        'RATE_LIMITED':'RATE_LIMITED',
+    }.get(err,'UNAUTHORIZED_DEVICE')
+    try:notifications.publish_security_alert('HTTPS_API',code,source_ip=source_ip,device_model='UNKNOWN')
+    except Exception:pass
+
+def create_app(auth,reader,notifications,control,vault=None,ops=None):
     app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
+    ops_monitor=ops or OpsMonitor(
+        auth_db=getattr(auth,'path',None),
+        notifications_db=getattr(notifications,'path',None),
+    )
     @app.middleware('http')
     async def authorize(request,call_next):
         if request.url.path=='/healthz':return JSONResponse({'status':'ok','live_enabled':False})
         if request.url.scheme!='https':return JSONResponse({'error':'HTTPS_REQUIRED'},status_code=426)
+        if not request.url.path.startswith(PREFIX+'/'):
+            return JSONResponse({'error':'NOT_FOUND'},status_code=404)
+        client_ip=_client_ip(request.headers,request.client)
         try:
-            auth.rate('ip:'+(request.client.host if request.client else 'unknown'),300)
+            auth.rate('ip:'+client_ip,300)
             length=request.headers.get('content-length')
             if length and int(length)>65536:return JSONResponse({'error':'REQUEST_TOO_LARGE'},status_code=413)
             body=await request.body()
@@ -35,9 +68,11 @@ def create_app(auth,reader,notifications,control,vault=None):
             public={PREFIX+'/devices/pair',PREFIX+'/session/challenge',PREFIX+'/session/open'}
             if request.url.path not in public:
                 request.state.principal=auth.authenticate(request.method,path,body,request.headers)
-            else:auth.rate('bootstrap:'+(request.client.host if request.client else 'unknown'),15)
+            else:auth.rate('bootstrap:'+client_ip,15)
             return await call_next(request)
-        except AuthError as exc:return JSONResponse({'error':str(exc)},status_code=401)
+        except AuthError as exc:
+            _alert_auth_failure(notifications,exc,client_ip)
+            return JSONResponse({'error':str(exc)},status_code=401)
         except (ValueError,KeyError,TypeError):return JSONResponse({'error':'INVALID_REQUEST'},status_code=400)
         except (sqlite3.Error,OSError):return JSONResponse({'error':'SERVICE_UNAVAILABLE'},status_code=503)
     def principal(request):return request.state.principal
@@ -464,6 +499,36 @@ def create_app(auth,reader,notifications,control,vault=None):
         with auth.tx() as db:
             db.execute('UPDATE custody_requests SET revoked=1 WHERE request_id=?',(target,))
         return {'revoked':True,'native_orders_changed':cancelled,'buy_orders':0}
+    def _fcm_configured():
+        cred=os.environ.get('SOLBOT_FCM_CREDENTIALS','/etc/sol-bot/secrets/firebase-adminsdk.json')
+        try:return bool(cred and Path(cred).is_file())
+        except OSError:return False
+    @app.get(PREFIX+'/system/overview')
+    async def system_overview(request:Request):
+        principal(request)
+        try:live_doc=present_live_status()
+        except Exception:live_doc={}
+        return ops_monitor.overview(cached=False,live_status_doc=live_doc,fcm_enabled=_fcm_configured())
+    @app.get(PREFIX+'/system/logs')
+    async def system_logs(request:Request,source:str='auth',only_alerts:bool=False,limit:int=80):
+        principal(request)
+        try:return ops_monitor.logs(source=source,only_alerts=only_alerts,limit=bounded(limit))
+        except ValueError as exc:return JSONResponse({'error':str(exc)},status_code=400)
+    @app.post(PREFIX+'/system/optimize-memory')
+    async def system_optimize_memory(request:Request):
+        p=principal(request)
+        if p['role'] not in ('operator','admin'):raise AuthError('CONTROL_FORBIDDEN')
+        auth.rate('ops-mem:'+p['device_id'],4)
+        return ops_monitor.optimize_memory()
+    @app.post(PREFIX+'/system/clean-cache')
+    async def system_clean_cache(request:Request):
+        p=principal(request)
+        if p['role'] not in ('operator','admin'):raise AuthError('CONTROL_FORBIDDEN')
+        auth.rate('ops-clean:'+p['device_id'],6)
+        raw=await request.body()
+        body=json.loads(raw) if raw else {}
+        dry_run=bool(body.get('dry_run',True)) if isinstance(body,dict) else True
+        return ops_monitor.clean_cache(dry_run=dry_run)
     @app.websocket(PREFIX+'/events')
     async def events(socket:WebSocket):
         import asyncio
@@ -473,7 +538,7 @@ def create_app(auth,reader,notifications,control,vault=None):
             p=auth.authenticate('GET',path,b'',socket.headers)
             tf=socket.query_params.get('timeframe') or '1m'
             if tf not in ('1m','5m','15m','1h','4h'):tf='1m'
-            await socket.accept();cursor=0
+            await socket.accept();cursor=0;tick=0
             while auth.active(p['device_id']):
                 try:
                     batch=notifications.alerts(cursor,100);cursor=batch['next_cursor']
@@ -489,8 +554,9 @@ def create_app(auth,reader,notifications,control,vault=None):
                     except TypeError: mkt_doc=reader.market_summary()
                     try: cfg_doc=account_vault().trading_config()
                     except Exception: cfg_doc={}
-                    await socket.send_json({
-                        'status':present_live_status(),
+                    live_st_doc=present_live_status()
+                    frame={
+                        'status':live_st_doc,
                         'risk':present_live_risk(),
                         'positions':present_positions(p['device_id']),
                         'live_orders':live_ord_doc,
@@ -502,13 +568,22 @@ def create_app(auth,reader,notifications,control,vault=None):
                         'strategies':reader.strategy_summary(),
                         'alerts':batch,
                         'resync_required':False,
-                    })
+                    }
+                    if tick%3==0:
+                        try:frame['system_overview']=ops_monitor.overview(cached=True,live_status_doc=live_st_doc,fcm_enabled=_fcm_configured())
+                        except Exception:pass
+                    tick+=1
+                    await socket.send_json(frame)
                 except Exception:
                     break
                 await asyncio.sleep(1.0)
             try:await socket.close(code=1000)
             except Exception:pass
-        except (AuthError,WebSocketDisconnect):
+        except AuthError as exc:
+            _alert_auth_failure(notifications,exc,_client_ip(socket.headers,socket.client))
+            try:await socket.close(code=1008)
+            except RuntimeError:pass
+        except WebSocketDisconnect:
             try:await socket.close(code=1008)
             except RuntimeError:pass
     return app
@@ -525,7 +600,11 @@ def _notification_loop(reader,auth,notifications,fcm_path,interval=2.0):
         try:
             if cred and not sender.enabled and cred.is_file():sender.enabled=True
             notifications.recover()
-            collector.poll()
+            try:collector.poll()
+            except Exception as poll_exc:
+                now_s=time.monotonic()
+                if now_s-last_warn>=60.0:
+                    last_warn=now_s;log.warning('notification collector poll failed: %s',poll_exc)
             notifications.dispatch(sender,device_active=auth.active)
         except Exception as exc:
             now_s=time.monotonic()
@@ -546,7 +625,17 @@ def main():
     root=Path(a.state_dir)
     from .binance_account import AccountVault
     from .custody_apts import loop
-    auth=AuthStore(root/'auth.sqlite',enrollment_sha256=enrollment)
+    def _env_list(name):
+        raw=os.environ.get(name,'')
+        return [x.strip() for x in raw.split(',') if x.strip()] or None
+    auth=AuthStore(
+        root/'auth.sqlite',
+        enrollment_sha256=enrollment,
+        allowed_device_ids=_env_list('SOLBOT_ALLOWED_DEVICE_IDS'),
+        allowed_device_models=_env_list('SOLBOT_ALLOWED_DEVICE_MODELS'),
+        allowed_pubkey_sha256s=_env_list('SOLBOT_ALLOWED_PUBKEY_SHA256S'),
+        pairing_locked=os.environ.get('SOLBOT_PAIRING_LOCKED','').strip().lower() in ('1','true','yes'),
+    )
     notifications=NotificationStore(root/'notifications.sqlite')
     vault=AccountVault(root)
     app=create_app(auth,DataReader(),notifications,ControlClient(a.control_socket,pwd.getpwnam('solbot-exec').pw_uid),vault)

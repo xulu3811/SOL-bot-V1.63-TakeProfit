@@ -41,6 +41,7 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lu.cryptobot.ui.components.BotFormatters
@@ -171,6 +172,7 @@ fun ProCandleChart(
     candles: JSONArray?,
     timeframe: String,
     stopPrice: Double? = null,
+    chartHeight: Dp = 240.dp,
     modifier: Modifier = Modifier,
 ) {
     val bot = LocalBotColors.current
@@ -184,7 +186,7 @@ fun ProCandleChart(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(28.dp),
+                .height(24.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -224,13 +226,13 @@ fun ProCandleChart(
             }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(4.dp))
 
         if (bars.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(220.dp),
+                    .height(chartHeight),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
@@ -265,7 +267,7 @@ fun ProCandleChart(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(238.dp),
+                .height(chartHeight),
         ) {
             Canvas(
                 modifier = Modifier

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -39,6 +40,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.lu.cryptobot.FrameSyncHelper
 import com.lu.cryptobot.ui.components.BotFormatters
 import com.lu.cryptobot.ui.components.BotSurfaceCard
@@ -101,16 +103,27 @@ fun StrategyScreen(
         else -> MaterialTheme.colorScheme.primary
     }
 
+    val reasonTexts = remember(reasonsArr) {
+        buildList {
+            if (reasonsArr != null) {
+                for (i in 0 until reasonsArr.length()) {
+                    val code = reasonsArr.optString(i)
+                    if (code.isNotBlank()) add(BotFormatters.reasonLabel(code))
+                }
+            }
+        }
+    }
+
     Column(
         modifier = modifier
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(11.dp),
     ) {
         // 1. 4-Engine Segmented Switcher (T1 / T2 / R2 / R1)
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             listOf(
                 Triple("T1", "顺势回调", if ("T1" in allowedLive) "主实盘" else "影子"),
@@ -134,8 +147,8 @@ fun StrategyScreen(
                     ),
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(3.dp),
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 7.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -150,14 +163,15 @@ fun StrategyScreen(
                             )
                             Text(
                                 text = tag,
-                                style = MaterialTheme.typography.labelSmall,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 fontWeight = FontWeight.SemiBold,
                                 color = if (isLiveAllowed) bot.gain else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
                             )
                         }
                         Text(
-                            text = if (engScore != null && !engScore.isNaN()) "$name · ${BotFormatters.formatNumber(engScore.toString(), 1)}" else name,
-                            style = MaterialTheme.typography.labelSmall.tnum(),
+                            text = if (engScore != null && !engScore.isNaN()) "$name ${BotFormatters.formatNumber(engScore.toString(), 1, grouping = false)}" else name,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp).tnum(),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -167,33 +181,33 @@ fun StrategyScreen(
             }
         }
 
-        // 2. Compact Horizontal Score Card (~132dp height vs giant empty ring!)
-        BotSurfaceCard {
+        // 2. Compact Horizontal Score Card
+        BotSurfaceCard(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 13.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 Box(
-                    modifier = Modifier.size(82.dp),
+                    modifier = Modifier.size(78.dp),
                     contentAlignment = Alignment.Center,
                 ) {
                     val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
                     val sweep = ((score / 100.0).toFloat().coerceIn(0f, 1f)) * 360f
-                    Canvas(modifier = Modifier.size(82.dp)) {
+                    Canvas(modifier = Modifier.size(78.dp)) {
                         drawArc(
                             color = trackColor,
                             startAngle = -90f,
                             sweepAngle = 360f,
                             useCenter = false,
-                            style = Stroke(width = 8.dp.toPx(), cap = StrokeCap.Round),
+                            style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round),
                         )
                         drawArc(
                             color = scoreAccent,
                             startAngle = -90f,
                             sweepAngle = sweep,
                             useCenter = false,
-                            style = Stroke(width = 8.dp.toPx(), cap = StrokeCap.Round),
+                            style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round),
                         )
                     }
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -212,10 +226,10 @@ fun StrategyScreen(
 
                 Column(
                     modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
                     FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         val (regBg, regFg) = when (regime) {
@@ -241,7 +255,7 @@ fun StrategyScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Text(
-                            text = if (gap <= 0.0) "已达到买入门槛 ≥75" else "距门槛差 ${BotFormatters.formatNumber(gap.toString(), 1)} 分",
+                            text = if (gap <= 0.0) "已达到买入门槛 ≥${threshold.toInt()}" else "距门槛差 ${BotFormatters.formatNumber(gap.toString(), 1)} 分",
                             style = MaterialTheme.typography.labelMedium.tnum(),
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -256,7 +270,7 @@ fun StrategyScreen(
                         progress = { (score / threshold).toFloat().coerceIn(0f, 1f) },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(7.dp)
+                            .height(6.dp)
                             .clip(RoundedCornerShape(999.dp)),
                         color = scoreAccent,
                         trackColor = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -272,17 +286,29 @@ fun StrategyScreen(
         }
 
         // 3. Blocking Reasons & Entry Gate Checklist
-        BotSurfaceCard {
-            SectionHeader(
-                title = "$selectedSid 入场门槛与拦截原因",
-                subtitle = if (selectedSid in allowedLive) "当前实盘主策略 · 每分钟重评估" else "仅影子回测评估 · 不直接触发实盘买单",
-            )
-            Spacer(Modifier.height(10.dp))
+        BotSurfaceCard(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "$selectedSid 入场门槛与拦截",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                StatusBadge(
+                    text = if (selectedSid in allowedLive) "主实盘 · 1m重估" else "影子回测评估",
+                    containerColor = if (selectedSid in allowedLive) bot.infoSoft else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = if (selectedSid in allowedLive) bot.info else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
 
             val gatesList = BotFormatters.gatesFor(selectedSid)
             FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 gatesList.forEach { (key, label) ->
                     val passed = gatesObj?.optBoolean(key, false) == true
@@ -291,7 +317,7 @@ fun StrategyScreen(
                         color = if (passed) bot.gainSoft else bot.lossSoft,
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
@@ -299,7 +325,7 @@ fun StrategyScreen(
                                 if (passed) Icons.Outlined.CheckCircle else Icons.Outlined.Cancel,
                                 contentDescription = null,
                                 tint = if (passed) bot.gain else bot.loss,
-                                modifier = Modifier.size(13.dp),
+                                modifier = Modifier.size(12.dp),
                             )
                             Text(
                                 text = label,
@@ -312,28 +338,33 @@ fun StrategyScreen(
                 }
             }
 
-            if (reasonsArr != null && reasonsArr.length() > 0) {
-                Spacer(Modifier.height(10.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    for (i in 0 until reasonsArr.length()) {
-                        val code = reasonsArr.optString(i)
-                        if (code.isBlank()) continue
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Icon(
-                                Icons.Outlined.Schedule,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(13.dp),
-                            )
-                            Text(
-                                text = BotFormatters.reasonLabel(code),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+            if (reasonTexts.isNotEmpty()) {
+                Spacer(Modifier.height(7.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = bot.warnSoft.copy(alpha = 0.65f),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(
+                            Icons.Outlined.Schedule,
+                            contentDescription = null,
+                            tint = bot.warn,
+                            modifier = Modifier
+                                .padding(top = 1.dp)
+                                .size(13.dp),
+                        )
+                        Text(
+                            text = reasonTexts.joinToString(" · "),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                 }
             }
@@ -342,7 +373,7 @@ fun StrategyScreen(
                 val adx1h = if (htf.has("adx_1h") && !htf.isNull("adx_1h")) BotFormatters.formatNumber(htf.optDouble("adx_1h").toString(), 1) else "—"
                 val e20_4h = if (htf.has("ema20_4h") && !htf.isNull("ema20_4h")) BotFormatters.formatCryptoPrice(htf.optDouble("ema20_4h").toString()) else "—"
                 val e50_4h = if (htf.has("ema50_4h") && !htf.isNull("ema50_4h")) BotFormatters.formatCryptoPrice(htf.optDouble("ema50_4h").toString()) else "—"
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(6.dp))
                 Surface(
                     shape = RoundedCornerShape(10.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -350,20 +381,34 @@ fun StrategyScreen(
                 ) {
                     Text(
                         text = "多周期基准：1h ADX $adx1h · 4h EMA20 $$e20_4h / EMA50 $$e50_4h",
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                         style = MaterialTheme.typography.labelSmall.tnum(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
         }
 
-        // 4. 5-Factor Weighted Breakdown
-        BotSurfaceCard {
-            SectionHeader(
-                title = "五维决策因子权重",
-                subtitle = "总分 ${BotFormatters.formatNumber(score.toString(), 1)} / 100",
-            )
+        // 4. 5-Factor Weighted Breakdown (Fits completely on the first screen)
+        BotSurfaceCard(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 13.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "五维决策因子权重",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                StatusBadge(
+                    text = "总分 ${BotFormatters.formatNumber(score.toString(), 1, grouping = false)} / 100",
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = scoreAccent,
+                )
+            }
             Spacer(Modifier.height(10.dp))
 
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -375,7 +420,7 @@ fun StrategyScreen(
                         ratio >= 0.4f -> bot.info
                         else -> MaterialTheme.colorScheme.outline
                     }
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -384,9 +429,16 @@ fun StrategyScreen(
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.weight(1f),
                             ) {
                                 Text(spec.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                Text(spec.subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    spec.subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
                             Text(
                                 text = "${BotFormatters.formatNumber(valScore.toString(), 1, grouping = false)} / ${spec.maxWeight.toInt()}",
@@ -409,67 +461,73 @@ fun StrategyScreen(
             }
         }
 
-        // 5. 5m Closed-Bar Features Strip
+        // 5. Below-the-fold Scroll Area: 5m Closed-Bar Snapshot
         if (indicators5m != null && indicators5m.length() > 0) {
-            SectionHeader(title = "5m 策略主周期快照", subtitle = "收盘K线同步校验")
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                MetricBentoTile("5m RSI(6)", BotFormatters.formatNumber(indicators5m.optString("rsi6"), 1), modifier = Modifier.weight(1f))
-                MetricBentoTile("5m RVOL", "${BotFormatters.formatNumber(indicators5m.optString("rvol"), 2)}x", modifier = Modifier.weight(1f))
-                MetricBentoTile("5m ADX", BotFormatters.formatNumber(indicators5m.optString("adx"), 1), modifier = Modifier.weight(1f))
+            BotSurfaceCard(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
+                SectionHeader(title = "5m 策略主周期快照", subtitle = "收盘K线同步校验")
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MetricBentoTile("5m RSI(6)", BotFormatters.formatNumber(indicators5m.optString("rsi6"), 1), modifier = Modifier.weight(1f))
+                    MetricBentoTile("5m RVOL", "${BotFormatters.formatNumber(indicators5m.optString("rvol"), 2)}x", modifier = Modifier.weight(1f))
+                    MetricBentoTile("5m ADX", BotFormatters.formatNumber(indicators5m.optString("adx"), 1), modifier = Modifier.weight(1f))
+                }
             }
         }
 
-        // 6. Recent Signal Decisions Feed
+        // 6. Below-the-fold Scroll Area: Recent Signal Decisions Feed
         if (itemsArr != null && itemsArr.length() > 0) {
-            SectionHeader(title = "近期引擎扫描记录")
             val cap = minOf(6, itemsArr.length())
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (i in 0 until cap) {
-                    val row = itemsArr.optJSONObject(i) ?: continue
-                    val sid = row.optString("strategy_id", "T1")
-                    val rowScore = row.optDouble("score", 0.0)
-                    val rowAccepted = row.optBoolean("accepted", false)
-                    val rowRegime = BotFormatters.regimeLabel(row.optString("regime"))
-                    val ts = row.optLong("signal_time", row.optLong("time", 0L))
-                    Surface(
-                        shape = MaterialTheme.shapes.small,
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                        border = BorderStroke(1.dp, bot.hairline),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
+            BotSurfaceCard(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
+                SectionHeader(title = "近期引擎扫描记录", subtitle = "最近 $cap 条决策审计")
+                Spacer(Modifier.height(8.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (i in 0 until cap) {
+                        val row = itemsArr.optJSONObject(i) ?: continue
+                        val sid = row.optString("strategy_id", "T1")
+                        val rowScore = row.optDouble("score", 0.0)
+                        val rowAccepted = row.optBoolean("accepted", false)
+                        val rowRegime = BotFormatters.regimeLabel(row.optString("regime"))
+                        val ts = row.optLong("signal_time", row.optLong("time", 0L))
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            border = BorderStroke(1.dp, bot.hairline),
+                            modifier = Modifier.fillMaxWidth(),
                         ) {
                             Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                StatusBadge(sid, if (sid in allowedLive) bot.infoSoft else MaterialTheme.colorScheme.surfaceContainerHigh, if (sid in allowedLive) bot.info else MaterialTheme.colorScheme.onSurfaceVariant)
-                                Column {
-                                    Text(
-                                        text = "$rowRegime · ${BotFormatters.formatNumber(rowScore.toString(), 1)} 分",
-                                        style = MaterialTheme.typography.titleSmall.tnum(),
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    Text(
-                                        text = BotFormatters.formatEpoch(ts),
-                                        style = MaterialTheme.typography.labelSmall.tnum(),
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    StatusBadge(sid, if (sid in allowedLive) bot.infoSoft else MaterialTheme.colorScheme.surfaceContainerHigh, if (sid in allowedLive) bot.info else MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Column {
+                                        Text(
+                                            text = "$rowRegime · ${BotFormatters.formatNumber(rowScore.toString(), 1)} 分",
+                                            style = MaterialTheme.typography.titleSmall.tnum(),
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                        Text(
+                                            text = BotFormatters.formatEpoch(ts),
+                                            style = MaterialTheme.typography.labelSmall.tnum(),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
                                 }
+                                StatusBadge(
+                                    text = if (rowAccepted) "已采纳" else "拦截",
+                                    containerColor = if (rowAccepted) bot.gainSoft else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                    contentColor = if (rowAccepted) bot.gain else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
-                            StatusBadge(
-                                text = if (rowAccepted) "已采纳" else "拦截",
-                                containerColor = if (rowAccepted) bot.gainSoft else MaterialTheme.colorScheme.surfaceContainerHigh,
-                                contentColor = if (rowAccepted) bot.gain else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
                         }
                     }
                 }
             }
         }
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
     }
 }

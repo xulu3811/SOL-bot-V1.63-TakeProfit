@@ -209,4 +209,24 @@ class UiSyncHelpersTest {
         assertEquals(1, legacyBars.size)
         assertEquals(80.4, legacyBars[0].close, 1e-6)
     }
+
+    @Test
+    fun mergeFrameOverlaysSystemOverviewWithoutDroppingExistingWhenOmitted() {
+        val initial = mapOf(
+            "system/overview" to JSONObject().put("server", JSONObject().put("ram_pct", 48.8)),
+        )
+        val frameWithoutOverview = JSONObject().put("risk", JSONObject().put("drawdown_pct", "0.10"))
+        val kept = FrameSyncHelper.mergeFrame(initial, frameWithoutOverview)
+        assertEquals(48.8, kept["system/overview"]!!.getJSONObject("server").getDouble("ram_pct"), 1e-6)
+
+        val frameWithOverview = JSONObject().put(
+            "system_overview",
+            JSONObject()
+                .put("server", JSONObject().put("ram_pct", 39.2))
+                .put("bot_modules", JSONObject().put("active_count", 12)),
+        )
+        val updated = FrameSyncHelper.mergeFrame(kept, frameWithOverview)
+        assertEquals(39.2, updated["system/overview"]!!.getJSONObject("server").getDouble("ram_pct"), 1e-6)
+        assertEquals(12, updated["system/overview"]!!.getJSONObject("bot_modules").getInt("active_count"))
+    }
 }

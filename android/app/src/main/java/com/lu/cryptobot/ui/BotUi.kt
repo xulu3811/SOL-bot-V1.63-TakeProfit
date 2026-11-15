@@ -53,10 +53,12 @@ import com.lu.cryptobot.ui.screens.ShadowScreen
 import com.lu.cryptobot.ui.screens.StrategyScreen
 import com.lu.cryptobot.ui.sheets.AlertsInboxSheet
 import com.lu.cryptobot.ui.sheets.BinanceApiSheet
+import com.lu.cryptobot.ui.sheets.CleanCacheConfirmDialog
 import com.lu.cryptobot.ui.sheets.ConnectionSheet
 import com.lu.cryptobot.ui.sheets.CustodyConfirmSheet
 import com.lu.cryptobot.ui.sheets.LiveToggleConfirmSheet
 import com.lu.cryptobot.ui.sheets.OrderDetailSheet
+import com.lu.cryptobot.ui.sheets.ServerLogsSheet
 import com.lu.cryptobot.ui.sheets.TradingConfigSheet
 import com.lu.cryptobot.ui.theme.CryptoBotTheme
 import com.lu.cryptobot.ui.theme.LocalBotColors
@@ -83,6 +85,7 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
     var showAlerts by remember { mutableStateOf(false) }
     var showApiConfig by remember { mutableStateOf(false) }
     var showTradingConfig by remember { mutableStateOf(false) }
+    var showServerLogs by remember { mutableStateOf(false) }
     var pendingLiveToggle by remember { mutableStateOf<Boolean?>(null) }
     var pendingCustody by remember { mutableStateOf<Pair<JSONObject, Boolean>?>(null) }
     var inspectingOrder by remember { mutableStateOf<JSONObject?>(null) }
@@ -238,6 +241,12 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                                 values = state.values,
                                 selectedTimeframe = state.interval,
                                 onSelectTimeframe = { tf -> vm.refreshCandles(tf) },
+                                opsBusy = state.opsBusy,
+                                opsMessage = state.opsMessage,
+                                onOptimizeMemory = { vm.optimizeServerMemory() },
+                                onRequestCleanCache = { vm.previewCleanServerCache() },
+                                onOpenServerLogs = { showServerLogs = true },
+                                onDismissOpsMessage = { vm.clearOpsMessage() },
                                 modifier = Modifier.fillMaxSize(),
                             )
                             "strategy" -> StrategyScreen(
@@ -420,6 +429,23 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
             OrderDetailSheet(
                 order = ord,
                 onDismiss = { inspectingOrder = null },
+            )
+        }
+
+        if (showServerLogs) {
+            ServerLogsSheet(
+                logs = state.systemLogs,
+                busy = state.logsBusy,
+                onFetchLogs = { source, onlyAlerts -> vm.loadSystemLogs(source, onlyAlerts) },
+                onDismiss = { showServerLogs = false },
+            )
+        }
+
+        state.cleanPreview?.let { preview ->
+            CleanCacheConfirmDialog(
+                preview = preview,
+                onConfirm = { vm.executeCleanServerCache() },
+                onDismiss = { vm.dismissCleanPreview() },
             )
         }
     }

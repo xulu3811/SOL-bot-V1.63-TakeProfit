@@ -1,10 +1,10 @@
 """Durable user-visible FCM reminders; never an order-control dependency."""
 from pathlib import Path
 from contextlib import closing,contextmanager
-import json,sqlite3,time,re,hashlib,base64,urllib.request,urllib.error,stat
+import json,sqlite3,time,re,hashlib,base64,urllib.request,urllib.error,stat,ipaddress,os
 
-KINDS={'STRATEGY_SIGNAL':'策略信号','SIMULATED_TRADE':'模拟交易','LIVE_ORDER':'实盘订单更新','BUY_FILL':'买入成交','STOP_LOSS':'止损状态更新','APTS_EXIT':'APTS止盈更新','HARD_LOCK':'5%风险硬锁','RECONCILIATION_FAILED':'账户对账异常','SERVER_ERROR':'服务器异常','PROTECTION_ERROR':'保护订单异常','MARKET_SYNC':'行情更新'}
-HIGH={'LIVE_ORDER','BUY_FILL','STOP_LOSS','APTS_EXIT','HARD_LOCK','RECONCILIATION_FAILED','SERVER_ERROR','PROTECTION_ERROR'}
+KINDS={'STRATEGY_SIGNAL':'策略信号','SIMULATED_TRADE':'模拟交易','LIVE_ORDER':'实盘订单更新','BUY_FILL':'买入成交','STOP_LOSS':'止损状态更新','APTS_EXIT':'APTS止盈更新','HARD_LOCK':'5%风险硬锁','RECONCILIATION_FAILED':'账户对账异常','SERVER_ERROR':'服务器异常','PROTECTION_ERROR':'保护订单异常','MARKET_SYNC':'行情更新','SECURITY_ALERT':'异常设备访问预警'}
+HIGH={'LIVE_ORDER','BUY_FILL','STOP_LOSS','APTS_EXIT','HARD_LOCK','RECONCILIATION_FAILED','SERVER_ERROR','PROTECTION_ERROR','SECURITY_ALERT'}
 def now():return time.time_ns()//1000000
 
 def _describe_event(kind,symbol,details):
@@ -34,12 +34,38 @@ def _describe_event(kind,symbol,details):
         route='live'
     elif kind=='SIMULATED_TRADE':
         body=f'{prefix} 影子沙盒模拟单已成交'
+        route='live' if strat=='R2' else 'shadow'
         route='shadow'
     elif kind=='HARD_LOCK':
         body=f'{sym} 触发 5% 日内风控硬锁，已暂停新开仓'
         route='live'
     elif kind=='RECONCILIATION_FAILED':
         body=f'{sym} 账户对账异常，请检查实盘持仓与挂单'
+        route='live'
+    elif kind=='SECURITY_ALERT':
+        channel=det.get('security_channel') or 'HTTPS_API'
+        code=det.get('security_code') or 'UNAUTHORIZED_DEVICE'
+        src_ip=det.get('source_ip') or '未知IP'
+        if code=='SSH_DESKTOP_LOGIN':
+            title=f'{sym} · 授权电脑SSH登录提醒'
+            body=f'台式电脑 Seth 已通过专属密钥登录服务器 SSH（VPN IP: {src_ip}）'
+        elif channel=='SSH':
+            code_cn={
+                'SSH_AUTH_FAILED':'检测到非授权设备尝试SSH登录并已拒绝',
+                'SSH_BANNED':'检测到异常IP高频扫描SSH并已被防火墙封禁',
+            }.get(code,'检测到异常SSH访问尝试并已拦截')
+            title=f'{sym} · 异常SSH设备拦截预警'
+            body=f'{code_cn}（来源IP: {src_ip}），服务器仅允许台式电脑 Seth 密钥访问'
+        else:
+            code_cn={
+                'UNAUTHORIZED_DEVICE':'非授权设备尝试访问App接口已被拒绝',
+                'PAIRING_BLOCKED':'非授权设备尝试配对绑定已被强制阻断',
+                'INVALID_SIGNATURE':'设备硬件签名校验失败已被拦截',
+                'REPLAY_BLOCKED':'检测到重放请求攻击已被拦截',
+                'RATE_LIMITED':'检测到异常高频请求已被限流拦截',
+            }.get(code,'检测到非授权设备访问App接口并已拦截')
+            title=f'{sym} · 异常设备访问强预警'
+            body=f'{code_cn}（来源IP: {src_ip}），仅允许三星 S24+ (SM-S926U1) 访问'
         route='live'
     else:
         body=f'{sym} {base_title}，请打开应用查看最新状态'
@@ -80,9 +106,20 @@ class NotificationStore:
         if not isinstance(event_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}',event_id):raise ValueError('invalid event ID')
         # Do not permit arbitrary server errors, account records or credentials in a push.
         safe={}
-        for key,allowed in {'mode':{'SIMULATED','LIVE'},'strategy':{'T1','R1','T2','R2'},'status':{'NEW','FILLED','PARTIALLY_FILLED','CANCELED','EXPIRED','CLOSED','UNKNOWN','PAUSED','LIVE_OFF','HARD_LOCKED'}}.items():
+        for key,allowed in {
+            'mode':{'SIMULATED','LIVE'},
+            'strategy':{'T1','R1','T2','R2'},
+            'status':{'NEW','FILLED','PARTIALLY_FILLED','CANCELED','EXPIRED','CLOSED','UNKNOWN','PAUSED','LIVE_OFF','HARD_LOCKED'},
+            'security_channel':{'HTTPS_API','SSH','FIREWALL'},
+            'security_code':{'UNAUTHORIZED_DEVICE','PAIRING_BLOCKED','INVALID_SIGNATURE','REPLAY_BLOCKED','RATE_LIMITED','SSH_AUTH_FAILED','SSH_BANNED','SSH_DESKTOP_LOGIN'},
+            'device_model':{'SM-S926U1','Seth','UNKNOWN'},
+        }.items():
             value=(details or {}).get(key)
             if value in allowed:safe[key]=value
+        raw_ip=(details or {}).get('source_ip')
+        if isinstance(raw_ip,str) and 3<=len(raw_ip)<=45:
+            try:safe['source_ip']=str(ipaddress.ip_address(raw_ip.strip()))
+            except ValueError:pass
         body=json.dumps(safe,sort_keys=True)
         with self.tx() as db:
             old=db.execute('SELECT kind,symbol,created_at,details FROM notification_events WHERE event_id=?',(event_id,)).fetchone()
@@ -92,6 +129,21 @@ class NotificationStore:
             db.execute('INSERT INTO notification_events(event_id,kind,symbol,created_at,details) VALUES(?,?,?,?,?)',(event_id,kind,symbol,at,body))
             db.execute("INSERT INTO notification_delivery SELECT ?,device_id,'PENDING',0,0 FROM notification_tokens WHERE active=1",(event_id,))
         return True
+    def publish_security_alert(self,channel,code,source_ip=None,device_model=None,cooldown_ms=300000):
+        at=int(self.clock())
+        bucket=at//max(1000,int(cooldown_ms))
+        ip_str=''
+        if isinstance(source_ip,str):
+            try:ip_str=str(ipaddress.ip_address(source_ip.strip()))
+            except ValueError:ip_str=''
+        ident='sec:'+hashlib.sha256(f'{channel}:{code}:{ip_str}:{bucket}'.encode()).hexdigest()[:32]
+        details={'security_channel':channel,'security_code':code}
+        if ip_str:details['source_ip']=ip_str
+        if device_model in ('SM-S926U1','Seth','UNKNOWN'):details['device_model']=device_model
+        with self.tx() as db:
+            if db.execute('SELECT 1 FROM notification_events WHERE event_id=?',(ident,)).fetchone():
+                return False
+        return self.publish(ident,'SECURITY_ALERT','SOLUSDT',at,details)
     def alerts(self,after=0,limit=50):
         if type(after)is not int or after<0 or type(limit)is not int or not 1<=limit<=500:raise ValueError('invalid pagination')
         with self.tx() as db:rows=[dict(r) for r in db.execute('SELECT * FROM notification_events WHERE sequence>? ORDER BY sequence LIMIT ?',(after,limit))]
@@ -234,10 +286,12 @@ class SourceEventCollector:
                     else:event_kind=None
                 if event_kind:
                     identity='source:'+hashlib.sha256((source+':'+table+':'+str(row['source_sequence'])).encode()).hexdigest()
-                    self.store.publish(identity,event_kind,symbol,at,details)
+                    try:self.store.publish(identity,event_kind,symbol,at,details)
+                    except ValueError:pass
                 with self.store.tx() as db:db.execute('INSERT INTO notification_source_cursors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor',(source+':'+table,row['source_sequence']))
             counts[source]=len(rows)
         counts['binance_vault']=self._poll_bot_orders()
+        counts['ssh_security']=self._poll_ssh_security_logs()
         # Current hard lock is a persistent condition, not permission to clear it.
         live=self.reader.live_status()
         with self.store.tx() as db:
@@ -267,7 +321,10 @@ class SourceEventCollector:
             elif status=='CLOSED':at=int(row.get('closed_at') or row.get('stop_updated_at') or row.get('filled_at') or row.get('created_at') or 0)
             else:at=int(row.get('created_at') or 0)
             details={'mode':'LIVE','strategy':row.get('strategy_id') or 'T1','status':status}
-            if self.store.publish(identity,event_kind,'SOLUSDT',at or self.store.clock(),details):emitted+=1
+            try:
+                if self.store.publish(identity,event_kind,'SOLUSDT',at or self.store.clock(),details):emitted+=1
+            except ValueError:
+                pass
         try:
             prot_rows=self.reader.read('binance_vault',"SELECT p.status,p.exchange_order_id,p.placed_at,p.updated_at,COALESCE(c.stage,'S0') AS stage FROM protections p LEFT JOIN custody_apts c USING(intent_id) WHERE p.intent_id='manual:SOL'",())
         except (sqlite3.Error,OSError,KeyError,TypeError):
@@ -282,7 +339,43 @@ class SourceEventCollector:
             if not ex_id or p_status not in ('OPEN','CLOSED'):continue
             p_kind='STOP_LOSS' if p_status=='OPEN' else 'APTS_EXIT'
             p_ident='mprot:'+hashlib.sha256(f'{ex_id}:{p_status}:{stage}'.encode()).hexdigest()[:32]
-            p_at=int(pr.get('updated_at') or pr.get('placed_at') or self.store.clock())
+            p_at=int(pr.get('placed_at') or pr.get('updated_at') or self.store.clock())
             p_details={'mode':'LIVE','status':'FILLED' if p_status=='OPEN' else 'CLOSED'}
-            if self.store.publish(p_ident,p_kind,'SOLUSDT',p_at,p_details):emitted+=1
+            try:
+                if self.store.publish(p_ident,p_kind,'SOLUSDT',p_at,p_details):emitted+=1
+            except ValueError:
+                pass
+        return emitted
+    def _poll_ssh_security_logs(self):
+        emitted=0
+        f2b_path=Path(os.environ.get('SOLBOT_FAIL2BAN_LOG','/var/log/fail2ban.log'))
+        auth_path=Path(os.environ.get('SOLBOT_AUTH_LOG','/var/log/auth.log'))
+        for key,path in (('log:fail2ban',f2b_path),('log:auth',auth_path)):
+            try:
+                if not path.is_file():continue
+                size=path.stat().st_size
+            except OSError:
+                continue
+            with self.store.tx() as db:
+                row=db.execute('SELECT cursor FROM notification_source_cursors WHERE source=?',(key,)).fetchone()
+            if row is None:
+                with self.store.tx() as db:
+                    db.execute('INSERT INTO notification_source_cursors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor',(key,size))
+                continue
+            offset=int(row[0])
+            if size<offset:offset=0
+            if size==offset:continue
+            try:
+                with path.open('rb') as fh:
+                    fh.seek(max(0,size-65536) if size-offset>65536 else offset)
+                    chunk=fh.read(65536).decode('utf-8',errors='ignore')
+            except OSError:
+                continue
+            for line in chunk.splitlines():
+                if key=='log:auth':
+                    m_fail=re.search(r'sshd(?:-session)?\[\d+\]:\s+(?:Failed publickey|Failed password)\s+for\s+(?:ubuntu|root)\s+from\s+([0-9a-fA-F.:]+)\s+port',line)
+                    if m_fail and self.store.publish_security_alert('SSH','SSH_AUTH_FAILED',source_ip=m_fail.group(1),device_model='UNKNOWN',cooldown_ms=600000):
+                        emitted+=1
+            with self.store.tx() as db:
+                db.execute('INSERT INTO notification_source_cursors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor',(key,size))
         return emitted

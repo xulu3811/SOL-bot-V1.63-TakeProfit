@@ -1,0 +1,25 @@
+[Unit]
+Description=SOL-bot whitelisted local ops & observability agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/sol-bot/p5
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sol-bot/venv/bin/python -m solbot.ops.agent --socket /run/solbot-ops/ops.sock --client-user solbot-app
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=solbot-ops
+RuntimeDirectoryMode=0755
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectHome=true
+MemoryMax=64M
+CPUQuota=10%
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

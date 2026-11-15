@@ -191,5 +191,25 @@ class NotificationsTests(unittest.TestCase):
         self.assertEqual((closed_alert['kind'],closed_alert['details'].get('status'),closed_alert['created_at']),('APTS_EXIT','CLOSED',self.now+5000))
         kinds=[(i['kind'],i['details'].get('status')) for i in self.store.alerts()['items'][-2:]]
         self.assertEqual(kinds,[('BUY_FILL','FILLED'),('APTS_EXIT','CLOSED')])
+    def test_security_alert_and_ssh_log_polling(self):
+        import os
+        self.store.register('s24',self.token)
+        self.assertTrue(self.store.publish_security_alert('HTTPS_API','UNAUTHORIZED_DEVICE',source_ip='203.0.113.99',device_model='UNKNOWN'))
+        self.assertFalse(self.store.publish_security_alert('HTTPS_API','UNAUTHORIZED_DEVICE',source_ip='203.0.113.99',device_model='UNKNOWN'))
+        alerts=self.store.alerts()['items']
+        self.assertEqual(alerts[-1]['kind'],'SECURITY_ALERT')
+        self.assertEqual(alerts[-1]['severity'],'HIGH')
+        self.assertIn('203.0.113.99',alerts[-1]['message'])
+        f2b=self.root/'fail2ban.log';auth_log=self.root/'auth.log'
+        f2b.write_text('init\n',encoding='utf-8');auth_log.write_text('init\n',encoding='utf-8')
+        os.environ['SOLBOT_FAIL2BAN_LOG']=str(f2b);os.environ['SOLBOT_AUTH_LOG']=str(auth_log)
+        try:
+            collector=SourceEventCollector(DataReader({},clock=lambda:self.now),self.store)
+            self.assertEqual(collector.poll()['ssh_security'],0)
+            f2b.write_text('init\n2026-11-15 13:40:00 fail2ban.actions [5228]: NOTICE [sshd] Ban 198.51.100.77\n',encoding='utf-8')
+            auth_log.write_text('init\n2026-11-15T13:40:01+08:00 localhost sshd-session[99]: Failed publickey for ubuntu from 198.51.100.88 port 44321 ssh2\n',encoding='utf-8')
+            self.assertEqual(collector.poll()['ssh_security'],1)
+        finally:
+            os.environ.pop('SOLBOT_FAIL2BAN_LOG',None);os.environ.pop('SOLBOT_AUTH_LOG',None)
 
 if __name__=='__main__':unittest.main()

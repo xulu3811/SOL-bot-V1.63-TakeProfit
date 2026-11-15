@@ -163,5 +163,21 @@ class AppBoundaryQA(unittest.TestCase):
         with self.fixture.store.tx() as db:
             count=db.execute("SELECT COUNT(*) FROM control_requests WHERE action='disable'").fetchone()[0]
         self.assertEqual(count,1)
+    def test_unauthorized_device_rejected_and_emits_security_alert(self):
+        from solbot.app_api.auth import pubkey_sha256
+        pem=self.fixture.key.public_key().public_bytes(serialization.Encoding.PEM,serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        self.fixture.store.allowed_device_ids=frozenset({self.fixture.session['device_id']})
+        self.fixture.store.allowed_device_models=frozenset({'qa'})
+        self.fixture.store.allowed_pubkey_sha256s=frozenset({pubkey_sha256(pem)})
+        self.fixture.store.pairing_locked=True
+        self.assertEqual(self.request('GET','/api/v1/app/status').status_code,200)
+        rogue_key=ec.generate_private_key(ec.SECP256R1())
+        rogue_body=json.dumps({'public_key_pem':rogue_key.public_key().public_bytes(serialization.Encoding.PEM,serialization.PublicFormat.SubjectPublicKeyInfo).decode(),'device_passphrase':'secret123','device_name':'RoguePhone'}).encode()
+        rogue_headers=self.fixture.sign('POST','/api/v1/app/devices/pair',rogue_body,key=rogue_key)
+        rogue_headers['x-forwarded-for']='198.51.100.42'
+        res=self.client.post('/api/v1/app/devices/pair',content=rogue_body,headers=rogue_headers)
+        self.assertEqual(res.status_code,401)
+        alerts=self.client.get('/api/v1/app/alerts',headers=self.fixture.sign('GET','/api/v1/app/alerts',b'',session=self.fixture.session)).json()['items']
+        self.assertTrue(any(a['kind']=='SECURITY_ALERT' and a['details'].get('source_ip')=='198.51.100.42' for a in alerts))
 
 if __name__=='__main__':unittest.main()

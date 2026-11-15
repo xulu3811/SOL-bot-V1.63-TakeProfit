@@ -6,12 +6,17 @@ After=network.target
 Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
 User=solbot-app
 Group=solbot-app
-SupplementaryGroups=solbot
+SupplementaryGroups=solbot adm
 WorkingDirectory=/opt/sol-bot/p5
 Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=SOLBOT_LIVE_STRATEGIES=T1,T2,R2
 Environment=SOLBOT_FCM_CREDENTIALS=/etc/sol-bot/secrets/firebase-adminsdk.json
+# Optional device binding allowlist (configure on production host if pairing lock is enabled):
+# Environment=SOLBOT_ALLOWED_DEVICE_IDS=<your-device-id>
+# Environment=SOLBOT_ALLOWED_DEVICE_MODELS=<your-device-model>
+# Environment=SOLBOT_ALLOWED_PUBKEY_SHA256S=<your-pubkey-sha256>
+# Environment=SOLBOT_PAIRING_LOCKED=true
 ExecStart=/opt/sol-bot/venv/bin/python -m solbot.app_api.application --state-dir /var/lib/sol-bot-app --port 8016 --require-enrollment
 Restart=on-failure
 RestartSec=15
@@ -22,8 +27,8 @@ PrivateDevices=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET
-ReadWritePaths=/var/lib/sol-bot-app /var/lib/sol-bot/shared
-ReadOnlyPaths=/opt/sol-bot/p5 /var/lib/sol-bot/database /var/lib/sol-bot-execution /var/lib/sol-bot/r2
+ReadWritePaths=/var/lib/sol-bot-app /var/lib/sol-bot/shared /run/solbot-ops
+ReadOnlyPaths=/opt/sol-bot/p5 /var/lib/sol-bot/database /var/lib/sol-bot-execution /var/lib/sol-bot/r2 /var/log
 MemoryMax=256M
 CPUQuota=20%
 UMask=0027

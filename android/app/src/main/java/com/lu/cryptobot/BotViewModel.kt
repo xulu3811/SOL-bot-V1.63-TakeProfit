@@ -17,6 +17,11 @@ data class ScreenState(
     val alertsSeenAt: Long = 0L,
     val deviceId: String = "",
     val baseUrl: String = "https://43.163.192.120/",
+    val opsBusy: Boolean = false,
+    val opsMessage: String? = null,
+    val cleanPreview: JSONObject? = null,
+    val systemLogs: JSONObject? = null,
+    val logsBusy: Boolean = false,
 )
 
 internal object FrameSyncHelper {
@@ -97,6 +102,7 @@ internal object FrameSyncHelper {
         frame.optJSONObject("shadow_status")?.let { if (it.length() > 0) map["shadow/status"] = JSONObject(it.toString()) }
         frame.optJSONObject("shadow_orders")?.let { if (it.length() > 0) map["shadow/orders"] = JSONObject(it.toString()) }
         frame.optJSONObject("trading_config")?.let { if (it.length() > 0) map["trading/config"] = JSONObject(it.toString()) }
+        frame.optJSONObject("system_overview")?.let { if (it.length() > 0) map["system/overview"] = JSONObject(it.toString()) }
         frame.optJSONObject("markets")?.let { summary -> map["markets"] = overlayMarket(map["markets"], summary) }
         frame.optJSONObject("strategies")?.let { summary ->
             val skip = if (summary.has("items")) emptySet() else setOf("items")
@@ -163,7 +169,7 @@ internal object FrameSyncHelper {
     private suspend fun syncAllSilently(interval: String = mutable.value.interval) {
         val map = mutable.value.values.toMutableMap()
         val currentInterval = interval
-        for (path in listOf("status", "markets?symbol=SOLUSDT&timeframe=$currentInterval", "strategies?symbol=SOLUSDT", "live/status", "live/orders", "live/positions", "live/risk", "binance/account", "trading/config", "shadow/status", "shadow/orders")) {
+        for (path in listOf("status", "markets?symbol=SOLUSDT&timeframe=$currentInterval", "strategies?symbol=SOLUSDT", "live/status", "live/orders", "live/positions", "live/risk", "binance/account", "trading/config", "shadow/status", "shadow/orders", "system/overview")) {
             try {
                 val key = path.substringBefore('?')
                 val fetched = repository.get(path)
@@ -323,5 +329,94 @@ internal object FrameSyncHelper {
         "STOP_LOCKING_SOL" -> "止损已挂上，SOL 已被锁定。"
         else -> (error.message ?: "保存失败").take(180)
     }
+    fun refreshSystemOverview() {
+        viewModelScope.launch {
+            runCatching { repository.get("system/overview") }.onSuccess { doc ->
+                mutable.value = mutable.value.copy(values = mutable.value.values + ("system/overview" to doc))
+            }
+        }
+    }
+
+    fun optimizeServerMemory() {
+        viewModelScope.launch {
+            mutable.value = mutable.value.copy(opsBusy = true, opsMessage = null)
+            try {
+                val res = repository.post("system/optimize-memory", JSONObject())
+                val msg = res.optString("message").ifBlank {
+                    if (res.optBoolean("ok", false)) "内存优化完成" else "内存优化未执行"
+                }
+                mutable.value = mutable.value.copy(opsMessage = msg)
+                refreshSystemOverview()
+            } catch (error: Exception) {
+                mutable.value = mutable.value.copy(opsMessage = "内存优化失败：${(error.message ?: "网络异常").take(80)}")
+            } finally {
+                mutable.value = mutable.value.copy(opsBusy = false)
+            }
+        }
+    }
+
+    fun previewCleanServerCache() {
+        viewModelScope.launch {
+            mutable.value = mutable.value.copy(opsBusy = true, opsMessage = null)
+            try {
+                val res = repository.post("system/clean-cache", JSONObject().put("dry_run", true))
+                mutable.value = mutable.value.copy(cleanPreview = res)
+            } catch (error: Exception) {
+                mutable.value = mutable.value.copy(opsMessage = "扫描缓存失败：${(error.message ?: "网络异常").take(80)}")
+            } finally {
+                mutable.value = mutable.value.copy(opsBusy = false)
+            }
+        }
+    }
+
+    fun executeCleanServerCache() {
+        viewModelScope.launch {
+            mutable.value = mutable.value.copy(opsBusy = true, cleanPreview = null, opsMessage = null)
+            try {
+                val res = repository.post("system/clean-cache", JSONObject().put("dry_run", false))
+                val freedMb = res.optDouble("total_freed_mb", 0.0)
+                val diskAfter = res.optDouble("disk_after_pct", 0.0)
+                val msg = if (res.optBoolean("ok", false)) {
+                    "清理完成：释放 ${String.format("%.1f", freedMb)} MB（磁盘 ${String.format("%.1f", diskAfter)}%）"
+                } else {
+                    res.optString("message", "清理未执行")
+                }
+                mutable.value = mutable.value.copy(opsMessage = msg)
+                refreshSystemOverview()
+            } catch (error: Exception) {
+                mutable.value = mutable.value.copy(opsMessage = "清理失败：${(error.message ?: "网络异常").take(80)}")
+            } finally {
+                mutable.value = mutable.value.copy(opsBusy = false)
+            }
+        }
+    }
+
+    fun dismissCleanPreview() {
+        mutable.value = mutable.value.copy(cleanPreview = null)
+    }
+
+    fun clearOpsMessage() {
+        mutable.value = mutable.value.copy(opsMessage = null)
+    }
+
+    fun loadSystemLogs(source: String = "auth", onlyAlerts: Boolean = false) {
+        viewModelScope.launch {
+            mutable.value = mutable.value.copy(logsBusy = true)
+            try {
+                val res = repository.get("system/logs?source=$source&only_alerts=$onlyAlerts&limit=80")
+                mutable.value = mutable.value.copy(systemLogs = res)
+            } catch (error: Exception) {
+                mutable.value = mutable.value.copy(
+                    systemLogs = JSONObject()
+                        .put("ok", false)
+                        .put("source", source)
+                        .put("error", (error.message ?: "读取日志失败").take(100))
+                )
+            } finally {
+                mutable.value = mutable.value.copy(logsBusy = false)
+            }
+        }
+    }
+
     fun revoke() { execute { repository.revokeSelf();BotConnectionService.stop(app);mutable.value=ScreenState() } }
 }

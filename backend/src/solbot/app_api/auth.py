@@ -9,11 +9,19 @@ class AuthError(PermissionError): pass
 def canonical(method,path,body,timestamp,nonce,request_id):
     return '\n'.join((method.upper(),path,hashlib.sha256(body).hexdigest(),str(timestamp),nonce,request_id)).encode()
 def hashed(value): return hashlib.sha256(value.encode()).hexdigest()
+def pubkey_sha256(pem):
+    key=AuthStore.public_key(pem)
+    der=key.public_bytes(serialization.Encoding.DER,serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
 
 class AuthStore:
-    def __init__(self,path,clock=None,enrollment_sha256=None):
+    def __init__(self,path,clock=None,enrollment_sha256=None,*,allowed_device_ids=None,allowed_device_models=None,allowed_pubkey_sha256s=None,pairing_locked=False):
         self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True);self.clock=clock or (lambda:time.time_ns()//1000000)
         self.enrollment=enrollment_sha256.strip() if isinstance(enrollment_sha256,str) and enrollment_sha256.strip() else None
+        self.allowed_device_ids=frozenset(x.strip() for x in allowed_device_ids if x and x.strip()) if allowed_device_ids else None
+        self.allowed_device_models=frozenset(x.strip() for x in allowed_device_models if x and x.strip()) if allowed_device_models else None
+        self.allowed_pubkey_sha256s=frozenset(x.strip().lower() for x in allowed_pubkey_sha256s if x and x.strip()) if allowed_pubkey_sha256s else None
+        self.pairing_locked=bool(pairing_locked)
         with self.tx() as db:
             tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if tables and 'app_auth_meta' not in tables: raise ValueError('foreign authentication database')
@@ -68,11 +76,21 @@ class AuthStore:
         token=secrets.token_urlsafe(32)
         db.execute('INSERT INTO sessions VALUES(?,?,?,0)',(hashed(token),device,0))
         return {'device_id':device,'session_token':token,'expires_at':0,'permanent':True}
+    def _check_device_allowlist(self,device_id=None,device_name=None,pem=None):
+        if device_id is not None and self.allowed_device_ids and device_id not in self.allowed_device_ids:
+            raise AuthError('UNAUTHORIZED_DEVICE')
+        if device_name is not None and self.allowed_device_models and device_name not in self.allowed_device_models:
+            raise AuthError('UNAUTHORIZED_DEVICE')
+        if pem is not None and self.allowed_pubkey_sha256s and pubkey_sha256(pem) not in self.allowed_pubkey_sha256s:
+            raise AuthError('UNAUTHORIZED_DEVICE')
     def pair(self,body,headers,*,path='/api/v1/app/devices/pair'):
-        value=json.loads(body);key=self.public_key(value['public_key_pem'])
+        if self.pairing_locked:
+            raise AuthError('PAIRING_LOCKED')
+        value=json.loads(body);pem=value['public_key_pem'];key=self.public_key(pem)
         nonce,rid=self._proof(key,'POST',path,body,headers)
         secret=value.get('device_passphrase');name=value.get('device_name','Android')
         if not isinstance(secret,str) or not 4<=len(secret)<=128 or not isinstance(name,str) or len(name)>80:raise AuthError('INVALID_PASSPHRASE')
+        self._check_device_allowlist(device_name=name,pem=pem)
         if self.enrollment and hashed(secret)!=self.enrollment:raise AuthError('PASSPHRASE_REJECTED')
         fingerprint=hashed(secret)
         with self.tx() as db:
@@ -81,32 +99,39 @@ class AuthStore:
             if bound:
                 db.execute('UPDATE sessions SET revoked=1 WHERE device_id=?',(bound[0],))
                 db.execute('DELETE FROM devices WHERE id=?',(bound[0],))
-            device=secrets.token_hex(16)
-            try:db.execute('INSERT INTO devices VALUES(?,?,?,?,0,?,?)',(device,value['public_key_pem'],name,'operator',self.clock(),fingerprint))
+            device=bound[0] if (bound and self.allowed_device_ids and bound[0] in self.allowed_device_ids) else secrets.token_hex(16)
+            self._check_device_allowlist(device_id=device,device_name=name,pem=pem)
+            try:db.execute('INSERT INTO devices VALUES(?,?,?,?,0,?,?)',(device,pem,name,'operator',self.clock(),fingerprint))
             except sqlite3.IntegrityError:raise AuthError('DEVICE_ALREADY_PAIRED') from None
             db.execute('INSERT INTO auth_audit(device_id,action,result,created_at) VALUES(?,?,?,?)',(device,'PAIR','PERMANENT',self.clock()))
             return self._session(db,device)
     def authenticate(self,method,path,body,headers):
         h={k.lower():v for k,v in headers.items()};device=h.get('x-device-id','')
         if not re.fullmatch(r'[0-9a-f]{32}',device):raise AuthError('UNAUTHENTICATED')
+        self._check_device_allowlist(device_id=device)
         self.rate('device:'+device)
         token=h.get('authorization','')
         if not token.startswith('Bearer ') or len(token)>200:raise AuthError('UNAUTHENTICATED')
         with self.tx() as db:
-            row=db.execute('SELECT public_key,role,revoked FROM devices WHERE id=?',(device,)).fetchone()
+            row=db.execute('SELECT public_key,role,revoked,name FROM devices WHERE id=?',(device,)).fetchone()
             session=db.execute('SELECT device_id,expires_at,revoked FROM sessions WHERE hash=?',(hashed(token[7:]),)).fetchone()
             if not row or row[2] or not session or session[0]!=device or session[2] or (session[1] and session[1]<=self.clock()):raise AuthError('SESSION_EXPIRED_OR_REVOKED')
+            self._check_device_allowlist(device_id=device,device_name=row[3],pem=row[0])
             nonce,rid=self._proof(self.public_key(row[0]),method,path,body,h);self._consume(db,device,nonce,rid)
             db.execute('INSERT INTO auth_audit(device_id,action,result,created_at) VALUES(?,?,?,?)',(device,method+' '+path.split('?')[0],'AUTHENTICATED',self.clock()))
             return {'device_id':device,'role':row[1],'request_id':rid}
     def active(self,device):
+        if self.allowed_device_ids and device not in self.allowed_device_ids:return False
         with self.tx() as db:return db.execute('SELECT 1 FROM devices WHERE id=? AND revoked=0',(device,)).fetchone() is not None
     def renew(self,principal):
+        self._check_device_allowlist(device_id=principal['device_id'])
         with self.tx() as db:
             if not db.execute('SELECT 1 FROM devices WHERE id=? AND revoked=0',(principal['device_id'],)).fetchone():raise AuthError('REVOKED')
             db.execute('UPDATE sessions SET revoked=1 WHERE device_id=?',(principal['device_id'],))
             return self._session(db,principal['device_id'])
     def challenge(self,device):
+        if not isinstance(device,str) or not re.fullmatch(r'[0-9a-f]{32}',device):raise AuthError('UNAUTHENTICATED')
+        self._check_device_allowlist(device_id=device)
         token=secrets.token_urlsafe(32)
         with self.tx() as db:
             db.execute('DELETE FROM challenges WHERE expires_at<?',(self.clock(),))
@@ -114,10 +139,12 @@ class AuthStore:
         return {'challenge':token,'expires_at':self.clock()+30000}
     def open_session(self,body,headers):
         value=json.loads(body);device=value['device_id']
+        self._check_device_allowlist(device_id=device)
         with self.tx() as db:
-            row=db.execute('SELECT public_key,revoked FROM devices WHERE id=?',(device,)).fetchone()
+            row=db.execute('SELECT public_key,revoked,name FROM devices WHERE id=?',(device,)).fetchone()
             challenge=db.execute('SELECT device_id,expires_at,used FROM challenges WHERE hash=?',(hashed(value['challenge']),)).fetchone()
             if not row or row[1] or not challenge or challenge[0]!=device or challenge[1]<=self.clock() or challenge[2]:raise AuthError('CHALLENGE_REJECTED')
+            self._check_device_allowlist(device_id=device,device_name=row[2],pem=row[0])
             nonce,rid=self._proof(self.public_key(row[0]),'POST','/api/v1/app/session/open',body,headers);self._consume(db,device,nonce,rid)
             db.execute('UPDATE challenges SET used=1 WHERE hash=?',(hashed(value['challenge']),))
             return self._session(db,device)
