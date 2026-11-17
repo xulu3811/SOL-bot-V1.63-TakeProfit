@@ -356,11 +356,15 @@ class BinanceAccountInputTests(unittest.TestCase):
         self.assertEqual(s_throttled['bot_stops']['actions'][0]['status'], 'STOP_RESTING')
         self.assertEqual(sum(1 for _, p, _ in transport.calls if p == '/api/v3/order/cancelReplace'), cr_before)
 
-        # Stage jump to S1 (+1.2% >= 1.0%) atomically replaces via /api/v3/order/cancelReplace
-        s_raised = step(vault, now=1800000005000, bid=Decimal('101.30'), evidence=ev, tick=Decimal('0.01'))
+        # Stage jump to S1 (+1.0% >= +0.8%) atomically replaces via /api/v3/order/cancelReplace
+        s_raised = step(vault, now=1800000005000, bid=Decimal('101.00'), evidence=ev, tick=Decimal('0.01'))
         self.assertEqual(s_raised['bot_stops']['actions'][0]['status'], 'TRAIL_RAISED')
         self.assertEqual(s_raised['bot_stops']['actions'][0]['stage'], 'S1')
         self.assertEqual(sum(1 for _, p, _ in transport.calls if p == '/api/v3/order/cancelReplace'), cr_before + 1)
+
+        # Stage jump to S2 (> +1.2%) advances stage to S2 and replaces via /api/v3/order/cancelReplace
+        s2_raised = step(vault, now=1800000007000, bid=Decimal('101.30'), evidence=ev, tick=Decimal('0.01'))
+        self.assertEqual(s2_raised['bot_stops']['actions'][0]['stage'], 'S2')
 
     def test_exit_pending_timeout_escalates_to_market_sell_for_manual_and_bot(self):
         transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), sol_free='1.0', sol_locked='0')
@@ -495,12 +499,12 @@ class BinanceAccountInputTests(unittest.TestCase):
             chased = vault.consider_entry(reader, Decimal('82.95'), Decimal('0.01'), 1800000000000, ask=Decimal('82.97'))
             self.assertEqual(chased['reason'], 'CHASE_EXCEEDED')
 
-            # Inside band: uses ask price (min(entry_high, ask) = 82.85), R2 dynamic sizing ($500-$1000), stores strategy_id & expires_at
+            # Inside band: uses buffered ask price capped by entry_high (min(entry_high, ceil_step(ask*1.0005)) = 82.90), R2 dynamic sizing ($500-$1000), stores strategy_id & expires_at
             placed = vault.consider_entry(reader, Decimal('82.80'), Decimal('0.01'), 1800000000000, ask=Decimal('82.85'))
             self.assertTrue(placed['placed'])
             self.assertEqual(placed['strategy_id'], 'R2')
-            self.assertEqual(placed['price'], '82.85')
-            self.assertEqual(Decimal(placed['quantity']), Decimal('7.724'))
+            self.assertEqual(placed['price'], '82.90')
+            self.assertEqual(Decimal(placed['quantity']), Decimal('7.720'))
             orders = vault.bot_orders()
             self.assertEqual(len(orders), 1)
             self.assertEqual(orders[0]['strategy_id'], 'R2')
@@ -587,6 +591,40 @@ class BinanceAccountInputTests(unittest.TestCase):
             second = vault.consider_entry(reader, Decimal('75.36'), Decimal('0.01'), 1800000007800, ask=Decimal('75.36'))
             self.assertFalse(second['placed'])
             self.assertEqual(len(vault.bot_orders()), 1)
+
+    def test_cross_strategy_same_wave_prefers_r2_over_t2_in_downtrend_and_uncertain(self):
+        for reg, expect_sid in (('DOWNTREND', 'R2'), ('UNCERTAIN', 'R2'), ('UPTREND', 'T2')):
+            strat_db = self.root / f'decisions_pri_{reg}.sqlite'
+            with closing(sqlite3.connect(strat_db)) as db, db:
+                db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy_id TEXT, signal_id TEXT, payload_json TEXT)')
+                t2_sig = {
+                    'symbol': 'SOLUSDT', 'strategy_id': 'T2', 'signal_id': f't2-{reg}',
+                    'accepted': True, 'regime': reg, 'entry_low': '75.37', 'entry_high': '75.50',
+                    'stop_distance': '0.012', 'score': '92.5',
+                    'signal_time': 1800000000000, 'expires_at': 1800000900000,
+                }
+                db.execute('INSERT INTO decisions(symbol,strategy_id,signal_id,payload_json) VALUES(?,?,?,?)',
+                           ('SOLUSDT', 'T2', t2_sig['signal_id'], json.dumps(t2_sig)))
+            r2_db = self.root / f'r2_pri_{reg}.sqlite'
+            with closing(sqlite3.connect(r2_db)) as db, db:
+                db.execute('CREATE TABLE r2_outbox(signal_id TEXT PRIMARY KEY, payload TEXT)')
+                r2_sig = {
+                    'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'signal_id': f'r2-{reg}',
+                    'accepted': True, 'regime': reg, 'entry_low': '75.37', 'entry_high': '75.59',
+                    'stop_distance': '0.008', 'score': '80',
+                    'signal_time': 1800000000000, 'expires_at': 1800000300000,
+                }
+                db.execute('INSERT INTO r2_outbox VALUES(?,?)', (r2_sig['signal_id'], json.dumps(r2_sig)))
+
+            reader = DataReader({'SOLUSDT_strategy': strat_db, 'r2_state': r2_db}, clock=lambda: 1800000000000)
+            transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='4000', sol_free='0', sol_locked='0')
+            vault = AccountVault(self.root / f'vault_pri_{reg}', clock=lambda: 1800000000000, transport=transport)
+            vault.save(self.key, self.secret)
+            vault.enable_live()
+            with patch.dict(os.environ, {'SOLBOT_LIVE_STRATEGIES': 'T1,T2,R2'}):
+                res = vault.consider_entry(reader, Decimal('75.37'), Decimal('0.01'), 1800000000600, ask=Decimal('75.37'))
+            self.assertTrue(res['placed'])
+            self.assertEqual(res['strategy_id'], expect_sid)
 
     def test_manual_custody_calculates_tp_sl_from_click_time_price_not_buy_price(self):
         from solbot.mathematics.protective_stop import initial_stop
@@ -859,6 +897,54 @@ class BinanceAccountInputTests(unittest.TestCase):
         self.assertTrue(vault.protection()['client_order_id'].startswith('cbotsl'))
         self.assertEqual(s1['stage'], 'S1')
 
+    def test_manual_custody_tightens_top_exhaustion_and_clamps_trailing_touch(self):
+        from solbot.mathematics.trend_exhaustion import TrendEvidence
+
+        class AnchoredTransport(FakeTransport):
+            def request(self, path, query, headers, method='GET'):
+                if path == '/api/v3/ticker/bookTicker':
+                    return {'bidPrice': '71.85', 'askPrice': '71.86'}
+                return super().request(path, query, headers, method)
+
+        transport = AnchoredTransport(restrictions(enableSpotAndMarginTrading=True), sol_free='18.912', sol_locked='0')
+        vault = self.vault(transport)
+        vault.save(self.key, self.secret)
+        vault.protect_manual('18.912')
+
+        strong_ev = TrendEvidence(
+            ready=True, higher_low_1m=True, higher_low_5m=True, rvol=Decimal('1.8'),
+            atr=Decimal('0.25'), previous_atr=Decimal('0.20'),
+            buy_ratio=Decimal('0.60'), previous_buy_ratio=Decimal('0.55'),
+            rsi=Decimal('89.2'), previous_rsi=Decimal('84.0'),
+        )
+        # Peak $73.30 (+2.02% >= +2.00%) enters S2; 1st bar exhaustion stays un-tightened, 2nd consecutive 1m bar tightens stop to 0.40% ($73.01)
+        s2_peak = vault.advance('73.30', strong_ev, '0.01', 1800000010000)
+        self.assertEqual(s2_peak['stage'], 'S2')
+
+        # Exhaustion turn-down (RSI 87.4 -> 75.2, buy_ratio 0.361)
+        exhaust_ev = TrendEvidence(
+            ready=True, higher_low_1m=True, higher_low_5m=True, rvol=Decimal('1.5'),
+            atr=Decimal('0.25'), previous_atr=Decimal('0.20'),
+            buy_ratio=Decimal('0.361'), previous_buy_ratio=Decimal('0.671'),
+            rsi=Decimal('75.2'), previous_rsi=Decimal('87.4'),
+        )
+        bar1 = vault.advance('73.15', exhaust_ev, '0.01', 1800000015000)
+        self.assertLess(Decimal(bar1['stop_price']), Decimal('73.01'))
+        tight = vault.advance('73.12', exhaust_ev, '0.01', 1800000065000)
+        self.assertEqual(Decimal(tight['stop_price']), Decimal('73.01'))
+        self.assertEqual(vault.protection()['status'], 'OPEN')
+
+        # If a lagged poll lands just below the candidate while still above resting limit_floor, clamp cbotsl up to bid-tick
+        vault2 = AccountVault(self.root / 'vault_lag', clock=lambda: 1800000000000, transport=AnchoredTransport(restrictions(enableSpotAndMarginTrading=True), sol_free='18.912', sol_locked='0'))
+        vault2.save(self.key, self.secret)
+        vault2.protect_manual('18.912')
+        vault2.advance('73.30', strong_ev, '0.01', 1800000010000)
+        vault2.advance('73.15', exhaust_ev, '0.01', 1800000015000)
+        lagged = vault2.advance('72.95', exhaust_ev, '0.01', 1800000065000)
+        self.assertEqual(vault2.protection()['status'], 'OPEN')
+        self.assertTrue(vault2.protection()['client_order_id'].startswith('cbotsl'))
+        self.assertEqual(Decimal(lagged['stop_price']), Decimal('72.94'))
+
     def test_trading_config_customizes_order_usdt_and_max_slots_for_live_and_shadow(self):
         transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='5000', sol_free='0', sol_locked='0')
         vault_dir = self.root / 'vault_cfg'
@@ -915,6 +1001,95 @@ class BinanceAccountInputTests(unittest.TestCase):
         self.assertEqual(r2_exec.minimum_notional, Decimal('1200'))
         self.assertEqual(r2_exec.maximum_notional, Decimal('1200'))
         self.assertEqual(r2_exec.maximum_slots, 3)
+
+    def test_r2_live_chase_requote_candidate_low_guard_expired_reentry_and_fast_entry(self):
+        from solbot.app_api.custody_apts import step
+        from solbot.mathematics.trend_exhaustion import TrendEvidence
+
+        r2_db = self.root / 'r2_chase_live.sqlite'
+        strat_db = self.root / 'strat_chase_live.sqlite'
+        with closing(sqlite3.connect(strat_db)) as db, db:
+            db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy_id TEXT, signal_id TEXT, payload_json TEXT)')
+        with closing(sqlite3.connect(r2_db)) as db, db:
+            db.execute('CREATE TABLE r2_outbox(signal_id TEXT PRIMARY KEY, payload TEXT)')
+            sig = {
+                'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'signal_id': 'r2-chase-live-1',
+                'accepted': True, 'entry_low': '71.85', 'entry_high': '72.06555',
+                'candidate_low': '71.17', 'stop_distance': '0.010', 'score': '85',
+                'signal_time': 1800000000000, 'expires_at': 1800000300000,
+            }
+            db.execute('INSERT INTO r2_outbox VALUES(?,?)', ('r2-chase-live-1', json.dumps(sig)))
+
+        reader = DataReader({'SOLUSDT_strategy': strat_db, 'r2_state': r2_db}, clock=lambda: 1800000000000)
+        transport = FakeTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='3000', sol_free='0', sol_locked='0')
+        vault_dir = self.root / 'vault_chase'
+        vault_dir.mkdir(exist_ok=True)
+        vault = AccountVault(vault_dir, clock=lambda: 1800000000000, transport=transport)
+        vault.save(self.key, self.secret)
+        vault.enable_live()
+
+        with patch.dict(os.environ, {'SOLBOT_LIVE_STRATEGIES': 'T1,T2,R2'}):
+            # 1. Entry executes with cached _require_spot (0 extra /sapi/v1/account/apiRestrictions calls in consider_entry!)
+            calls_before = list(transport.calls)
+            placed = vault.consider_entry(reader, Decimal('71.84'), Decimal('0.01'), 1800000000000, ask=Decimal('71.85'))
+            self.assertTrue(placed['placed'])
+            self.assertEqual(placed['price'], '71.89')
+            entry_paths = [p for _, p, _ in transport.calls[len(calls_before):]]
+            self.assertNotIn('/sapi/v1/account/apiRestrictions', entry_paths)
+            self.assertNotIn('/api/v3/time', entry_paths)
+
+            # 2. Under 5s -> does not chase yet
+            ev = TrendEvidence(ready=True, atr=Decimal('0.3'), previous_atr=Decimal('0.3'))
+            early = vault.sync_bot_stops(Decimal('71.92'), Decimal('0.01'), 1800000003000, evidence=ev, ask=Decimal('71.93'))
+            self.assertEqual(early['actions'][0]['status'], 'NEW')
+
+            # 3. At +5s ask moved to 71.93 (<= 72.06555) -> cancels old order & replaces at 71.97 (preserving quote!)
+            chased = vault.sync_bot_stops(Decimal('71.92'), Decimal('0.01'), 1800000005000, evidence=ev, ask=Decimal('71.93'))
+            self.assertEqual(chased['actions'][0]['status'], 'CHASE_REPLACED')
+            self.assertEqual(chased['actions'][0]['price'], '71.97')
+            row1 = vault.bot_orders()[0]
+            self.assertEqual(row1['price'], '71.97')
+            self.assertLessEqual(Decimal(row1['quantity']) * Decimal(row1['price']), Decimal('1000.00'))
+
+            # 4. If exchange expires early (e.g. EXPIRE_MAKER) while now < expires_at, 1 re-entry is allowed (and at most 1)
+            transport.orders_by_cid[row1['client_order_id']]['status'] = 'EXPIRED'
+            exp_res = vault.sync_bot_stops(Decimal('71.90'), Decimal('0.01'), 1800000010000, evidence=ev, ask=Decimal('71.91'))
+            self.assertEqual(exp_res['actions'][0]['status'], 'EXPIRED')
+            reentered = vault.consider_entry(reader, Decimal('71.90'), Decimal('0.01'), 1800000011000, ask=Decimal('71.91'))
+            self.assertTrue(reentered['placed'])
+            row2 = vault.bot_orders()[0]
+            self.assertNotEqual(row2['client_order_id'], row1['client_order_id'])
+
+            # Simulate a 2nd early expiry -> must NOT re-enter a 2nd time
+            transport.orders_by_cid[row2['client_order_id']]['status'] = 'EXPIRED'
+            vault.sync_bot_stops(Decimal('71.90'), Decimal('0.01'), 1800000015000, evidence=ev, ask=Decimal('71.91'))
+            blocked = vault.consider_entry(reader, Decimal('71.90'), Decimal('0.01'), 1800000016000, ask=Decimal('71.91'))
+            self.assertFalse(blocked['placed'])
+
+            # 5. Candidate low break cancels pending NEW buy and blocks re-entry; also verify step() enters before refresh_account()
+            with closing(sqlite3.connect(r2_db)) as db, db:
+                sig2 = dict(sig, signal_id='r2-cand-low-break', signal_time=1800001000000, expires_at=1800001300000)
+                db.execute('INSERT INTO r2_outbox VALUES(?,?)', ('r2-cand-low-break', json.dumps(sig2)))
+
+            call_order = []
+            orig_consider = vault.consider_entry
+            orig_refresh = vault.refresh_account
+            def wrap_consider(*a, **kw):
+                call_order.append('consider_entry')
+                return orig_consider(*a, **kw)
+            def wrap_refresh(*a, **kw):
+                call_order.append('refresh_account')
+                return orig_refresh(*a, **kw)
+            with patch.object(vault, 'consider_entry', side_effect=wrap_consider), \
+                 patch.object(vault, 'refresh_account', side_effect=wrap_refresh):
+                step_res = step(vault, reader=reader, now=1800001000000, bid=Decimal('71.84'), tick=Decimal('0.01'), evidence=ev, sync_account=True)
+            self.assertEqual(call_order[:2], ['consider_entry', 'refresh_account'])
+            self.assertTrue(step_res['entry']['placed'])
+
+            # Break candidate_low (71.17 -> bid=71.10)
+            brk = vault.sync_bot_stops(Decimal('71.10'), Decimal('0.01'), 1800001002000, evidence=ev, ask=Decimal('71.11'))
+            self.assertEqual(brk['actions'][0]['status'], 'CANCELED')
+            self.assertEqual(brk['actions'][0]['reason'], 'CANDIDATE_LOW_BROKEN')
 
 
 if __name__ == '__main__':

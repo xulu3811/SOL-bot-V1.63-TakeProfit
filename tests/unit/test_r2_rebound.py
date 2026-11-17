@@ -34,14 +34,23 @@ class R2Tests(unittest.TestCase):
             self.assertGreaterEqual(notional, 499)
             self.assertLessEqual(notional, 1000)
             self.assertLessEqual(risk, 25)
-            # When available cash < 1000 and >= 500, open max available cash
+            # Aligning with SOL-bot Live: score=75 keeps score_cap=500 even when cash=750;
+            # score=100 caps cleanly at available cash (~749 USDT).
             with ledger._transaction() as db:
                 db.execute("UPDATE shadow_account SET cash='750',reserved='0'")
             intent_fb = dict(intent, signal_id='rebound-fallback-test', score='75')
             fb = ledger.submit_intent(intent_fb, NOW)
             fb_notional = Decimal(fb['quantity']) * Decimal(fb['limit_price'])
-            self.assertGreater(fb_notional, Decimal('740'))
-            self.assertLess(fb_notional, Decimal('755'))
+            self.assertGreaterEqual(fb_notional, Decimal('495'))
+            self.assertLessEqual(fb_notional, Decimal('505'))
+            with ledger._transaction() as db:
+                db.execute("UPDATE shadow_account SET cash='750',reserved='0'")
+                db.execute("DELETE FROM shadow_orders")
+            intent_fb_max = dict(intent, signal_id='rebound-fallback-max', score='100')
+            fb_max = ledger.submit_intent(intent_fb_max, NOW)
+            fb_max_notional = Decimal(fb_max['quantity']) * Decimal(fb_max['limit_price'])
+            self.assertGreater(fb_max_notional, Decimal('740'))
+            self.assertLess(fb_max_notional, Decimal('755'))
             # Below 500 USDT available cash rejects opening
             with ledger._transaction() as db:
                 db.execute("UPDATE shadow_account SET cash='450',reserved='0'")
@@ -63,8 +72,12 @@ class R2Tests(unittest.TestCase):
             self.assertEqual(order['order_id'],repeat['order_id'])
             ledger.process_market(features(2000,quantity='100'),NORMAL,now_ms=NOW+2000)
             with ledger._transaction() as db:
+                pos = db.execute("SELECT entry_price FROM shadow_positions WHERE status='OPEN'").fetchone()
                 state=json.loads(db.execute('SELECT state_json FROM shadow_protection').fetchone()[0])
-                self.assertEqual(float(state['stop_price']),99.05)
+                from decimal import Decimal
+                from solbot.mathematics.protective_stop import initial_stop
+                expected_stop = initial_stop(pos['entry_price'], RULES.tick_size, stop_distance='0.0095')
+                self.assertEqual(Decimal(str(state['stop_price'])), expected_stop)
 
     def test_memory_and_restart_and_single_intent(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -260,4 +273,93 @@ class R2Tests(unittest.TestCase):
                 r2_db, market_db, strategy_id='R2', signal_id='sig-r2-1', signal_time=NOW, now_ms=NOW + 100
             )
             self.assertTrue(claimed_r2)
+
+    def test_r2_order_ttl_300s_and_shadow_chase_pending_fills_breakout(self):
+        from decimal import Decimal
+        from solbot.execution.r2_shadow import R2ShadowExecutor
+        from test_p3_apts_shadow import RULES, NOW, NORMAL, features
+        candles, metrics = inputs(BASE)
+        state, _ = advance(None, candles, metrics, 'DOWNTREND', BASE)
+        candles, metrics = inputs(BASE + 1800000, low='99.1', rsi=(45, 55))
+        state, _ = advance(state, candles, metrics, 'DOWNTREND', BASE + 1800000)
+        candles, metrics = inputs(BASE + 1860000, five_time=BASE + 1800000, low='99.1', rsi=(45, 55), close='100.2')
+        state, intent = advance(state, candles, metrics, 'DOWNTREND', BASE + 1860000)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['expires_at'], (BASE + 1860000) + 300_000)
+
+        # Reproduce 10:08 R2 scenario in shadow: initial ask=71.85, jumps to 71.93 -> chase_pending lifts limit to 71.97 and fills
+        with tempfile.TemporaryDirectory() as folder:
+            r2 = R2ShadowExecutor(Path(folder) / 'r2_chase.sqlite', rules=RULES, fee_rate='0.00075')
+            r2.apply_trading_config('1500', '1500', 2)
+            sig = {
+                'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'strategy_version': 'r2-rebound-2',
+                'signal_id': 'r2-shadow-chase-1', 'accepted': True, 'reasons': [],
+                'signal_time': NOW, 'expires_at': NOW + 300_000,
+                'entry_low': '71.85', 'entry_high': '72.06555',
+                'candidate_low': '71.17', 'stop_price': '71.12',
+                'stop_distance': '0.010', 'score': '85',
+            }
+            order = r2.submit_intent(sig, NOW, bid='71.84', ask='71.85')
+            self.assertEqual(Decimal(order['limit_price']), Decimal('71.89'))
+
+            # At +1s ask jumped to 71.93 (above 71.89) -> still resting before 5s chase interval
+            f1 = features(1000, bid='71.92', ask='71.93', quantity='300')
+            self.assertEqual(r2.chase_pending(f1, NOW + 1000), [])
+            res1 = r2.process_market(f1, NORMAL, now_ms=NOW + 1000)
+            self.assertEqual(res1['fills'], [])
+
+            # At +5s ask=71.93 (<= entry_high 72.06555) -> chase_pending lifts limit_price to 71.97 and fills!
+            f2 = features(5000, bid='71.92', ask='71.93', quantity='300')
+            chased = r2.chase_pending(f2, NOW + 5000)
+            self.assertEqual(len(chased), 1)
+            self.assertEqual(Decimal(chased[0]['limit_price']), Decimal('71.97'))
+            res2 = r2.process_market(f2, NORMAL, now_ms=NOW + 5000)
+            self.assertEqual(len(res2['fills']), 1)
+            self.assertEqual(res2['fills'][0]['side'], 'BUY')
+
+    def test_shadow_downtrend_uncertain_r2_outranks_t2(self):
+        from contextlib import closing
+        import json
+        import sqlite3
+        from solbot.execution.p3_shadow import P3ShadowExecutor
+        from solbot.execution.r2_shadow import R2ShadowExecutor
+        from solbot.execution.shadow import ShadowRejected
+        from solbot.p3_runtime import _has_higher_priority_strategy_signal, acquire_cross_shadow_entry_guard
+        from test_p3_apts_shadow import RULES, NOW
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            db_dir = root / 'database'
+            r2_dir = root / 'r2'
+            db_dir.mkdir(parents=True, exist_ok=True)
+            r2_dir.mkdir(parents=True, exist_ok=True)
+            market_db = db_dir / 'market.sqlite'
+            market_db.touch()
+            p3_db = db_dir / 'sol-shadow.sqlite'
+            r2_db = r2_dir / 'r2-v2-shadow.sqlite'
+            strat_db = db_dir / 'sol-shadow-strategy.sqlite'
+            r2_state_db = r2_dir / 'r2-state.sqlite'
+            P3ShadowExecutor(p3_db, rules=RULES, fee_rate='0.00075')
+            R2ShadowExecutor(r2_db, rules=RULES, fee_rate='0.00075')
+            with closing(sqlite3.connect(strat_db)) as db, db:
+                db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy_id TEXT, signal_time INTEGER, accepted INTEGER, payload_json TEXT)')
+                t2_down = {'symbol': 'SOLUSDT', 'strategy_id': 'T2', 'regime': 'DOWNTREND', 'signal_id': 't2-d', 'signal_time': NOW}
+                db.execute('INSERT INTO decisions(symbol,strategy_id,signal_time,accepted,payload_json) VALUES(?,?,?,?,?)',
+                           ('SOLUSDT', 'T2', NOW, 1, json.dumps(t2_down)))
+            with closing(sqlite3.connect(r2_state_db)) as db, db:
+                db.execute("CREATE TABLE r2_outbox(signal_id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', outcome TEXT)")
+                r2_sig = {'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'regime': 'DOWNTREND', 'signal_id': 'r2-d', 'signal_time': NOW}
+                db.execute("INSERT INTO r2_outbox(signal_id,payload,status) VALUES(?,?,?)", ('r2-d', json.dumps(r2_sig), 'PENDING'))
+
+            # T2 in DOWNTREND/UNCERTAIN must NOT block R2, while active R2 DOES block T2.
+            self.assertFalse(_has_higher_priority_strategy_signal(strat_db, NOW, 900_000))
+            with self.assertRaises(ShadowRejected) as ctx_err:
+                acquire_cross_shadow_entry_guard(
+                    p3_db, market_db, strategy_id='T2', signal_id='t2-d', signal_time=NOW, now_ms=NOW + 100, regime='DOWNTREND',
+                )
+            self.assertEqual(ctx_err.exception.code, 'CROSS_STRATEGY_COOLDOWN')
+            self.assertTrue(acquire_cross_shadow_entry_guard(
+                r2_db, market_db, strategy_id='R2', signal_id='r2-d', signal_time=NOW, now_ms=NOW + 150, strategy_db=strat_db,
+            ))
+
 

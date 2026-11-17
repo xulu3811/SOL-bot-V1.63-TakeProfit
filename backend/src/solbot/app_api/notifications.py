@@ -3,8 +3,47 @@ from pathlib import Path
 from contextlib import closing,contextmanager
 import json,sqlite3,time,re,hashlib,base64,urllib.request,urllib.error,stat,ipaddress,os
 
-KINDS={'STRATEGY_SIGNAL':'策略信号','SIMULATED_TRADE':'模拟交易','LIVE_ORDER':'实盘订单更新','BUY_FILL':'买入成交','STOP_LOSS':'止损状态更新','APTS_EXIT':'APTS止盈更新','HARD_LOCK':'5%风险硬锁','RECONCILIATION_FAILED':'账户对账异常','SERVER_ERROR':'服务器异常','PROTECTION_ERROR':'保护订单异常','MARKET_SYNC':'行情更新','SECURITY_ALERT':'异常设备访问预警'}
-HIGH={'LIVE_ORDER','BUY_FILL','STOP_LOSS','APTS_EXIT','HARD_LOCK','RECONCILIATION_FAILED','SERVER_ERROR','PROTECTION_ERROR','SECURITY_ALERT'}
+KINDS={
+    'STRATEGY_SIGNAL':'策略信号',
+    'SIMULATED_TRADE':'模拟交易',
+    'LIVE_ORDER':'实盘订单更新',
+    'BUY_FILL':'买入成交',
+    'STOP_LOSS':'止损状态更新',
+    'APTS_EXIT':'APTS止盈更新',
+    'HARD_LOCK':'5%风险硬锁',
+    'RECONCILIATION_FAILED':'账户对账异常',
+    'SERVER_ERROR':'服务器故障预警',
+    'SOLBOT_SERVICE_FAULT':'SOL-bot服务故障预警',
+    'PROTECTION_ERROR':'保护订单异常',
+    'MARKET_SYNC':'行情更新',
+    'SECURITY_ALERT':'安全防御记录',
+}
+HIGH={'LIVE_ORDER','BUY_FILL','STOP_LOSS','APTS_EXIT','HARD_LOCK','RECONCILIATION_FAILED','SERVER_ERROR','SOLBOT_SERVICE_FAULT','PROTECTION_ERROR'}
+SILENT={'SECURITY_ALERT'}
+FAULT_UNIT_LABELS={
+    'ops-agent':'Ops运维代理(solbot-ops-agent)',
+    'disk':'系统磁盘空间',
+    'memory':'系统运行内存',
+    'health':'系统健康巡检(health.log)',
+    'nginx.service':'Nginx TLS网关(nginx.service)',
+    'solbot-market.service':'SOL K线采集(solbot-market)',
+    'solbot-micro-sol.service':'SOL 盘口深度(solbot-micro-sol)',
+    'sol-shadow.service':'T1/T2/R1 影子引擎(sol-shadow)',
+    'sol-r2-shadow.service':'R2 反弹状态机(sol-r2-shadow)',
+    'solbot-guardian.service':'Guardian P4 风控(solbot-guardian)',
+    'solbot-guardian-ipc.service':'Guardian IPC(solbot-guardian-ipc)',
+    'solbot-execution-p5.service':'P5 执行门禁(solbot-execution-p5)',
+    'solbot-app.service':'App API & FCM(solbot-app)',
+    'solbot-sui-market.service':'SUI K线采集(solbot-sui-market)',
+    'solbot-micro-sui.service':'SUI 盘口深度(solbot-micro-sui)',
+    'sui-strategy.service':'SUI 数学研究(sui-strategy)',
+    'micro_sol':'SOL 盘口行情心跳',
+    'shadow':'P3 影子策略心跳',
+    'r2':'R2 状态机心跳',
+    'guardian':'Guardian 风控状态',
+    'execution':'P5 执行门禁状态',
+    'system':'服务器核心节点',
+}
 def now():return time.time_ns()//1000000
 
 def _describe_event(kind,symbol,details):
@@ -42,20 +81,42 @@ def _describe_event(kind,symbol,details):
     elif kind=='RECONCILIATION_FAILED':
         body=f'{sym} 账户对账异常，请检查实盘持仓与挂单'
         route='live'
+    elif kind=='SERVER_ERROR':
+        fcode=det.get('fault_code') or 'OPS_AGENT_DOWN'
+        funit=FAULT_UNIT_LABELS.get(det.get('fault_unit') or 'system','服务器节点')
+        body={
+            'OPS_AGENT_DOWN':f'{funit} 连续探测无响应，请立即检查服务器状态',
+            'DISK_CRITICAL':f'{funit} 使用率已达到危险阈值 (≥92%)，请立即清理释放磁盘',
+            'RAM_CRITICAL':f'{funit} 可用内存严重不足或占用 ≥95%，请立即排查进程或清理缓存',
+            'NGINX_DOWN':f'{funit} 服务已停止运行，App HTTPS/WSS 通道受阻',
+            'HEALTHCHECK_FAIL':f'{funit} 检测到紧急异常项 (status=fail)，请立即查看系统日志',
+        }.get(fcode,f'{funit} 发生严重故障，请立即排查服务器状态')
+        title='服务器故障 · 紧急预警'
+        route='markets'
+    elif kind=='SOLBOT_SERVICE_FAULT':
+        fcode=det.get('fault_code') or 'SERVICE_DOWN'
+        funit=FAULT_UNIT_LABELS.get(det.get('fault_unit') or 'system','SOL-bot 核心服务')
+        body={
+            'SERVICE_DOWN':f'{funit} 服务已停止运行，请立即检查重启并核实持仓安全',
+            'HEARTBEAT_STALE':f'{funit} 心跳超时未更新，请立即检查服务进程与数据流',
+            'MODULE_ERROR':f'{funit} 报告运行异常，请立即检查服务状态与风控日志',
+        }.get(fcode,f'{funit} 发生服务故障，请立即检查')
+        title='SOL-bot 服务故障 · 紧急预警'
+        route='markets'
     elif kind=='SECURITY_ALERT':
         channel=det.get('security_channel') or 'HTTPS_API'
         code=det.get('security_code') or 'UNAUTHORIZED_DEVICE'
         src_ip=det.get('source_ip') or '未知IP'
         if code=='SSH_DESKTOP_LOGIN':
-            title=f'{sym} · 授权电脑SSH登录提醒'
-            body=f'台式电脑 Seth 已通过专属密钥登录服务器 SSH（VPN IP: {src_ip}）'
+            title=f'{sym} · 授权电脑SSH登录记录'
+            body=f'台式电脑 Seth 已通过专属密钥登录服务器 SSH（IP: {src_ip}）'
         elif channel=='SSH':
             code_cn={
                 'SSH_AUTH_FAILED':'检测到非授权设备尝试SSH登录并已拒绝',
                 'SSH_BANNED':'检测到异常IP高频扫描SSH并已被防火墙封禁',
             }.get(code,'检测到异常SSH访问尝试并已拦截')
-            title=f'{sym} · 异常SSH设备拦截预警'
-            body=f'{code_cn}（来源IP: {src_ip}），服务器仅允许台式电脑 Seth 密钥访问'
+            title=f'{sym} · SSH安全拦截记录'
+            body=f'{code_cn}（来源IP: {src_ip}），已静默记录'
         else:
             code_cn={
                 'UNAUTHORIZED_DEVICE':'非授权设备尝试访问App接口已被拒绝',
@@ -64,13 +125,18 @@ def _describe_event(kind,symbol,details):
                 'REPLAY_BLOCKED':'检测到重放请求攻击已被拦截',
                 'RATE_LIMITED':'检测到异常高频请求已被限流拦截',
             }.get(code,'检测到非授权设备访问App接口并已拦截')
-            title=f'{sym} · 异常设备访问强预警'
+            title=f'{sym} · 接口安全拦截记录'
             body=f'{code_cn}（来源IP: {src_ip}），仅允许三星 S24+ (SM-S926U1) 访问'
-        route='live'
+        route='markets'
     else:
         body=f'{sym} {base_title}，请打开应用查看最新状态'
         route='live'
-    priority='HIGH' if (kind=='STRATEGY_SIGNAL' or kind in HIGH or kind=='SIMULATED_TRADE') else 'NORMAL'
+    if kind in SILENT:
+        priority='SILENT'
+    elif kind=='STRATEGY_SIGNAL' or kind in HIGH or kind=='SIMULATED_TRADE':
+        priority='HIGH'
+    else:
+        priority='NORMAL'
     return title,body,route,priority
 
 class NotificationStore:
@@ -101,6 +167,15 @@ class NotificationStore:
         with self.tx() as db:
             db.execute('UPDATE notification_tokens SET active=0 WHERE device_id=?',(device_id,))
             db.execute("UPDATE notification_delivery SET state='REVOKED' WHERE device_id=? AND state!='SENT'",(device_id,))
+    def reset_shadow_cursors(self):
+        with self.tx() as db:
+            db.execute(
+                "DELETE FROM notification_source_cursors WHERE source IN ('shadow:shadow_fills','r2_shadow:shadow_fills','r2_shadow_read:shadow_fills')"
+            )
+            db.execute(
+                "DELETE FROM notification_delivery WHERE event_id IN (SELECT event_id FROM notification_events WHERE kind='SIMULATED_TRADE')"
+            )
+            db.execute("DELETE FROM notification_events WHERE kind='SIMULATED_TRADE'")
     def publish(self,event_id,kind,symbol,at,details=None):
         if kind not in KINDS or symbol not in (None,'SOLUSDT','SUIUSDT','BNBUSDT') or type(at)is not int:raise ValueError('invalid notification event')
         if not isinstance(event_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}',event_id):raise ValueError('invalid event ID')
@@ -113,6 +188,8 @@ class NotificationStore:
             'security_channel':{'HTTPS_API','SSH','FIREWALL'},
             'security_code':{'UNAUTHORIZED_DEVICE','PAIRING_BLOCKED','INVALID_SIGNATURE','REPLAY_BLOCKED','RATE_LIMITED','SSH_AUTH_FAILED','SSH_BANNED','SSH_DESKTOP_LOGIN'},
             'device_model':{'SM-S926U1','Seth','UNKNOWN'},
+            'fault_code':{'OPS_AGENT_DOWN','DISK_CRITICAL','RAM_CRITICAL','NGINX_DOWN','HEALTHCHECK_FAIL','SERVICE_DOWN','HEARTBEAT_STALE','MODULE_ERROR'},
+            'fault_unit':set(FAULT_UNIT_LABELS),
         }.items():
             value=(details or {}).get(key)
             if value in allowed:safe[key]=value
@@ -144,6 +221,18 @@ class NotificationStore:
             if db.execute('SELECT 1 FROM notification_events WHERE event_id=?',(ident,)).fetchone():
                 return False
         return self.publish(ident,'SECURITY_ALERT','SOLUSDT',at,details)
+    def publish_fault_alert(self,kind,fault_code,fault_unit='system',cooldown_ms=300000):
+        """Publish an allowlisted category-1 server or SOL-bot critical fault event with cooldown."""
+        if kind not in ('SERVER_ERROR','SOLBOT_SERVICE_FAULT'):
+            raise ValueError('invalid fault kind')
+        at=int(self.clock())
+        bucket=at//max(1000,int(cooldown_ms))
+        unit_key=fault_unit if fault_unit in FAULT_UNIT_LABELS else 'system'
+        ident='flt:'+hashlib.sha256(f'{kind}:{fault_code}:{unit_key}:{bucket}'.encode()).hexdigest()[:32]
+        with self.tx() as db:
+            if db.execute('SELECT 1 FROM notification_events WHERE event_id=?',(ident,)).fetchone():
+                return False
+        return self.publish(ident,kind,'SOLUSDT',at,{'fault_code':fault_code,'fault_unit':unit_key})
     def alerts(self,after=0,limit=50):
         if type(after)is not int or after<0 or type(limit)is not int or not 1<=limit<=500:raise ValueError('invalid pagination')
         with self.tx() as db:rows=[dict(r) for r in db.execute('SELECT * FROM notification_events WHERE sequence>? ORDER BY sequence LIMIT ?',(after,limit))]
@@ -168,7 +257,8 @@ class NotificationStore:
                 continue
             det=json.loads(r.get('details') or '{}')
             title,body,route,priority=_describe_event(r['kind'],r.get('symbol'),det)
-            message={'token':current['token'],'notification':{'title':title,'body':body},'data':{'event_id':r['event_id'],'kind':r['kind'],'symbol':r['symbol'] or '','title':title,'message':body,'route':route,'severity':priority},'android':{'priority':priority,'notification':{'channel_id':'solbot_critical_alarm_v2' if priority=='HIGH' else 'updates','tag':r['event_id'],'sound':'default','default_vibrate_timings':True,'visibility':'PUBLIC'}}}
+            fcm_priority='high' if priority=='HIGH' else 'normal'
+            message={'token':current['token'],'data':{'event_id':r['event_id'],'kind':r['kind'],'symbol':r['symbol'] or '','title':title,'message':body,'route':route,'severity':priority,'created_at':str(r['created_at'])},'android':{'priority':fcm_priority}}
             try:status=sender(message)
             except Exception:status='RETRY'
             state='SENT' if status=='SENT' else ('INVALID' if status=='UNREGISTERED' else ('FAILED' if r['attempts']+1>=3 else 'RETRY'))
@@ -230,7 +320,7 @@ class SourceEventCollector:
     """Bounded incremental polling of committed service events, no source writes."""
     def __init__(self,reader,store):self.reader,self.store=reader,store
     def poll(self):
-        sources=[('SOLUSDT_strategy','decisions','STRATEGY_SIGNAL','SOLUSDT'),('SUIUSDT_strategy','decisions','STRATEGY_SIGNAL','SUIUSDT'),('r2_state','r2_outbox','R2_SIGNAL','SOLUSDT'),('shadow','shadow_fills','SIMULATED_TRADE','SOLUSDT'),('orders','order_events','LIVE_ORDER','SUIUSDT'),('guardian','risk_events','RISK','SUIUSDT')]
+        sources=[('SOLUSDT_strategy','decisions','STRATEGY_SIGNAL','SOLUSDT'),('r2_state','r2_outbox','R2_SIGNAL','SOLUSDT'),('shadow','shadow_fills','SIMULATED_TRADE','SOLUSDT'),('orders','order_events','LIVE_ORDER','SUIUSDT'),('guardian','risk_events','RISK','SUIUSDT')]
         if hasattr(self.reader,'paths'):
             for r2_key in ('r2_shadow_read','r2_shadow'):
                 p=self.reader.paths.get(r2_key)
@@ -248,8 +338,10 @@ class SourceEventCollector:
                 event_kind=kind;details={}
                 at=row.get('created_at',row.get('event_time',row.get('signal_time',self.store.clock())))
                 if kind=='STRATEGY_SIGNAL':
-                    details={'strategy':row['strategy_id']}
-                    if not row.get('accepted'):event_kind=None
+                    strat=row['strategy_id']
+                    details={'strategy':strat}
+                    # R1 (and SUIUSDT research decisions) are non-live research only; never alarm as trade entry signals.
+                    if not row.get('accepted') or strat=='R1':event_kind=None
                 elif kind=='R2_SIGNAL':
                     try:
                         sig=json.loads(row.get('payload') or '{}')

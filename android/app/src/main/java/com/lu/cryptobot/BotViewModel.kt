@@ -15,6 +15,7 @@ data class ScreenState(
     val values: Map<String, JSONObject> = emptyMap(),
     val interval: String = "15m",
     val alertsSeenAt: Long = 0L,
+    val servAlertsSeenAt: Long = 0L,
     val deviceId: String = "",
     val baseUrl: String = "https://43.163.192.120/",
     val opsBusy: Boolean = false,
@@ -22,6 +23,8 @@ data class ScreenState(
     val cleanPreview: JSONObject? = null,
     val systemLogs: JSONObject? = null,
     val logsBusy: Boolean = false,
+    val shadowResetBusy: Boolean = false,
+    val shadowResetMessage: String? = null,
 )
 
 internal object FrameSyncHelper {
@@ -193,10 +196,12 @@ internal object FrameSyncHelper {
 
     private suspend fun syncSettingsSnapshot() {
         val seen = repository.settings.get("alerts_seen_ms").toLongOrNull() ?: 0L
+        val servSeen = repository.settings.get("serv_alerts_seen_ms").toLongOrNull() ?: 0L
         val dev = repository.settings.get("device")
         val base = repository.settings.get("base").ifBlank { "https://43.163.192.120/" }
         mutable.value = mutable.value.copy(
             alertsSeenAt = maxOf(mutable.value.alertsSeenAt, seen),
+            servAlertsSeenAt = maxOf(mutable.value.servAlertsSeenAt, servSeen),
             deviceId = dev,
             baseUrl = base,
         )
@@ -236,6 +241,16 @@ internal object FrameSyncHelper {
         val next = maxOf(mutable.value.alertsSeenAt, latestReceivedAt)
         mutable.value = mutable.value.copy(alertsSeenAt = next)
         viewModelScope.launch { repository.settings.put("alerts_seen_ms", next.toString()) }
+    }
+
+    fun markServAlertsRead(latestNoticeAt: Long) {
+        val next = if (latestNoticeAt > 0L) {
+            maxOf(mutable.value.servAlertsSeenAt, latestNoticeAt)
+        } else {
+            maxOf(mutable.value.servAlertsSeenAt, System.currentTimeMillis())
+        }
+        mutable.value = mutable.value.copy(servAlertsSeenAt = next)
+        viewModelScope.launch { repository.settings.put("serv_alerts_seen_ms", next.toString()) }
     }
 
     fun triggerTestAlert() {
@@ -397,6 +412,33 @@ internal object FrameSyncHelper {
 
     fun clearOpsMessage() {
         mutable.value = mutable.value.copy(opsMessage = null)
+    }
+
+    fun resetShadowTradingData() {
+        viewModelScope.launch {
+            mutable.value = mutable.value.copy(shadowResetBusy = true, shadowResetMessage = null)
+            try {
+                val res = repository.post("shadow/reset", JSONObject().put("confirm", true))
+                val updatedValues = mutable.value.values.toMutableMap()
+                runCatching { repository.get("shadow/status") }.onSuccess { updatedValues["shadow/status"] = it }
+                runCatching { repository.get("shadow/orders") }.onSuccess { updatedValues["shadow/orders"] = it }
+                mutable.value = mutable.value.copy(
+                    values = updatedValues,
+                    shadowResetMessage = res.optString("message", "Shadow 模拟盘交易数据已重置"),
+                )
+                refresh()
+            } catch (error: Exception) {
+                mutable.value = mutable.value.copy(
+                    shadowResetMessage = "重置失败：${(error.message ?: "网络异常").take(80)}"
+                )
+            } finally {
+                mutable.value = mutable.value.copy(shadowResetBusy = false)
+            }
+        }
+    }
+
+    fun dismissShadowResetMessage() {
+        mutable.value = mutable.value.copy(shadowResetMessage = null)
     }
 
     fun loadSystemLogs(source: String = "auth", onlyAlerts: Boolean = false) {

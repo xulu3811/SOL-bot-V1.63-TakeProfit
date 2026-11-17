@@ -252,6 +252,14 @@ class OpsSystemStatusTests(unittest.TestCase):
         self.assertEqual(lr.json()["source"], "api")
         self.assertGreaterEqual(lr.json()["count"], 1)
 
+        # Security summary exposes silent recent_alerts without turning Serv Status into fault
+        sec = body["server"]["security"]
+        self.assertFalse(sec["critical_fault"])
+        self.assertEqual(sec["status"], "OK")
+        self.assertEqual(sec["status_label"], "安全正常")
+        self.assertGreater(sec["latest_alert_at"], 0)
+        self.assertGreaterEqual(len(sec["recent_alerts"]), 1)
+
         # Optimize memory
         h_opt = qa.sign("POST", "/api/v1/app/system/optimize-memory", b"{}", session=qa.session)
         opt_r = client.post("/api/v1/app/system/optimize-memory", content=b"{}", headers=h_opt)
@@ -265,7 +273,7 @@ class OpsSystemStatusTests(unittest.TestCase):
         self.assertEqual(cl_r.status_code, 200)
         self.assertTrue(cl_r.json()["dry_run"])
 
-        # Graceful fallback when ops agent is down
+        # Graceful fallback when ops agent is down triggers critical fault after 2 checks
         ops_down = OpsMonitor(
             auth_db=auth.path,
             notifications_db=notif.path,
@@ -275,7 +283,67 @@ class OpsSystemStatusTests(unittest.TestCase):
         )
         fb = ops_down.overview()
         self.assertFalse(fb["server"]["ops_agent_connected"])
+        self.assertTrue(fb["server"]["security"]["critical_fault"])
+        self.assertEqual(fb["server"]["security"]["status"], "FAULT")
         self.assertEqual(len(fb["bot_modules"]["layers"]), 4)
+        # Requires 3 consecutive unreachable checks before raising OPS_AGENT_DOWN
+        self.assertEqual(ops_down.check_critical_faults(notif), [])
+        self.assertEqual(ops_down.check_critical_faults(notif), [])
+        triggered_down = ops_down.check_critical_faults(notif)
+        self.assertEqual(len(triggered_down), 1)
+        self.assertEqual(triggered_down[0]["kind"], "SERVER_ERROR")
+        self.assertEqual(triggered_down[0]["fault_code"], "OPS_AGENT_DOWN")
+
+    def test_ops_backend_metrics_cache_reuses_snapshot_and_invalidates(self):
+        backend = self._build_backend()
+        m1 = backend.metrics()
+        self.now_sec += 2.0
+        m2 = backend.metrics()
+        self.assertIs(m1, m2)
+        self.now_sec += 7.0
+        m3 = backend.metrics()
+        self.assertIsNot(m1, m3)
+        backend.optimize_memory()
+        m4 = backend.metrics()
+        self.assertIsNot(m3, m4)
+
+    def test_critical_fault_probe_detects_server_and_solbot_service_faults(self):
+        class _StaticAgent:
+            def __init__(self, metrics_doc):
+                self.metrics_doc = metrics_doc
+            def call(self, payload):
+                if payload.get("action") == "metrics":
+                    return self.metrics_doc
+                if payload.get("action") == "logs":
+                    return {"ok": True, "entries": []}
+                return None
+
+        now_clock = [self.now_ms]
+        notif = NotificationStore(self.root / "fault_notif.sqlite", clock=lambda: now_clock[0])
+        metrics_doc = {
+            "ok": True,
+            "disk_pct": 93.5,
+            "ram_pct": 60.0,
+            "ram_available_mb": 700,
+            "services": [
+                {"unit": "nginx.service", "label": "Nginx", "active": True, "active_state": "active"},
+                {"unit": "solbot-execution-p5.service", "label": "P5 执行门禁", "active": False, "active_state": "failed"},
+            ],
+        }
+        ops = OpsMonitor(
+            notifications_db=notif.path,
+            agent_client=_StaticAgent(metrics_doc),
+            clock=lambda: now_clock[0],
+        )
+        # First check builds confirmation streak; second check emits urgent faults
+        self.assertEqual(ops.check_critical_faults(notif), [])
+        fired = ops.check_critical_faults(notif)
+        kinds = {(f["kind"], f["fault_code"], f["fault_unit"]) for f in fired}
+        self.assertIn(("SERVER_ERROR", "DISK_CRITICAL", "disk"), kinds)
+        self.assertIn(("SOLBOT_SERVICE_FAULT", "SERVICE_DOWN", "solbot-execution-p5.service"), kinds)
+        ov = ops.overview()
+        self.assertTrue(ov["server"]["security"]["critical_fault"])
+        self.assertEqual(ov["server"]["security"]["status"], "FAULT")
 
 
 if __name__ == "__main__":

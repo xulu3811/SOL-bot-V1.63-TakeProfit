@@ -247,6 +247,46 @@ class AppApiSyncUpgradeTests(unittest.TestCase):
         self.assertEqual(shadow['positions'][0]['unrealized_pnl'], '+6.00')
         self.assertEqual(shadow['positions'][0]['reversal_hits'], 1)
 
+    def test_manual_position_displays_apts_custody_anchor_price(self):
+        from tests.unit.test_p6_independent_qa import DeviceAuthenticationQA, FakeControl
+        ledger = AllocationLedger(self.root / 'guardian_manual.sqlite')
+
+        class ManualOrderTransport(FakeTransport):
+            def request(self, path, query, headers, method='GET'):
+                if path == '/api/v3/ticker/bookTicker':
+                    return {'bidPrice': '71.85', 'askPrice': '71.86'}
+                if path == '/api/v3/allOrders':
+                    return [
+                        {'symbol': 'SOLUSDT', 'orderId': 777, 'clientOrderId': 'web-buy-1', 'side': 'BUY',
+                         'status': 'FILLED', 'price': '71.89', 'origQty': '18.912', 'executedQty': '18.912',
+                         'cummulativeQuoteQty': '1359.58368', 'time': self.orders_time, 'updateTime': self.orders_time},
+                    ]
+                return super().request(path, query, headers, method)
+
+        transport = ManualOrderTransport(restrictions(enableSpotAndMarginTrading=True), usdt_free='100', sol_free='18.912', sol_locked='0')
+        transport.orders_time = self.now - 300_000
+        vault_dir = self.root / 'vault_manual'
+        vault_dir.mkdir(exist_ok=True)
+        vault = AccountVault(vault_dir, clock=lambda: self.now, transport=transport)
+        vault.save('A' * 64, 'B' * 64)
+        vault.protect_manual('18.912')
+
+        fixture = DeviceAuthenticationQA()
+        fixture.now = self.now
+        fixture.setUp()
+        self.addCleanup(fixture.tmp.cleanup)
+        reader = DataReader({'guardian': ledger.path, 'binance_snapshot': vault.snapshot_path}, clock=lambda: self.now)
+        app = create_app(fixture.store, reader, NotificationStore(self.root / 'noti_m.sqlite', clock=lambda: self.now), FakeControl(), vault=vault)
+        client = TestClient(app, base_url='https://testserver')
+        self.addCleanup(client.close)
+
+        path = '/api/v1/app/live/positions'
+        res = client.get(path, headers=fixture.sign('GET', path, b'', session=fixture.session)).json()
+        manual_item = res['manual'][0]
+        self.assertEqual(manual_item['entry_price'], '71.89')
+        self.assertEqual(manual_item['custody_anchor_price'], '71.85')
+        self.assertEqual(manual_item['protection']['custody_anchor_price'], '71.85')
+
 
 if __name__ == '__main__':
     unittest.main()

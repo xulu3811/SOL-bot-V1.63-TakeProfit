@@ -8,7 +8,31 @@ from .trend_exhaustion import TrendEvidence,classify
 from .volatility_regime import trailing_distance
 
 S1_PROFIT_PROTECTION_TRIGGER = Decimal('.008')
-S2_ADAPTIVE_TRAILING_TRIGGER = Decimal('.015')
+S1_DYNAMIC_LOCK_TRIGGER = Decimal('.011')
+S2_ADAPTIVE_TRAILING_TRIGGER = Decimal('.012')
+S2_EXHAUSTION_TIGHTEN_TRIGGER = Decimal('.020')
+
+
+def _overbought_exhaustion(evidence: TrendEvidence) -> bool:
+    """Return True when RSI reached >= 80 and flow/momentum visibly rolls over."""
+    peak_rsi = max(evidence.rsi, evidence.previous_rsi)
+    if peak_rsi < Decimal('80'):
+        return False
+    if evidence.buy_ratio < Decimal('0.42'):
+        return True
+    if evidence.rsi <= evidence.previous_rsi - Decimal('3') and evidence.buy_ratio < Decimal('0.50'):
+        return True
+    return evidence.rsi < evidence.previous_rsi and evidence.buy_ratio < Decimal('0.48')
+
+
+def _is_exhaustion_or_weakening(regime: str, evidence: TrendEvidence) -> bool:
+    """Return True when structure, flow, or overbought momentum shows top exhaustion."""
+    return (
+        regime in ('WEAKENING', 'CONFIRMED_REVERSAL', 'SEVERE_ADVERSE_MOVE')
+        or evidence.failed_new_high
+        or (evidence.adverse_move and evidence.buy_ratio < Decimal('0.48'))
+        or _overbought_exhaustion(evidence)
+    )
 
 
 @dataclass(frozen=True)
@@ -30,19 +54,27 @@ class APTSState:
     entry_time_ms: int=0
     reversal_hits: int=0
     reversal_confirm_ticks: int=1
+    exhaustion_hits: int=0
+    exhaustion_last_bar_ms: int=0
+    exhaustion_confirm_bars: int=2
+    last_normal_distance: Decimal=Decimal('.005')
 
     @classmethod
-    def create(cls,context,entry_price,quantity,tick_size,entry_fee_rate='0.001',exit_fee_rate='0.001',slippage_rate='0.001',scheme='APTS',stop_distance=None,entry_time_ms=0,reversal_confirm_ticks=1):
+    def create(cls,context,entry_price,quantity,tick_size,entry_fee_rate='0.001',exit_fee_rate='0.001',slippage_rate='0.001',scheme='APTS',stop_distance=None,entry_time_ms=0,reversal_confirm_ticks=1,exhaustion_confirm_bars=2):
         entry,qty=D(entry_price,positive=True),D(quantity,positive=True)
         fees=[D(x,nonnegative=True) for x in (entry_fee_rate,exit_fee_rate,slippage_rate)]
         if max(fees)>=Decimal('.1'):raise ValueError('invalid cost assumptions')
         if scheme not in ('APTS','FIXED_0_5','FIXED_1_0','ATR'):raise ValueError('unknown scheme')
         stop=initial_stop(entry,tick_size) if stop_distance is None else initial_stop(entry,tick_size,stop_distance=stop_distance)
+        exhaust_bars=2 if exhaustion_confirm_bars is None else max(1,int(exhaustion_confirm_bars))
         return cls(
             context,entry,qty,entry,stop,stop,*fees,
             last_decision_time_ms=context.decision_time_ms,scheme=scheme,
             entry_time_ms=int(entry_time_ms or 0),reversal_hits=0,
             reversal_confirm_ticks=max(1,int(reversal_confirm_ticks or 1)),
+            exhaustion_hits=0,exhaustion_last_bar_ms=0,
+            exhaustion_confirm_bars=exhaust_bars,
+            last_normal_distance=Decimal('.005'),
         )
 
     def asdict(self):return json_safe(self)
@@ -53,6 +85,10 @@ class APTSState:
         data['context']=DecisionContext(**data['context'])
         for key in ('entry_price','quantity','high_price','stop_price','floor_price','entry_fee_rate','exit_fee_rate','slippage_rate'):
             data[key]=D(data[key],nonnegative=True)
+        data['exhaustion_hits']=int(data.get('exhaustion_hits') or 0)
+        data['exhaustion_last_bar_ms']=int(data.get('exhaustion_last_bar_ms') or 0)
+        data['exhaustion_confirm_bars']=max(1,int(data.get('exhaustion_confirm_bars') or 2))
+        data['last_normal_distance']=D(data.get('last_normal_distance','0.005'),nonnegative=True)
         return cls(**data)
 
 
@@ -106,11 +142,35 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
     else:
         high=max(state.high_price,bid)
         gross=bid/state.entry_price-1
+        peak_gross=high/state.entry_price-1
         stage=state.stage
         if gross>S2_ADAPTIVE_TRAILING_TRIGGER and stage!='S3_TREND_EXHAUSTION':stage='S2_ADAPTIVE_TRAILING'
         elif gross>=S1_PROFIT_PROTECTION_TRIGGER and stage=='S0_INITIAL_PROTECTION':stage='S1_PROFIT_PROTECTION'
         floor=state.floor_price
         candidate=state.stop_price
+        exhausted=_is_exhaustion_or_weakening(regime,evidence)
+        effective_distance=distance
+        if state.scheme=='APTS' and regime=='NORMAL_UPTREND' and evidence.higher_low_5m and not evidence.adverse_move and evidence.buy_ratio>=Decimal('0.50') and evidence.atr>0:
+            atr_band=min(Decimal('0.0095'),max(Decimal('0.005'),(Decimal('1.5')*evidence.atr)/bid))
+            effective_distance=max(effective_distance,atr_band)
+        ex_s1=(stage=='S1_PROFIT_PROTECTION' and state.scheme=='APTS' and peak_gross>=S1_DYNAMIC_LOCK_TRIGGER and exhausted)
+        ex_s2=(stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION') and state.scheme=='APTS' and peak_gross>=S2_EXHAUSTION_TIGHTEN_TRIGGER and exhausted)
+        wants_weakening_shrink=(stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION') and state.scheme=='APTS' and regime=='WEAKENING')
+        wants_tighten=ex_s1 or ex_s2 or wants_weakening_shrink
+        cur_bar_id=evidence.bar_time_ms if evidence.bar_time_ms>0 else (context.decision_time_ms//60_000)+1
+        exhaustion_hits=state.exhaustion_hits
+        exhaustion_last_bar=state.exhaustion_last_bar_ms
+        last_normal_distance=state.last_normal_distance
+        if wants_tighten:
+            if cur_bar_id!=exhaustion_last_bar:
+                exhaustion_hits+=1
+                exhaustion_last_bar=cur_bar_id
+        else:
+            exhaustion_hits=0
+            exhaustion_last_bar=0
+            if state.scheme=='APTS' and regime!='WEAKENING':
+                last_normal_distance=max(effective_distance,Decimal('0.005'))
+        tighten_confirmed=wants_tighten and exhaustion_hits>=max(1,state.exhaustion_confirm_bars)
         if stage!='S0_INITIAL_PROTECTION':
             floor=max(floor,profit_floor(state.entry_price,state.entry_fee_rate,state.exit_fee_rate,state.slippage_rate,tick))
             if floor>=bid:
@@ -118,13 +178,22 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
                 reasons.append('POSITIVE_NET_PROFIT_NOT_LOCKED')
                 status='EXIT_REQUIRED'
             else:candidate=max(candidate,floor)
+        if stage=='S1_PROFIT_PROTECTION' and state.scheme=='APTS' and peak_gross>=S1_DYNAMIC_LOCK_TRIGGER:
+            s1_dist=Decimal('0.004') if (ex_s1 and tighten_confirmed) else Decimal('0.0055')
+            candidate=max(candidate,high*(1-s1_dist))
+            if ex_s1 and tighten_confirmed:reasons.append('S1_EXHAUSTION_LOCK_TIGHTENED')
+            elif ex_s1:reasons.append('S1_EXHAUSTION_PENDING_CONFIRMATION')
         if stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION'):
             if state.scheme=='APTS':
-                if gross>=Decimal('0.030') and (regime=='WEAKENING' or evidence.failed_new_high or (evidence.adverse_move and evidence.buy_ratio<Decimal('0.48'))):
+                if regime=='WEAKENING' and not tighten_confirmed:
+                    distance=max(last_normal_distance,Decimal('0.005'))
+                else:
+                    distance=effective_distance
+                if ex_s2 and tighten_confirmed:
                     distance=min(distance,Decimal('0.004'))
-                elif regime=='NORMAL_UPTREND' and evidence.higher_low_5m and not evidence.adverse_move and evidence.buy_ratio>=Decimal('0.50') and evidence.atr>0:
-                    atr_band=min(Decimal('0.0095'),max(Decimal('0.005'),(Decimal('1.5')*evidence.atr)/bid))
-                    distance=max(distance,atr_band)
+                    reasons.append('S2_EXHAUSTION_TRAILING_TIGHTENED')
+                elif ex_s2 or wants_weakening_shrink:
+                    reasons.append('S2_EXHAUSTION_PENDING_CONFIRMATION')
             candidate=max(candidate,high*(1-distance))
         s0_half_stop=ceil_step(state.entry_price-(state.entry_price-state.floor_price)*Decimal('0.5'),tick)
         if stage=='S0_INITIAL_PROTECTION' and high>=state.entry_price*Decimal('1.006') and s0_half_stop<bid:
@@ -154,7 +223,11 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
         # A stop that cannot be newly established below the current market is
         # not advertised as newly effective. Preserve the previous valid stop.
         effective=max(state.stop_price,candidate) if candidate<bid else state.stop_price
-        current=replace(current,stage=stage,high_price=high,floor_price=floor,stop_price=effective,reversal_hits=reversal_hits)
+        current=replace(
+            current,stage=stage,high_price=high,floor_price=floor,stop_price=effective,
+            reversal_hits=reversal_hits,exhaustion_hits=exhaustion_hits,
+            exhaustion_last_bar_ms=exhaustion_last_bar,last_normal_distance=last_normal_distance,
+        )
     if context.decision_time_ms>state.last_decision_time_ms and fresh:
         current=replace(current,last_decision_time_ms=context.decision_time_ms)
     assert current.stop_price>=state.stop_price

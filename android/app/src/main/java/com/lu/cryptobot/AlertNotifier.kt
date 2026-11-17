@@ -24,8 +24,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 object AlertNotifier {
-    const val CRITICAL_CHANNEL_ID = "solbot_critical_alarm_v2"
-    const val UPDATES_CHANNEL_ID = "updates"
+    const val CRITICAL_CHANNEL_ID = "solbot_critical_alarm_v3"
+    const val UPDATES_CHANNEL_ID = "solbot_silent_updates_v1"
 
     private val _popupEvents = MutableSharedFlow<AlertRecord>(extraBufferCapacity = 16)
     val popupEvents = _popupEvents.asSharedFlow()
@@ -45,10 +45,10 @@ object AlertNotifier {
 
         val criticalChannel = NotificationChannel(
             CRITICAL_CHANNEL_ID,
-            "交易与信号强预警（锁屏弹窗+响铃）",
+            "紧急故障与交易强预警（锁屏弹窗+响铃）",
             NotificationManager.IMPORTANCE_HIGH,
         ).apply {
-            description = "每次策略信号触发、实盘成交、止盈止损时强制锁屏弹窗与响铃"
+            description = "策略信号、实盘交易、服务器故障及 SOL-bot 服务故障时锁屏弹窗与响铃"
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             enableVibration(true)
             vibrationPattern = longArrayOf(0, 500, 200, 500, 200, 800)
@@ -62,19 +62,26 @@ object AlertNotifier {
 
         val updatesChannel = NotificationChannel(
             UPDATES_CHANNEL_ID,
-            "一般状态同步",
-            NotificationManager.IMPORTANCE_DEFAULT,
+            "一般状态静默同步",
+            NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            description = "仅静默同步状态，不弹窗不响铃"
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
+            lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         }
         manager.createNotificationChannel(updatesChannel)
+        runCatching { manager.deleteNotificationChannel("updates") }
     }
 
     fun notify(context: Context, record: AlertRecord, urgent: Boolean = true) {
+        // Security audit messages remain strictly silent inside Serv Status; never popup or ring.
+        if (record.eventId.startsWith("sec:")) return
         val appContext = context.applicationContext
-        _popupEvents.tryEmit(record)
         ensureChannels(appContext)
         if (urgent) {
+            _popupEvents.tryEmit(record)
             wakeScreen(appContext)
             playAlarmAndVibrate(appContext)
         }
@@ -115,16 +122,23 @@ object AlertNotifier {
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body).setBigContentTitle(title))
-            .setPriority(if (urgent) NotificationCompat.PRIORITY_MAX else NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setVibrate(longArrayOf(0, 500, 200, 500, 200, 800))
             .setContentIntent(clickPending)
             .setAutoCancel(true)
 
         if (urgent) {
-            builder.setFullScreenIntent(fullScreenPending, true)
+            builder
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setVibrate(longArrayOf(0, 500, 200, 500, 200, 800))
+                .setFullScreenIntent(fullScreenPending, true)
+        } else {
+            builder
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setSilent(true)
         }
 
         runCatching { manager.notify(notifyId, builder.build()) }

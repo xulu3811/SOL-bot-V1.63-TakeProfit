@@ -6,7 +6,7 @@ import json
 
 VERSION = 'r2-rebound-2'
 PARAMETERS = {'candidate_ms': 7200000, 'recovery_ms': 1800000,
-              'oversold': 20, 'recovery': 48, 'order_ms': 60000,
+              'oversold': 20, 'recovery': 48, 'order_ms': 300000,
               'atr_buffer': '0.15', 'chase': '0.003', 'maximum_candidate_ms': 14400000}
 PARAMETER_HASH = sha256(json.dumps(PARAMETERS, sort_keys=True).encode()).hexdigest()
 TERMINAL = {'IDLE', 'INVALIDATED', 'EXPIRED', 'CONSUMED'}

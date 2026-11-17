@@ -143,7 +143,7 @@ class ShadowExecutor:
             db.executemany("UPDATE shadow_orders SET status='EXPIRED',reserved='0',close_reason='signal_expired' WHERE order_id=?",
                            [(row["order_id"],) for row in rows])
 
-    def submit_candidate(self, candidate, *, notional="300", now_ms=None, limit_price=None):
+    def submit_candidate(self, candidate, *, notional="300", now_ms=None, limit_price=None, allow_price_below_low=False):
         """Create a pending BUY; repeated identical signal requests return its order."""
         now_ms = timestamp(now_ms if now_ms is not None else time.time_ns() // 1_000_000)
         if not isinstance(candidate, dict) or candidate.get("accepted") is not True or candidate.get("reasons"):
@@ -162,7 +162,8 @@ class ShadowExecutor:
         price = amount(limit_price if limit_price is not None else candidate["entry_high"])
         size = amount(notional, "notional")
         min_bound = getattr(self, "_effective_minimum_notional", self.minimum_notional)
-        if not low <= price <= high or not min_bound <= size <= self.maximum_notional:
+        price_ok = (low <= high and Decimal("0") < price <= high) if allow_price_below_low else (low <= price <= high)
+        if not price_ok or not min_bound <= size <= self.maximum_notional:
             raise ShadowRejected("DENY_SIZE_PRICE", "order must stay within candidate price and account notional bounds")
         encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode()) > 65_536:

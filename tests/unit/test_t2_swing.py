@@ -53,6 +53,37 @@ class T2RuleTests(unittest.TestCase):
         _, reasons = assess(candles(), down, "DOWNTREND")
         self.assertIn("FOUR_HOUR_DOWNTREND", reasons)
 
+    def test_downtrend_extreme_reversal_requires_1m_confirmation(self):
+        c = {
+            "5m": [
+                {"close_time": 1_200, "open": "99", "high": "99.5", "low": "96.0", "close": "97.0", "quote_volume": "1000", "taker_buy_quote_volume": "400"},
+                {"close_time": 1_500, "open": "97.0", "high": "98.0", "low": "96.2", "close": "97.5", "quote_volume": "1000", "taker_buy_quote_volume": "450"},
+                {"close_time": 1_800, "open": "97.5", "high": "99.0", "low": "96.8", "close": "98.8", "quote_volume": "1000", "taker_buy_quote_volume": "580"},
+            ],
+            "1h": [{"close": "100"}],
+            "15m": [{"low": "96", "close": "98.8"}],
+            "1m": [
+                {"open_time": 1_620, "close_time": 1_680, "open": "97.2", "high": "97.6", "low": "96.8", "close": "97.4"},
+                {"open_time": 1_680, "close_time": 1_740, "open": "97.4", "high": "98.0", "low": "97.1", "close": "97.9"},
+                {"open_time": 1_740, "close_time": 1_800, "open": "97.9", "high": "99.0", "low": "97.5", "close": "98.8"},
+            ],
+        }
+        m = {
+            "4h": {"ema20": [95.0], "ema50": [105.0]},
+            "1h": {"ema20": [105.0]},
+            "15m": {"ema20": [100.0], "rsi6": [18.0, 21.0, 25.0], "rvol20": [1.5, 1.3, 1.1]},
+            "5m": {"rsi6": [12.0, 20.0, 26.0], "rvol20": [2.0, 1.5, 1.3], "atr14": [0.5]},
+        }
+        # On the 5m close bar itself, confirm_1m is still False -> must reject with ONE_MINUTE_BREAKOUT_UNCONFIRMED.
+        factors_unconf, reasons_unconf = assess(c, m, "DOWNTREND")
+        self.assertEqual(reasons_unconf, ["ONE_MINUTE_BREAKOUT_UNCONFIRMED"])
+        self.assertLess(factors_unconf["structure"], 1.0)
+        # Once subsequent 1m breakout confirms past 5m close_time (1_800), extreme reversal is accepted.
+        c["1m"].append({"open_time": 1_800, "close_time": 1_860, "open": "98.8", "high": "99.4", "low": "98.5", "close": "99.3"})
+        factors_ok, reasons_ok = assess(c, m, "DOWNTREND")
+        self.assertEqual(reasons_ok, [])
+        self.assertEqual(factors_ok["structure"], 1.0)
+
     def test_full_setup_has_no_hard_reason(self):
         _, reasons = assess(candles(), metrics(), "UNCERTAIN")
         self.assertEqual(reasons, [])

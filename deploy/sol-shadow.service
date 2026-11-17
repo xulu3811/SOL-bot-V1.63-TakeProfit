@@ -3,6 +3,7 @@ Description=SOL-bot P3 protected simulation worker
 After=network-online.target solbot-market.service
 [Service]
 Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
+Environment=SOLBOT_LIVE_STRATEGIES=T1,T2,R2
 ExecStart=/opt/sol-bot/venv/bin/python -m solbot.p3_runtime --symbol SOLUSDT --micro-db /var/lib/sol-bot/database/sol-micro.sqlite --audit-db /var/lib/sol-bot/database/sol-math-audit.sqlite --market-db /var/lib/sol-bot/database/market.sqlite --strategy-db /var/lib/sol-bot/database/sol-shadow-strategy.sqlite --status-path /var/lib/sol-bot/sol-shadow-status.json --shadow-db /var/lib/sol-bot/database/sol-shadow.sqlite
 Type=simple
 User=solbot

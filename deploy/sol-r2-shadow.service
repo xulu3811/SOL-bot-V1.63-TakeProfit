@@ -3,6 +3,7 @@ Description=SOL R2 isolated rebound paper worker
 After=network-online.target solbot-market.service solbot-micro-sol.service
 [Service]
 Environment=SOLBOT_TRADING_CONFIG_PATH=/var/lib/sol-bot/shared/trading-config.json
+Environment=SOLBOT_LIVE_STRATEGIES=T1,T2,R2
 Type=simple
 User=solbot
 Group=solbot

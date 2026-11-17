@@ -2,8 +2,10 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
@@ -11,10 +13,33 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode
 from urllib.request import Request, urlopen
 
+try:
+    import httpx
+except ImportError:  # pragma: no cover - fallback when httpx is absent
+    httpx = None
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from solbot.execution.live_policy import (
+    BNB_MAX_HOLDING_USDT,
+    BNB_MIN_RESERVE_USDT,
+    BNB_REFILL_COOLDOWN_MS,
+    BNB_REFILL_TARGET_USDT,
+    DEFAULT_FEE_RATE as POLICY_FEE_RATE,
+    DEFAULT_SLIPPAGE_RATE as POLICY_SLIPPAGE_RATE,
+    LIVE_MAX_ORDER_USDT,
+    LIVE_MIN_ORDER_USDT,
+    compute_bnb_refill_order,
+    compute_entry_limit_price,
+    compute_live_order_size,
+    is_custom_trading_config,
+    parse_allowed_strategies,
+    r2_risk_notional,
+)
 from solbot.mathematics.decimal_utils import floor_step
-from solbot.strategy.t2_swing import risk_notional
+from solbot.mathematics.trend_exhaustion import FlowSmoother
+
+logger = logging.getLogger(__name__)
 
 HOST = 'https://api.binance.com'
 READ_PATHS = frozenset((
@@ -25,27 +50,31 @@ READ_PATHS = frozenset((
 ASSETS = ('SOL', 'USDT', 'BNB')
 STOP_TYPES = frozenset(('STOP_LOSS', 'STOP_LOSS_LIMIT'))
 BOT_ORDER_PREFIXES = ('sb5-', 'p5p-', 'p5x-', 'cbotby', 'cbotsl', 'cbotex', 'cbot2s', 'cbot2x')
+BNB_REFILL_PREFIX = 'cbotbn'
 STOP_PREFIXES = ('cbotsl', 'cbot2s', 'p5p-')
 EXIT_LIMIT_PREFIXES = ('cbot2x', 'cbotex', 'p5x-')
 EXIT_MARKET_PREFIXES = ('cbot2x', 'cbotex', 'p5x-')
 DELETE_PREFIXES = ('cbotby', 'cbotsl', 'cbotex', 'cbot2s', 'cbot2x', 'p5p-', 'p5x-')
-DEFAULT_LIVE_STRATEGIES = tuple(
-    item.strip() for item in os.environ.get('SOLBOT_LIVE_STRATEGIES', 'T1').split(',') if item.strip()
-) or ('T1',)
+DEFAULT_LIVE_STRATEGIES = parse_allowed_strategies()
 APTS_STAGE_SHORT = {
     'S0_INITIAL_PROTECTION': 'S0',
     'S1_PROFIT_PROTECTION': 'S1',
     'S2_ADAPTIVE_TRAILING': 'S2',
     'S3_TREND_EXHAUSTION': 'S3',
 }
-DEFAULT_FEE_RATE = '0.00075'
-DEFAULT_SLIPPAGE_RATE = '0.00075'
+DEFAULT_FEE_RATE = format(POLICY_FEE_RATE, 'f')
+DEFAULT_SLIPPAGE_RATE = format(POLICY_SLIPPAGE_RATE, 'f')
 EXIT_PENDING_TIMEOUT_MS = 5000
 STOP_REPLACE_MIN_INTERVAL_MS = 15000
 STOP_REPLACE_MIN_STEP_PCT = Decimal('0.0015')
 CROSS_STRATEGY_COOLDOWN_MS = 900_000
-MIN_ORDER_USDT = Decimal('500')
-MAX_ORDER_USDT = Decimal('1000')
+SPOT_VERIFY_CACHE_MS = 60_000
+SERVER_TIME_CACHE_MS = 60_000
+BUY_CHASE_INTERVAL_MS = 5_000
+BUY_CHASE_MAX_COUNT = 4
+MAX_EXPIRED_REENTRY_COUNT = 1
+MIN_ORDER_USDT = LIVE_MIN_ORDER_USDT
+MAX_ORDER_USDT = LIVE_MAX_ORDER_USDT
 DUST_NOTIONAL_USDT = Decimal('5')
 
 
@@ -53,7 +82,52 @@ def _fields(query):
     return dict(parse_qsl(query, keep_blank_values=True))
 
 
+def _raise_mapped_binance_error(raw_bytes):
+    try:
+        payload = json.loads(raw_bytes[:100_000])
+    except (ValueError, OSError):
+        payload = {}
+    code = payload.get('code') if isinstance(payload, dict) else None
+    if code == -2011:
+        raise ValueError('ORDER_GONE') from None
+    if code == -2022 and isinstance(payload.get('data'), dict):
+        data = payload['data']
+        cancel_code = (data.get('cancelResponse') or {}).get('code') if isinstance(data.get('cancelResponse'), dict) else None
+        new_code = (data.get('newOrderResponse') or {}).get('code') if isinstance(data.get('newOrderResponse'), dict) else None
+        if data.get('cancelResult') == 'FAILURE' or cancel_code == -2011:
+            raise ValueError('ORDER_GONE') from None
+        if new_code == -2010:
+            raise ValueError('INSUFFICIENT_FREE_SOL') from None
+    if code in (-2010, -2015):
+        raise ValueError('TRADE_PERMISSION_REQUIRED' if code == -2015 else 'INSUFFICIENT_FREE_SOL') from None
+    raise ValueError('PROTECTION_REJECTED') from None
+
+
 class UrlTransport:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._client = None
+
+    def _get_client(self):
+        with self._lock:
+            if self._client is None:
+                self._client = httpx.Client(
+                    timeout=12.0,
+                    limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+                )
+            return self._client
+
+    def _reset_client(self, old_client=None):
+        with self._lock:
+            if old_client is not None and self._client is not old_client:
+                return
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._client = None
+
     def request(self, path, query, headers, method='GET'):
         method = method.upper()
         if not isinstance(query, str) or len(query) > 4000:
@@ -81,9 +155,22 @@ class UrlTransport:
                 raise ValueError('BINANCE_REJECTED')
             url, body = HOST + path, query.encode()
         elif method in ('POST', 'DELETE') and path == '/api/v3/order':
-            if fields.get('symbol') != 'SOLUSDT':
+            symbol = fields.get('symbol')
+            if symbol == 'BNBUSDT':
+                if method != 'POST' or fields.get('side') != 'BUY' or fields.get('type') != 'LIMIT' or fields.get('timeInForce') != 'IOC':
+                    raise ValueError('BINANCE_REJECTED')
+                if not str(fields.get('newClientOrderId', '')).startswith(BNB_REFILL_PREFIX):
+                    raise ValueError('BINANCE_REJECTED')
+                try:
+                    bnb_qty = Decimal(str(fields.get('quantity') or '0'))
+                    bnb_px = Decimal(str(fields.get('price') or '0'))
+                except Exception:
+                    raise ValueError('BINANCE_REJECTED') from None
+                if bnb_qty <= 0 or bnb_px <= 0 or bnb_qty * bnb_px > BNB_MAX_HOLDING_USDT:
+                    raise ValueError('BINANCE_REJECTED')
+            elif symbol != 'SOLUSDT':
                 raise ValueError('BINANCE_REJECTED')
-            if method == 'POST' and fields.get('side') == 'BUY':
+            elif method == 'POST' and fields.get('side') == 'BUY':
                 if fields.get('type') != 'LIMIT' or not str(fields.get('newClientOrderId', '')).startswith('cbotby'):
                     raise ValueError('BINANCE_REJECTED')
             elif method == 'POST':
@@ -104,8 +191,28 @@ class UrlTransport:
                 url, body = HOST + path + '?' + query, None
         else:
             raise ValueError('BINANCE_REJECTED')
+        req_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded'}
+        if httpx is not None:
+            for attempt in range(2):
+                client = self._get_client()
+                try:
+                    response = client.request(method, url, content=body, headers=req_headers)
+                    break
+                except (httpx.RemoteProtocolError, httpx.ConnectError):
+                    self._reset_client(client)
+                    if method == 'GET' and attempt == 0:
+                        continue
+                    raise ValueError('BINANCE_UNREACHABLE') from None
+                except (httpx.HTTPError, TimeoutError, OSError):
+                    raise ValueError('BINANCE_UNREACHABLE') from None
+            if response.status_code >= 400:
+                _raise_mapped_binance_error(response.content)
+            raw = response.content
+            if len(raw) > 1_000_000:
+                raise ValueError('BINANCE_REJECTED')
+            return json.loads(raw)
         try:
-            request = Request(url, data=body, headers={**headers, 'Content-Type': 'application/x-www-form-urlencoded'}, method=method)
+            request = Request(url, data=body, headers=req_headers, method=method)
             with urlopen(request, timeout=12) as response:
                 raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
@@ -113,23 +220,10 @@ class UrlTransport:
                 return json.loads(raw)
         except HTTPError as error:
             try:
-                payload = json.loads(error.read(100000))
-            except (ValueError, OSError):
-                payload = {}
-            code = payload.get('code') if isinstance(payload, dict) else None
-            if code == -2011:
-                raise ValueError('ORDER_GONE') from None
-            if code == -2022 and isinstance(payload.get('data'), dict):
-                data = payload['data']
-                cancel_code = (data.get('cancelResponse') or {}).get('code') if isinstance(data.get('cancelResponse'), dict) else None
-                new_code = (data.get('newOrderResponse') or {}).get('code') if isinstance(data.get('newOrderResponse'), dict) else None
-                if data.get('cancelResult') == 'FAILURE' or cancel_code == -2011:
-                    raise ValueError('ORDER_GONE') from None
-                if new_code == -2010:
-                    raise ValueError('INSUFFICIENT_FREE_SOL') from None
-            if code in (-2010, -2015):
-                raise ValueError('TRADE_PERMISSION_REQUIRED' if code == -2015 else 'INSUFFICIENT_FREE_SOL') from None
-            raise ValueError('PROTECTION_REJECTED') from None
+                err_bytes = error.read(100000)
+            except OSError:
+                err_bytes = b''
+            _raise_mapped_binance_error(err_bytes)
         except (URLError, TimeoutError, OSError):
             raise ValueError('BINANCE_UNREACHABLE') from None
 
@@ -144,6 +238,13 @@ class AccountVault:
         self.db_path = self.root / 'binance-vault.sqlite'
         self.snapshot_path = self.root / 'binance-snapshot.sqlite'
         self._rules_cache = None
+        self._bnb_rules_cache = None
+        self._bnb_lock = threading.Lock()
+        self._last_bnb_refill_at = 0
+        self._spot_verified_until = 0
+        self._time_offset_ms = None
+        self._time_synced_at = 0
+        self._flow_smoother = FlowSmoother()
 
     def status(self):
         row = self._meta()
@@ -156,10 +257,16 @@ class AccountVault:
 
     def save(self, api_key, secret):
         api_key, secret = self._shape(api_key, secret)
+        self._spot_verified_until = 0
+        self._time_offset_ms = None
+        self._time_synced_at = 0
+        self._flow_smoother = FlowSmoother()
         try:
             spot_enabled = self._permissions(api_key, secret)
             self._store(api_key, secret, orders_enabled=spot_enabled)
             summary = self._sync(api_key, secret, spot_hint=spot_enabled)
+            if spot_enabled:
+                self._spot_verified_until = int(self.clock()) + SPOT_VERIFY_CACHE_MS
         finally:
             api_key = secret = None
         summary.update(self.status())
@@ -198,6 +305,10 @@ class AccountVault:
             self.cancel_manual()
         except ValueError:
             pass
+        self._spot_verified_until = 0
+        self._time_offset_ms = None
+        self._time_synced_at = 0
+        self._flow_smoother = FlowSmoother()
         with self._db() as db:
             db.execute('DELETE FROM credentials')
             db.execute('DELETE FROM sync_state')
@@ -534,27 +645,17 @@ class AccountVault:
     @staticmethod
     def _r2_notional(equity, stop_distance, fee_rate, score='85', min_order_usdt=MIN_ORDER_USDT, max_order_usdt=MAX_ORDER_USDT):
         try:
-            equity = Decimal(str(equity))
-            stop = Decimal(str(stop_distance))
-            fee = Decimal(str(fee_rate))
-            score_dec = Decimal(str(score))
-            min_u = Decimal(str(min_order_usdt))
-            max_u = Decimal(str(max_order_usdt))
+            return r2_risk_notional(
+                equity,
+                stop_distance,
+                fee_rate,
+                score,
+                min_order_usdt=min_order_usdt,
+                max_order_usdt=max_order_usdt,
+                is_custom_cfg=False,
+            )
         except Exception:
             return None
-        if equity <= 0 or stop < Decimal('0.005') or stop > Decimal('0.050'):
-            return None
-        if fee < 0 or fee > Decimal('0.01') or min_u <= 0 or max_u < min_u:
-            return None
-        loss = stop + fee + fee + Decimal('0.002')
-        if loss <= 0:
-            return None
-        span = min(Decimal('1'), max(Decimal('0'), (score_dec - Decimal('75')) / Decimal('25')))
-        score_cap = min_u + span * (max_u - min_u)
-        risk_cap = equity * Decimal('0.010') / loss
-        if risk_cap < min_u:
-            return None
-        return min(max_u, score_cap, risk_cap)
 
     def consider_entry(self, reader, bid, tick, now, allowed_strategies=None, ask=None):
         """Place at most one SOL limit buy from an accepted live strategy signal."""
@@ -569,7 +670,7 @@ class AccountVault:
         min_order_usdt = Decimal(str(cfg.get('min_order_usdt') or '500'))
         max_order_usdt = Decimal(str(cfg.get('max_order_usdt') or '1000'))
         max_slots = int(cfg.get('max_slots') or 2)
-        is_custom_cfg = bool(cfg.get('custom')) and (min_order_usdt != MIN_ORDER_USDT or max_order_usdt != MAX_ORDER_USDT)
+        is_custom_cfg = is_custom_trading_config(cfg, min_order_usdt, max_order_usdt)
         bid_dec = Decimal(str(bid))
         open_slots = len(self.open_bot_slots(mark_price=bid_dec if bid_dec > 0 else None))
         if open_slots >= max_slots:
@@ -580,21 +681,21 @@ class AccountVault:
         ask_dec = Decimal(str(ask)) if ask is not None else bid_dec
         if ask_dec <= 0:
             ask_dec = bid_dec
-        entry_high = signal.get('entry_high')
-        if signal['strategy_id'] in ('T2', 'R2') and entry_high is not None and entry_high > 0:
-            if bid_dec > entry_high:
-                return {'placed': False, 'reason': 'CHASE_EXCEEDED', 'buy_orders': 0}
-            raw_price = min(entry_high, ask_dec)
-        else:
-            raw_price = min(signal['limit'], bid_dec)
-        tick_dec = Decimal(str(tick))
-        price = self._floor(raw_price, tick_dec) if tick_dec > 0 else raw_price
-        if price <= 0:
-            return {'placed': False, 'reason': 'INVALID_PRICE', 'buy_orders': 0}
+        price, price_err = compute_entry_limit_price(
+            signal['strategy_id'],
+            signal.get('limit'),
+            signal.get('entry_high'),
+            bid_dec,
+            ask_dec,
+            tick,
+        )
+        if price is None:
+            return {'placed': False, 'reason': price_err, 'buy_orders': 0}
         below_min_code = 'USDT_BELOW_500' if min_order_usdt == Decimal('500') else 'USDT_BELOW_MIN'
+        reentry_num = int(signal.get('reentry_count') or 0)
         api_key, secret = self._load()
         try:
-            self._require_spot(api_key, secret)
+            self._require_spot(api_key, secret, now)
             account = self._signed('/api/v3/account', {}, api_key, secret, now)
             free = usdt_total = sol_total = Decimal('0')
             for row in account.get('balances') or []:
@@ -607,54 +708,89 @@ class AccountVault:
             if free < min_order_usdt or price <= 0:
                 return {'placed': False, 'reason': below_min_code, 'buy_orders': 0}
             ref_equity = max(Decimal('2000'), usdt_total + sol_total * bid_dec)
-            score_dec = Decimal(str(signal.get('score') or '85'))
-            span = min(Decimal('1'), max(Decimal('0'), (score_dec - Decimal('75')) / Decimal('25')))
-            if signal['strategy_id'] == 'T2':
-                if not is_custom_cfg:
-                    target_notional = risk_notional(ref_equity, signal['stop_distance'], DEFAULT_FEE_RATE, signal['score'])
-                    if target_notional is None:
-                        return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
-                else:
-                    if risk_notional(max(ref_equity, Decimal('5000')), signal['stop_distance'], DEFAULT_FEE_RATE, signal['score']) is None:
-                        return {'placed': False, 'reason': 'T2_SIZE', 'buy_orders': 0}
-                    target_notional = min_order_usdt + span * (max_order_usdt - min_order_usdt)
-            elif signal['strategy_id'] == 'R2':
-                eff_eq = max(ref_equity, max_order_usdt * Decimal('2.5')) if is_custom_cfg else ref_equity
-                target_notional = self._r2_notional(
-                    eff_eq, signal['stop_distance'], DEFAULT_FEE_RATE, signal.get('score') or '85',
-                    min_order_usdt=min_order_usdt, max_order_usdt=max_order_usdt,
-                )
-                if target_notional is None:
-                    return {'placed': False, 'reason': 'R2_SIZE', 'buy_orders': 0}
-            else:
-                target_notional = min_order_usdt + span * (max_order_usdt - min_order_usdt) if is_custom_cfg else signal['notional']
-            notional = min(max_order_usdt, max(min_order_usdt, target_notional), free)
-            if notional < min_order_usdt:
-                return {'placed': False, 'reason': below_min_code, 'buy_orders': 0}
             rules = self._get_sol_rules(now)
-            qty = self._floor(notional / price, rules['step'])
-            step_tolerance = price * rules['step']
-            min_notional = max(min_order_usdt - step_tolerance, rules.get('min_notional') or Decimal('5'))
-            if qty <= 0 or qty < rules['min_qty'] or qty * price < min_notional:
-                return {'placed': False, 'reason': 'BELOW_MIN_NOTIONAL', 'buy_orders': 0}
-            client_id = 'cbotby' + hashlib.sha256(signal['signal_id'].encode()).hexdigest()[:16]
-            placed = self._signed('/api/v3/order', {
-                'symbol': 'SOLUSDT', 'side': 'BUY', 'type': 'LIMIT', 'timeInForce': 'GTC',
-                'quantity': format(qty, 'f'), 'price': format(price, 'f'), 'newClientOrderId': client_id,
-            }, api_key, secret, now, method='POST')
+            qty, _order_notional, notional, size_err = compute_live_order_size(
+                signal['strategy_id'],
+                price,
+                free,
+                ref_equity,
+                signal.get('stop_distance'),
+                fee_rate=DEFAULT_FEE_RATE,
+                score=signal.get('score') or '85',
+                min_order_usdt=min_order_usdt,
+                max_order_usdt=max_order_usdt,
+                is_custom_cfg=is_custom_cfg,
+                step_size=rules['step'],
+                min_qty=rules['min_qty'],
+                rules_min_notional=rules.get('min_notional') or Decimal('5'),
+            )
+            if qty is None:
+                return {'placed': False, 'reason': size_err, 'buy_orders': 0}
+            self.ensure_bnb_fee_reserve(
+                api_key, secret, now,
+                account=account,
+                reserved_usdt=_order_notional * Decimal('1.002'),
+                reason='SOL_BUY',
+            )
+            suffix = f':r{reentry_num}' if reentry_num > 0 else ''
+            client_id = 'cbotby' + hashlib.sha256((signal['signal_id'] + suffix).encode()).hexdigest()[:16]
+            try:
+                placed = self._signed('/api/v3/order', {
+                    'symbol': 'SOLUSDT', 'side': 'BUY', 'type': 'LIMIT', 'timeInForce': 'GTC',
+                    'quantity': format(qty, 'f'), 'price': format(price, 'f'), 'newClientOrderId': client_id,
+                }, api_key, secret, now, method='POST')
+            except ValueError as exc:
+                if str(exc) in ('TRADE_PERMISSION_REQUIRED', 'WITHDRAWALS_ENABLED'):
+                    self._spot_verified_until = 0
+                raise
         finally:
             api_key = secret = None
         stop_dist = str(signal.get('stop_distance') or '0.010')
+        p_status = str(placed.get('status') or 'NEW').upper()
+        p_exec = Decimal(str(placed.get('executedQty') or '0'))
+        p_fill_px = self._fill_price(placed)
+        if p_status == 'FILLED' or (p_status in ('CANCELED', 'EXPIRED', 'REJECTED') and p_exec > 0):
+            row_status = 'FILLED'
+            row_price = p_fill_px if Decimal(p_fill_px) > 0 else format(price, 'f')
+            row_qty = format(p_exec, 'f') if p_exec > 0 else format(qty, 'f')
+            row_filled_at = int(placed.get('transactTime') or now)
+        elif p_status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            row_status = p_status
+            row_price = format(price, 'f')
+            row_qty = format(qty, 'f')
+            row_filled_at = None
+        else:
+            row_status = 'NEW'
+            row_price = format(price, 'f')
+            row_qty = format(qty, 'f')
+            row_filled_at = None
+        row_quote = format(Decimal(row_price) * Decimal(row_qty), 'f')
+        entry_high_str = format(signal['entry_high'], 'f') if signal.get('entry_high') else None
+        cand_low_str = format(signal['candidate_low'], 'f') if signal.get('candidate_low') else None
         with self._db() as db:
             db.execute(
-                'INSERT OR IGNORE INTO bot_orders(signal_id,client_order_id,exchange_order_id,price,quantity,quote,status,created_at,stop_distance,strategy_id,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                'INSERT INTO bot_orders('
+                'signal_id,client_order_id,exchange_order_id,price,quantity,quote,status,created_at,'
+                'stop_distance,strategy_id,expires_at,filled_at,entry_high,candidate_low,chase_count,last_chase_at,reentry_count'
+                ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
+                'ON CONFLICT(signal_id) DO UPDATE SET '
+                'client_order_id=excluded.client_order_id,exchange_order_id=excluded.exchange_order_id,'
+                'price=excluded.price,quantity=excluded.quantity,quote=excluded.quote,status=excluded.status,'
+                'created_at=excluded.created_at,stop_distance=excluded.stop_distance,strategy_id=excluded.strategy_id,'
+                'expires_at=excluded.expires_at,filled_at=excluded.filled_at,entry_high=excluded.entry_high,'
+                'candidate_low=excluded.candidate_low,chase_count=0,last_chase_at=excluded.last_chase_at,'
+                'reentry_count=excluded.reentry_count '
+                "WHERE bot_orders.status='EXPIRED' AND bot_orders.filled_at IS NULL",
                 (
                     signal['signal_id'], client_id, str(placed.get('orderId') or ''),
-                    format(price, 'f'), format(qty, 'f'), format(qty * price, 'f'),
-                    'NEW', now, stop_dist, signal['strategy_id'], signal.get('expires_at'),
+                    row_price, row_qty, row_quote, row_status, now, stop_dist,
+                    signal['strategy_id'], signal.get('expires_at'), row_filled_at,
+                    entry_high_str, cand_low_str, 0, now, reentry_num,
                 ),
             )
-        return {'placed': True, 'signal_id': signal['signal_id'], 'strategy_id': signal['strategy_id'], 'quantity': format(qty, 'f'), 'price': format(price, 'f'), 'buy_orders': 1}
+        if row_status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            return {'placed': False, 'reason': row_status, 'signal_id': signal['signal_id'], 'buy_orders': 0}
+        return {'placed': True, 'signal_id': signal['signal_id'], 'strategy_id': signal['strategy_id'], 'quantity': row_qty, 'price': row_price, 'status': row_status, 'buy_orders': 1}
 
     def has_open_bots(self, include_dust=False):
         if not self.db_path.exists():
@@ -665,14 +801,16 @@ class AccountVault:
             return bool(count)
         return bool(self.open_bot_slots())
 
-    def sync_bot_stops(self, bid, tick, now, evidence=None, micro_features=None):
+    def sync_bot_stops(self, bid, tick, now, evidence=None, micro_features=None, ask=None):
         """Protect all live bot positions through APTS + atomic cancelReplace, and enforce 24h & 5s exit fallbacks."""
         bid = Decimal(str(bid))
         tick = Decimal(str(tick))
         now = int(now)
         with self._db() as db:
             rows = [tuple(row) for row in db.execute(
-                "SELECT signal_id,client_order_id,price,quantity,status,stop_distance,stop_client_id,filled_at,high_price,exit_client_id,stop_price,stop_updated_at,exit_started_at,strategy_id,expires_at "
+                "SELECT signal_id,client_order_id,price,quantity,status,stop_distance,stop_client_id,filled_at,"
+                "high_price,exit_client_id,stop_price,stop_updated_at,exit_started_at,strategy_id,expires_at,"
+                "entry_high,candidate_low,COALESCE(chase_count,0),COALESCE(last_chase_at,created_at) "
                 "FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')")]
         if not rows:
             return {'synced': True, 'open': 0}
@@ -687,10 +825,10 @@ class AccountVault:
         api_key, secret = self._load()
         actions = []
         try:
-            self._require_spot(api_key, secret)
+            self._require_spot(api_key, secret, now)
             for row in rows:
                 try:
-                    actions.append(self._sync_one_bot(api_key, secret, bid, tick, step, now, evidence, micro_features, *row))
+                    actions.append(self._sync_one_bot(api_key, secret, bid, tick, step, now, evidence, micro_features, *row, ask=ask))
                 except Exception as exc:
                     actions.append({'signal_id': row[0], 'error': type(exc).__name__})
         finally:
@@ -837,11 +975,90 @@ class AccountVault:
             self._record_bot_close(db, signal_id, entry_price, quantity, exit_px, now, exit_client_id=final_cid)
         return {'signal_id': signal_id, 'status': 'CLOSED', 'reason': 'DUST_BELOW_5_USDT'}
 
+    def _cancel_bot_buy_and_check_fill(self, api_key, secret, client_id, executed, now):
+        try:
+            cancelled = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now, method='DELETE')
+            cancel_exec = Decimal(str(cancelled.get('executedQty') or executed))
+            cancel_px = self._fill_price(cancelled)
+        except ValueError as exc:
+            if str(exc) != 'ORDER_GONE':
+                raise
+            refound = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now)
+            cancel_exec = Decimal(str(refound.get('executedQty') or executed))
+            cancel_px = self._fill_price(refound)
+        return cancel_exec, cancel_px
+
+    def _chase_bot_buy(self, api_key, secret, signal_id, client_id, strategy_id, found, price, qty,
+                       bid_dec, ask_dec, tick_dec, step, entry_high, chase_count, now):
+        try:
+            high_cap = Decimal(str(entry_high))
+            cur_limit = Decimal(str(found.get('price') or price))
+        except Exception:
+            return None
+        if high_cap <= 0 or cur_limit <= 0 or bid_dec > high_cap or ask_dec <= cur_limit:
+            return None
+        target_px, _err = compute_entry_limit_price(strategy_id, None, high_cap, bid_dec, ask_dec, tick_dec)
+        if target_px is None or target_px <= cur_limit:
+            return None
+        cancel_exec, cancel_px = self._cancel_bot_buy_and_check_fill(api_key, secret, client_id, Decimal('0'), now)
+        if cancel_exec > 0:
+            fill_px = cancel_px if Decimal(cancel_px) > 0 else price
+            return {'filled': True, 'price': fill_px, 'qty': format(cancel_exec, 'f'), 'filled_at': now}
+        orig_quote = Decimal(str(found.get('origQty') or qty)) * cur_limit
+        new_qty = floor_step(orig_quote / target_px, step)
+        rules = self._get_sol_rules(now)
+        if new_qty <= 0 or new_qty < rules['min_qty'] or new_qty * target_px < (rules.get('min_notional') or Decimal('5')):
+            with self._db() as db:
+                db.execute("UPDATE bot_orders SET status='CANCELED', reentry_count=COALESCE(reentry_count,0)+1 WHERE signal_id=?", (signal_id,))
+            return {'done': True, 'result': {'signal_id': signal_id, 'status': 'CANCELED'}}
+        next_chase = int(chase_count or 0) + 1
+        new_cid = 'cbotby' + hashlib.sha256(f'{signal_id}:chase:{next_chase}:{now}'.encode()).hexdigest()[:16]
+        try:
+            placed = self._signed('/api/v3/order', {
+                'symbol': 'SOLUSDT', 'side': 'BUY', 'type': 'LIMIT', 'timeInForce': 'GTC',
+                'quantity': format(new_qty, 'f'), 'price': format(target_px, 'f'), 'newClientOrderId': new_cid,
+            }, api_key, secret, now, method='POST')
+        except ValueError as exc:
+            if str(exc) in ('TRADE_PERMISSION_REQUIRED', 'WITHDRAWALS_ENABLED'):
+                self._spot_verified_until = 0
+            with self._db() as db:
+                db.execute("UPDATE bot_orders SET status='CANCELED' WHERE signal_id=?", (signal_id,))
+            return {'done': True, 'result': {'signal_id': signal_id, 'status': 'CANCELED', 'reason': str(exc)}}
+        p_status = str(placed.get('status') or 'NEW').upper()
+        p_exec = Decimal(str(placed.get('executedQty') or '0'))
+        p_fill_px = self._fill_price(placed)
+        new_exch_id = str(placed.get('orderId') or '')
+        if p_status == 'FILLED' or (p_status in ('CANCELED', 'EXPIRED', 'REJECTED') and p_exec > 0):
+            row_px = p_fill_px if Decimal(p_fill_px) > 0 else format(target_px, 'f')
+            row_qty = format(p_exec, 'f') if p_exec > 0 else format(new_qty, 'f')
+            row_filled_at = int(placed.get('transactTime') or now)
+            with self._db() as db:
+                db.execute(
+                    'UPDATE bot_orders SET client_order_id=?,exchange_order_id=?,price=?,quantity=?,quote=?,status=?,filled_at=?,chase_count=?,last_chase_at=? WHERE signal_id=?',
+                    (new_cid, new_exch_id, row_px, row_qty, format(Decimal(row_px) * Decimal(row_qty), 'f'), 'FILLED', row_filled_at, next_chase, now, signal_id),
+                )
+            return {'filled': True, 'price': row_px, 'qty': row_qty, 'filled_at': row_filled_at}
+        if p_status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            with self._db() as db:
+                db.execute(
+                    'UPDATE bot_orders SET client_order_id=?,exchange_order_id=?,status=?,chase_count=?,last_chase_at=? WHERE signal_id=?',
+                    (new_cid, new_exch_id, p_status, next_chase, now, signal_id),
+                )
+            return {'done': True, 'result': {'signal_id': signal_id, 'status': p_status}}
+        with self._db() as db:
+            db.execute(
+                'UPDATE bot_orders SET client_order_id=?,exchange_order_id=?,price=?,quantity=?,quote=?,status=?,chase_count=?,last_chase_at=? WHERE signal_id=?',
+                (new_cid, new_exch_id, format(target_px, 'f'), format(new_qty, 'f'), format(new_qty * target_px, 'f'), 'NEW', next_chase, now, signal_id),
+            )
+        return {'done': True, 'result': {'signal_id': signal_id, 'status': 'CHASE_REPLACED', 'price': format(target_px, 'f')}}
+
     def _sync_one_bot(self, api_key, secret, bid, tick, step, now, evidence, micro_features,
                       signal_id, client_id, price, qty, status, stop_distance, stop_client,
                       filled_at, high_price, exit_client, stored_stop_price, stop_updated_at, exit_started_at,
-                      strategy_id='T1', expires_at=None):
+                      strategy_id='T1', expires_at=None, entry_high=None, candidate_low=None,
+                      chase_count=0, last_chase_at=None, ask=None):
         bid_dec, tick_dec = Decimal(str(bid)), Decimal(str(tick))
+        ask_dec = Decimal(str(ask)) if ask is not None and Decimal(str(ask)) > 0 else bid_dec
         strategy_id = strategy_id or 'T1'
         if status in ('NEW', 'PARTIALLY_FILLED'):
             found = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now)
@@ -859,16 +1076,7 @@ class AccountVault:
                     db.execute('UPDATE bot_orders SET status=? WHERE signal_id=?', (exch_status, signal_id))
                 return {'signal_id': signal_id, 'status': exch_status}
             elif exch_status in ('NEW', 'PARTIALLY_FILLED') and expires_at is not None and now >= int(expires_at):
-                try:
-                    cancelled = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now, method='DELETE')
-                    cancel_exec = Decimal(str(cancelled.get('executedQty') or executed))
-                    cancel_px = self._fill_price(cancelled)
-                except ValueError as exc:
-                    if str(exc) != 'ORDER_GONE':
-                        raise
-                    refound = self._signed('/api/v3/order', {'symbol': 'SOLUSDT', 'origClientOrderId': client_id}, api_key, secret, now)
-                    cancel_exec = Decimal(str(refound.get('executedQty') or executed))
-                    cancel_px = self._fill_price(refound)
+                cancel_exec, cancel_px = self._cancel_bot_buy_and_check_fill(api_key, secret, client_id, executed, now)
                 if cancel_exec > 0:
                     status = 'FILLED'
                     filled_at = now
@@ -879,6 +1087,39 @@ class AccountVault:
                     with self._db() as db:
                         db.execute("UPDATE bot_orders SET status='EXPIRED' WHERE signal_id=?", (signal_id,))
                     return {'signal_id': signal_id, 'status': 'EXPIRED'}
+            elif exch_status == 'NEW' and executed == 0 and self._candidate_low_broken(candidate_low, bid_dec):
+                cancel_exec, cancel_px = self._cancel_bot_buy_and_check_fill(api_key, secret, client_id, executed, now)
+                if cancel_exec > 0:
+                    status = 'FILLED'
+                    filled_at = now
+                    qty = format(cancel_exec, 'f')
+                    if Decimal(cancel_px) > 0:
+                        price = cancel_px
+                else:
+                    with self._db() as db:
+                        db.execute("UPDATE bot_orders SET status='CANCELED', reentry_count=COALESCE(reentry_count,0)+1 WHERE signal_id=?", (signal_id,))
+                    return {'signal_id': signal_id, 'status': 'CANCELED', 'reason': 'CANDIDATE_LOW_BROKEN'}
+            elif (
+                strategy_id in ('R2', 'T2')
+                and exch_status == 'NEW'
+                and executed == 0
+                and entry_high
+                and int(chase_count or 0) < BUY_CHASE_MAX_COUNT
+                and now - int(last_chase_at or 0) >= BUY_CHASE_INTERVAL_MS
+            ):
+                chase_res = self._chase_bot_buy(
+                    api_key, secret, signal_id, client_id, strategy_id, found, price, qty,
+                    bid_dec, ask_dec, tick_dec, step, entry_high, chase_count, now,
+                )
+                if chase_res and chase_res.get('done'):
+                    return chase_res['result']
+                if chase_res and chase_res.get('filled'):
+                    status = 'FILLED'
+                    price = chase_res['price']
+                    qty = chase_res['qty']
+                    filled_at = chase_res['filled_at']
+                else:
+                    status = exch_status
             else:
                 status = exch_status
             with self._db() as db:
@@ -922,7 +1163,7 @@ class AccountVault:
             f'bot:{signal_id}', entry=entry, qty=quantity, current_stop=current_stop,
             current_stage='S0', bid=bid_dec, evidence=evidence, tick=tick_dec, now=now,
             micro_features=micro_features, strategy_id=strategy_id, stop_distance=distance,
-            entry_time_ms=int(filled_at or now), reversal_confirm_ticks=2,
+            entry_time_ms=int(filled_at or now), reversal_confirm_ticks=2, exhaustion_confirm_bars=2,
         )
         if decision.exit_required:
             return self._place_bot_exit_limit(api_key, secret, signal_id, entry, stop_client, decision, tick_dec, step, bid_dec, now)
@@ -960,6 +1201,8 @@ class AccountVault:
         with self._db() as db:
             db.execute('UPDATE bot_orders SET stop_client_id=?,stop_price=?,stop_updated_at=?,quantity=? WHERE signal_id=?',
                        (res['client_id'], format(stop_price, 'f'), now, format(final_qty, 'f'), signal_id))
+        if not prev_stop_client:
+            self.ensure_bnb_fee_reserve(api_key, secret, now, reason='SOL_BOT_STOP_INIT')
         return {'signal_id': signal_id, 'status': label, 'stage': stage, 'stop': format(stop_price, 'f')}
 
     def _place_bot_exit_limit(self, api_key, secret, signal_id, entry_price, stop_client, decision, tick, step, bid_dec, now):
@@ -967,6 +1210,7 @@ class AccountVault:
         price = floor_step(decision.limit_price, tick)
         if decision.quantity * price < DUST_NOTIONAL_USDT:
             return self._close_dust_bot_order(api_key, secret, signal_id, decision.quantity, entry_price, stop_client, step, bid_dec, now)
+        self.ensure_bnb_fee_reserve(api_key, secret, now, reason='SOL_BOT_EXIT')
         res = self._atomic_replace_or_place_stop(
             api_key, secret, prev_client_id=stop_client or None, new_client_id=exit_cid,
             quantity=decision.quantity, stop_price=price, limit_price=price,
@@ -1039,15 +1283,32 @@ class AccountVault:
                            (res.get('client_id') or client_id, now, signal_id))
         return {'closed': closed}
 
-    def _require_spot(self, api_key, secret):
-        clock = self._server_time()
+    @staticmethod
+    def _candidate_low_broken(candidate_low, bid_dec):
+        if not candidate_low or bid_dec <= 0:
+            return False
+        try:
+            cand_low_dec = Decimal(str(candidate_low))
+        except Exception:
+            return False
+        return cand_low_dec > 0 and bid_dec < cand_low_dec
+
+    def _require_spot(self, api_key, secret, now=None):
+        check_now = int(now if now is not None else self.clock())
+        if 0 < self._spot_verified_until - check_now <= SPOT_VERIFY_CACHE_MS:
+            return
+        clock = self._server_time(check_now)
         data = self._signed('/sapi/v1/account/apiRestrictions', {}, api_key, secret, clock)
         if data.get('enableWithdrawals') is True or data.get('enableInternalTransfer') is True or data.get('permitsUniversalTransfer') is True:
+            self._spot_verified_until = 0
             raise ValueError('WITHDRAWALS_ENABLED')
         if data.get('enableReading') is not True:
+            self._spot_verified_until = 0
             raise ValueError('READ_PERMISSION_REQUIRED')
         if data.get('enableSpotAndMarginTrading') is not True:
+            self._spot_verified_until = 0
             raise ValueError('TRADE_PERMISSION_REQUIRED')
+        self._spot_verified_until = check_now + SPOT_VERIFY_CACHE_MS
 
     @staticmethod
     def _parse_signal_payload(payload, used, allowed, now):
@@ -1062,12 +1323,13 @@ class AccountVault:
         if not signal_id or signal_id in used:
             return None
         expires = int(payload.get('expires_at') or 0)
-        if expires and expires < now:
+        if expires and expires <= now:
             return None
         try:
             limit = Decimal(str(payload.get('entry_low') or '0'))
             entry_high = Decimal(str(payload.get('entry_high') or '0'))
             score = Decimal(str(payload.get('score') or '75'))
+            cand_low = Decimal(str(payload.get('candidate_low') or '0'))
         except Exception:
             return None
         if limit <= 0:
@@ -1078,7 +1340,9 @@ class AccountVault:
         stop_dist = payload.get('stop_distance') or default_stop
         return {
             'signal_id': signal_id, 'limit': limit, 'entry_high': entry_high if entry_high > 0 else None,
+            'candidate_low': cand_low if cand_low > 0 else None,
             'notional': notional, 'score': score, 'strategy_id': strategy_id,
+            'regime': str(payload.get('regime') or '').upper(),
             'stop_distance': stop_dist, 'expires_at': expires or None,
             'signal_time': int(payload.get('signal_time') or 0),
         }
@@ -1092,7 +1356,19 @@ class AccountVault:
             ) or DEFAULT_LIVE_STRATEGIES
         mark_dec = Decimal(str(mark_price)) if mark_price is not None and Decimal(str(mark_price)) > 0 else self._current_mark_dec()
         with self._db() as db:
-            used = {row[0] for row in db.execute('SELECT signal_id FROM bot_orders')}
+            used = set()
+            reentry_counts = {}
+            for sig_id, row_status, row_filled_at, row_reentry in db.execute(
+                'SELECT signal_id, status, filled_at, COALESCE(reentry_count, 0) FROM bot_orders'
+            ):
+                if (
+                    row_status == 'EXPIRED'
+                    and row_filled_at is None
+                    and int(row_reentry or 0) < MAX_EXPIRED_REENTRY_COUNT
+                ):
+                    reentry_counts[sig_id] = int(row_reentry or 0) + 1
+                else:
+                    used.add(sig_id)
             recent_active = [
                 int(row[0] or 0)
                 for row in db.execute(
@@ -1114,6 +1390,8 @@ class AccountVault:
                 continue
             parsed = self._parse_signal_payload(payload, used, allowed, now)
             if parsed is not None:
+                if parsed['signal_id'] in reentry_counts:
+                    parsed['reentry_count'] = reentry_counts[parsed['signal_id']]
                 candidates.append(parsed)
         if 'R2' in allowed:
             try:
@@ -1133,15 +1411,30 @@ class AccountVault:
                     continue
                 parsed = self._parse_signal_payload(payload, used, allowed, now)
                 if parsed is not None:
+                    if parsed['signal_id'] in reentry_counts:
+                        parsed['reentry_count'] = reentry_counts[parsed['signal_id']]
                     candidates.append(parsed)
         if not candidates:
             return None
-        priority_rank = {'T1': 2, 'T2': 1, 'R2': 0}
+        wave_regimes = {}
+        for item in candidates:
+            reg = str(item.get('regime') or '').upper()
+            if reg in ('DOWNTREND', 'UNCERTAIN'):
+                wave_regimes[item['signal_time']] = reg
+
+        def _priority_rank(item):
+            reg = str(item.get('regime') or '').upper() or wave_regimes.get(item['signal_time'], '')
+            if reg in ('DOWNTREND', 'UNCERTAIN'):
+                ranks = {'T1': 2, 'R2': 1, 'T2': 0}
+            else:
+                ranks = {'T1': 2, 'T2': 1, 'R2': 0}
+            return ranks.get(item['strategy_id'], 0)
+
         picked = max(
             candidates,
             key=lambda item: (
                 item['signal_time'],
-                priority_rank.get(item['strategy_id'], 0),
+                _priority_rank(item),
                 item['score'],
             ),
         )
@@ -1216,21 +1509,27 @@ class AccountVault:
             current_stage=current.get('stage') or 'S0', bid=bid, evidence=evidence,
             tick=tick, now=now, micro_features=micro_features, strategy_id='T1',
             stop_distance=Decimal('0.008'),
-            entry_time_ms=int(current.get('placed_at') or 0), reversal_confirm_ticks=2,
+            entry_time_ms=int(current.get('placed_at') or 0), reversal_confirm_ticks=2, exhaustion_confirm_bars=2,
         )
         if decision.exit_required and bid >= limit_floor:
             from dataclasses import replace
+            from solbot.mathematics.apts_exit import S1_PROFIT_PROTECTION_TRIGGER, S2_ADAPTIVE_TRAILING_TRIGGER
             peak = Decimal(str(decision.state.high_price))
-            fallback_stage = 'S2_ADAPTIVE_TRAILING' if peak >= entry * Decimal('1.015') else (
-                'S1_PROFIT_PROTECTION' if peak >= entry * Decimal('1.008') else 'S0_INITIAL_PROTECTION'
+            fallback_stage = 'S2_ADAPTIVE_TRAILING' if peak > entry * (1 + S2_ADAPTIVE_TRAILING_TRIGGER) else (
+                'S1_PROFIT_PROTECTION' if peak >= entry * (1 + S1_PROFIT_PROTECTION_TRIGGER) else 'S0_INITIAL_PROTECTION'
             )
-            unlatched = replace(decision.state, stage=fallback_stage, trigger_latched=False, trigger_reason='')
+            target_stop = decision.stop_price
+            if decision.state.trigger_reason in ('TRAILING_STOP_TOUCHED', 'PROFIT_FLOOR_NOT_EXECUTABLE'):
+                tight_stop = floor_step(bid - tick, tick)
+                if tight_stop > target_stop and tight_stop < bid:
+                    target_stop = tight_stop
+            unlatched = replace(decision.state, stage=fallback_stage, stop_price=target_stop, trigger_latched=False, trigger_reason='')
             stage = APTS_STAGE_SHORT.get(fallback_stage, prev_stage or 'S0')
             self._save_state(unlatched, stage, 'RESTING_PROTECTIVE_STOP_ACTIVE', now, '', intent_id='manual:SOL')
-            if decision.stop_price > current_stop and decision.stop_price < bid and self._should_replace_stop(
-                current_stop, decision.stop_price, Decimal(current['quantity']), decision.quantity, current.get('updated_at'), now, stage != prev_stage
+            if target_stop > current_stop and target_stop < bid and self._should_replace_stop(
+                current_stop, target_stop, Decimal(current['quantity']), decision.quantity, current.get('updated_at'), now, stage != prev_stage
             ):
-                self._raise_stop(decision, current, tick, now)
+                self._raise_stop(replace(decision, stop_price=target_stop), current, tick, now)
         elif decision.exit_required:
             self._exit_position(decision, current, tick, now)
         elif self._should_replace_stop(current_stop, decision.stop_price, Decimal(current['quantity']), decision.quantity, current.get('updated_at'), now, stage != prev_stage):
@@ -1248,6 +1547,114 @@ class AccountVault:
         rules = self._sol_rules(info)
         self._rules_cache = (now_ms + 60_000, rules)
         return rules
+
+    def _get_bnb_rules(self, now=None):
+        now_ms = int(now if now is not None else self.clock())
+        if self._bnb_rules_cache is not None and now_ms < self._bnb_rules_cache[0]:
+            return self._bnb_rules_cache[1]
+        info = self.transport.request('/api/v3/exchangeInfo', 'symbol=BNBUSDT', {})
+        try:
+            rules = self._extract_symbol_rules(info, 'BNBUSDT')
+        except ValueError:
+            return None
+        self._bnb_rules_cache = (now_ms + 60_000, rules)
+        return rules
+
+    def ensure_bnb_fee_reserve(self, api_key, secret, now=None, *, account=None, reserved_usdt=Decimal('0'), reason='TRADE'):
+        """Top up ~5 USDT of BNB before SOL trades when BNB spot value < 5 USDT (cap 20 USDT)."""
+        now_ms = int(now if now is not None else self.clock())
+        with self._bnb_lock:
+            try:
+                if self._last_bnb_refill_at and 0 <= now_ms - self._last_bnb_refill_at < BNB_REFILL_COOLDOWN_MS:
+                    return {'checked': False, 'refilled': False, 'reason': 'BNB_COOLDOWN'}
+                if self.db_path.exists():
+                    with self._db() as db:
+                        row = db.execute(
+                            "SELECT MAX(created_at) FROM bnb_refills WHERE status IN ('FILLED','PARTIALLY_FILLED','NEW')"
+                        ).fetchone()
+                    last_db = int(row[0] or 0) if row and row[0] is not None else 0
+                    if last_db and 0 <= now_ms - last_db < BNB_REFILL_COOLDOWN_MS:
+                        return {'checked': False, 'refilled': False, 'reason': 'BNB_COOLDOWN'}
+                rules = self._get_bnb_rules(now_ms)
+                if rules is None:
+                    return {'checked': False, 'refilled': False, 'reason': 'BNB_RULES_UNAVAILABLE'}
+                book = self.transport.request('/api/v3/ticker/bookTicker', 'symbol=BNBUSDT', {})
+                ask_px = Decimal(str(book.get('askPrice') or book.get('bidPrice') or '0'))
+                if ask_px <= 0:
+                    return {'checked': False, 'refilled': False, 'reason': 'BNB_PRICE_UNAVAILABLE'}
+                acct = account if isinstance(account, dict) and account.get('balances') is not None else self._signed('/api/v3/account', {}, api_key, secret, now_ms)
+                bnb_total = Decimal('0')
+                free_usdt = Decimal('0')
+                for bal in acct.get('balances') or []:
+                    asset = bal.get('asset')
+                    if asset == 'BNB':
+                        bnb_total = Decimal(str(bal.get('free') or '0')) + Decimal(str(bal.get('locked') or '0'))
+                    elif asset == 'USDT':
+                        free_usdt = Decimal(str(bal.get('free') or '0'))
+                bnb_value = bnb_total * ask_px
+                if bnb_value >= BNB_MIN_RESERVE_USDT:
+                    return {'checked': True, 'refilled': False, 'reason': 'BNB_SUFFICIENT', 'bnb_value_usdt': format(bnb_value, 'f')}
+                open_bnb = self._order_rows('/api/v3/openOrders', {'symbol': 'BNBUSDT'}, api_key, secret, now_ms)
+                if any(str(row.get('symbol') or '') == 'BNBUSDT' for row in open_bnb):
+                    return {'checked': True, 'refilled': False, 'reason': 'BNB_ORDER_OPEN'}
+                qty, limit_price, est_notional, skip_reason = compute_bnb_refill_order(
+                    bnb_total,
+                    ask_px,
+                    free_usdt,
+                    reserved_usdt=reserved_usdt,
+                    step_size=rules['step'],
+                    min_qty=rules['min_qty'],
+                    tick_size=rules['tick'],
+                    rules_min_notional=rules['min_notional'],
+                )
+                if qty is None:
+                    return {'checked': True, 'refilled': False, 'reason': skip_reason}
+                cid = BNB_REFILL_PREFIX + hashlib.sha256(f'{reason}:{now_ms}:{qty}'.encode()).hexdigest()[:16]
+                placed = self._signed('/api/v3/order', {
+                    'symbol': 'BNBUSDT',
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'timeInForce': 'IOC',
+                    'quantity': format(qty, 'f'),
+                    'price': format(limit_price, 'f'),
+                    'newClientOrderId': cid,
+                }, api_key, secret, now_ms, method='POST')
+                status = str(placed.get('status') or 'NEW').upper()
+                exec_qty = Decimal(str(placed.get('executedQty') or '0'))
+                quote_qty = Decimal(str(placed.get('cummulativeQuoteQty') or '0'))
+                if quote_qty <= 0 and exec_qty > 0:
+                    quote_qty = exec_qty * limit_price
+                if quote_qty <= 0:
+                    quote_qty = est_notional
+                self._last_bnb_refill_at = now_ms
+                with self._db() as db:
+                    db.execute(
+                        'INSERT OR REPLACE INTO bnb_refills VALUES(?,?,?,?,?,?,?,?,?)',
+                        (
+                            cid,
+                            str(placed.get('orderId') or ''),
+                            format(exec_qty if exec_qty > 0 else qty, 'f'),
+                            format(limit_price, 'f'),
+                            format(quote_qty, 'f'),
+                            format(bnb_value, 'f'),
+                            status,
+                            reason,
+                            now_ms,
+                        ),
+                    )
+                return {
+                    'checked': True,
+                    'refilled': status in ('FILLED', 'PARTIALLY_FILLED', 'NEW') or exec_qty > 0,
+                    'status': status,
+                    'client_order_id': cid,
+                    'quantity': format(qty, 'f'),
+                    'price': format(limit_price, 'f'),
+                    'quote': format(quote_qty, 'f'),
+                    'bnb_before_usdt': format(bnb_value, 'f'),
+                }
+            except Exception as exc:
+                logger.warning('BNB fee reserve check failed (%s): %s', reason, exc)
+                return {'checked': False, 'refilled': False, 'reason': str(exc) or type(exc).__name__}
 
     @staticmethod
     def _should_replace_stop(current_stop, new_stop, current_qty, new_qty, last_updated_at, now, stage_changed):
@@ -1399,6 +1806,7 @@ class AccountVault:
         qty = self._floor(min(remaining_desired, free_sol), step) if step > 0 else min(remaining_desired, free_sol)
         if qty <= 0:
             return {'status': 'FILLED', 'executedQty': '0', 'already_closed': True, 'client_id': exit_client_id}
+        self.ensure_bnb_fee_reserve(api_key, secret, now, account=account, reason='SOL_MARKET_EXIT')
         placed = self._signed('/api/v3/order', {
             'symbol': 'SOLUSDT', 'side': 'SELL', 'type': 'MARKET',
             'quantity': format(qty, 'f'), 'newClientOrderId': exit_client_id,
@@ -1448,7 +1856,7 @@ class AccountVault:
 
     def _advance_apts_step(self, intent_id, *, entry, qty, current_stop, current_stage, bid, evidence, tick, now,
                            micro_features=None, strategy_id='T1', stop_distance=None,
-                           entry_time_ms=0, reversal_confirm_ticks=1):
+                           entry_time_ms=0, reversal_confirm_ticks=1, exhaustion_confirm_bars=2):
         from dataclasses import replace
         from solbot.mathematics.apts_exit import APTSState, update_protection
         from solbot.mathematics.contracts import make_context
@@ -1481,6 +1889,7 @@ class AccountVault:
                 entry_fee_rate=DEFAULT_FEE_RATE, exit_fee_rate=DEFAULT_FEE_RATE,
                 slippage_rate=DEFAULT_SLIPPAGE_RATE, stop_distance=stop_distance,
                 entry_time_ms=entry_time_ms, reversal_confirm_ticks=reversal_confirm_ticks,
+                exhaustion_confirm_bars=exhaustion_confirm_bars,
             )
             best_stop = max(state.stop_price, current_stop) if current_stop and current_stop > 0 else state.stop_price
             state = replace(state, stop_price=best_stop, last_decision_time_ms=now - 1)
@@ -1491,6 +1900,8 @@ class AccountVault:
                 updates['entry_time_ms'] = int(entry_time_ms)
             if reversal_confirm_ticks and state.reversal_confirm_ticks != max(1, int(reversal_confirm_ticks)):
                 updates['reversal_confirm_ticks'] = max(1, int(reversal_confirm_ticks))
+            if exhaustion_confirm_bars and state.exhaustion_confirm_bars != max(1, int(exhaustion_confirm_bars)):
+                updates['exhaustion_confirm_bars'] = max(1, int(exhaustion_confirm_bars))
             if updates:
                 state = replace(state, **updates)
         decision = update_protection(state, context, bid, evidence, tick_size=tick, quantity=qty, native_supported=True)
@@ -1567,6 +1978,7 @@ class AccountVault:
         price = floor_step(decision.limit_price, tick)
         api_key, secret = self._load()
         try:
+            self.ensure_bnb_fee_reserve(api_key, secret, now, reason='SOL_MANUAL_EXIT')
             res = self._atomic_replace_or_place_stop(
                 api_key, secret, prev_client_id=current['client_order_id'], new_client_id=client_id,
                 quantity=decision.quantity, stop_price=price, limit_price=price,
@@ -1606,6 +2018,10 @@ class AccountVault:
         orders = self._signed('/api/v3/allOrders', {'symbol': 'SOLUSDT', 'limit': 100}, api_key, secret, clock)
         if spot_hint is not None:
             spot_enabled = bool(spot_hint) and (account.get('canTrade', True) is not False)
+            if spot_enabled:
+                self._spot_verified_until = int(self.clock()) + SPOT_VERIFY_CACHE_MS
+            else:
+                self._spot_verified_until = 0
         else:
             try:
                 rights = self._signed('/sapi/v1/account/apiRestrictions', {}, api_key, secret, clock)
@@ -1615,6 +2031,10 @@ class AccountVault:
                     and all(rights.get(k) is False for k in blocked)
                     and account.get('canTrade', True) is not False
                 )
+                if rights.get('enableReading') is True and spot_enabled:
+                    self._spot_verified_until = int(self.clock()) + SPOT_VERIFY_CACHE_MS
+                else:
+                    self._spot_verified_until = 0
             except Exception:
                 meta = self._meta()
                 spot_enabled = bool(meta.get('orders_enabled')) if meta else False
@@ -1653,11 +2073,16 @@ class AccountVault:
         return {'synced': True, 'balances': {asset: {'free': free, 'locked': locked} for asset, free, locked, _ in balances},
                 'manual_order_count': len(manual), 'orders_enabled': bool(spot_enabled), 'spot_trading_enabled': bool(spot_enabled), 'private_order_calls': 0}
 
-    def _server_time(self):
+    def _server_time(self, now=None):
+        local_now = int(now if now is not None else self.clock())
+        if self._time_offset_ms is not None and 0 <= local_now - self._time_synced_at < SERVER_TIME_CACHE_MS:
+            return local_now + self._time_offset_ms
         data = self.transport.request('/api/v3/time', '', {})
         value = data.get('serverTime') if isinstance(data, dict) else None
         if type(value) is not int:
             raise ValueError('BINANCE_UNREACHABLE')
+        self._time_offset_ms = value - local_now
+        self._time_synced_at = local_now
         return value
 
     def _signed(self, path, params, api_key, secret, clock, method='GET'):
@@ -1746,6 +2171,7 @@ class AccountVault:
             if found is not None:
                 placed = found
         self._remember(placed, client_id, qty, stop, limit, entry, clock)
+        self.ensure_bnb_fee_reserve(api_key, secret, clock, account=account, reason='SOL_MANUAL_STOP_INIT')
         if self.snapshot_path.exists():
             try:
                 new_free = format(max(Decimal('0'), free - qty), 'f')
@@ -1901,8 +2327,8 @@ class AccountVault:
         return Decimal(str(max(rows, key=lambda row: int(row[1] or 0))[0]))
 
     @staticmethod
-    def _sol_rules(info):
-        rows = [row for row in info.get('symbols') or [] if row.get('symbol') == 'SOLUSDT']
+    def _extract_symbol_rules(info, symbol_name):
+        rows = [row for row in info.get('symbols') or [] if row.get('symbol') == symbol_name]
         if len(rows) != 1:
             raise ValueError('PROTECTION_REJECTED')
         symbol = rows[0]
@@ -1918,6 +2344,10 @@ class AccountVault:
         if tick <= 0 or step <= 0:
             raise ValueError('PROTECTION_REJECTED')
         return {'tick': tick, 'step': step, 'min_qty': min_qty, 'min_notional': min_notional, 'types': set(symbol.get('orderTypes') or [])}
+
+    @classmethod
+    def _sol_rules(cls, info):
+        return cls._extract_symbol_rules(info, 'SOLUSDT')
 
     @staticmethod
     def _fill_price(row):
@@ -2009,6 +2439,7 @@ class AccountVault:
         db.execute('CREATE TABLE IF NOT EXISTS user_live(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL, updated_at INTEGER NOT NULL, reason TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS trading_config(singleton INTEGER PRIMARY KEY CHECK(singleton=1), min_order_usdt TEXT NOT NULL, max_order_usdt TEXT NOT NULL, max_slots INTEGER NOT NULL, updated_at INTEGER NOT NULL)')
         db.execute("CREATE TABLE IF NOT EXISTS bot_orders(signal_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, exchange_order_id TEXT NOT NULL, price TEXT NOT NULL, quantity TEXT NOT NULL, quote TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS bnb_refills(client_order_id TEXT PRIMARY KEY, exchange_order_id TEXT NOT NULL, quantity TEXT NOT NULL, price TEXT NOT NULL, quote TEXT NOT NULL, bnb_before_usdt TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL)")
         bot_columns = {row[1] for row in db.execute('PRAGMA table_info(bot_orders)')}
         for name, kind in (
             ('stop_distance', 'TEXT'), ('stop_client_id', 'TEXT'), ('filled_at', 'INTEGER'),
@@ -2016,6 +2447,8 @@ class AccountVault:
             ('stop_price', 'TEXT'), ('stop_updated_at', 'INTEGER'), ('exit_started_at', 'INTEGER'),
             ('strategy_id', 'TEXT'), ('expires_at', 'INTEGER'),
             ('exit_price', 'TEXT'), ('closed_at', 'INTEGER'), ('realized_pnl', 'TEXT'),
+            ('entry_high', 'TEXT'), ('candidate_low', 'TEXT'),
+            ('chase_count', 'INTEGER'), ('last_chase_at', 'INTEGER'), ('reentry_count', 'INTEGER'),
         ):
             if name not in bot_columns:
                 db.execute(f'ALTER TABLE bot_orders ADD COLUMN {name} {kind}')

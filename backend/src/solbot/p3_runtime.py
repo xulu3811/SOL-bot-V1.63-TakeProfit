@@ -9,7 +9,7 @@ from solbot.storage.microstructure import MicrostructureStore
 from solbot.storage.math_audit import MathAudit,normalize_signal
 from solbot.mathematics.contracts import ACCOUNTS,SymbolRules,make_context,feature_reasons
 from solbot.mathematics.decimal_utils import D,floor_step,json_safe
-from solbot.mathematics.trend_exhaustion import TrendEvidence,from_closed_inputs
+from solbot.mathematics.trend_exhaustion import FlowSmoother, TrendEvidence, from_closed_inputs, smooth_micro_features
 from solbot.mathematics.execution_cost import FeeSchedule, estimate_cost
 from solbot.mathematics.expected_return import estimate_return
 from solbot.mathematics.fill_probability import estimate_fill
@@ -17,6 +17,17 @@ from solbot.mathematics.entry_pricing import price_entry
 from solbot.mathematics.position_sizing import ResearchRiskParameters, size_position
 from solbot.execution.shadow import ShadowRejected
 from solbot.execution.p3_shadow import P3ShadowExecutor
+from solbot.execution.live_policy import (
+    DEFAULT_FEE_RATE,
+    LIVE_MAX_ORDER_USDT,
+    LIVE_MIN_ORDER_USDT,
+    compute_entry_limit_price,
+    compute_live_order_size,
+    is_custom_trading_config,
+    parse_allowed_strategies,
+    resolve_stop_distance,
+    strategy_entry_allowed,
+)
 from solbot.storage.read_snapshot import publish
 
 SHADOW_RISK_PARAMETERS=ResearchRiskParameters(symbol='SOLUSDT',version='p3-shadow-500-1000-v1',t1_budget=Decimal('0.012'),r1_budget=Decimal('0.008'),min_notional=Decimal('500'),max_notional=Decimal('1000'),allow_cash_fallback=True)
@@ -132,13 +143,55 @@ def _has_higher_priority_strategy_signal(strategy_db_path, signal_time, cooldown
                 payload = json.loads(row['payload_json'])
             except Exception:
                 payload = {}
-            if payload.get('strategy_id') == 'T1' and payload.get('regime') == 'DOWNTREND':
+            sid = payload.get('strategy_id')
+            reg = str(payload.get('regime') or '').upper()
+            if sid == 'T1' and reg == 'DOWNTREND':
+                continue
+            # In DOWNTREND/UNCERTAIN, R2 outranks T2 so T2 does not block R2.
+            if sid == 'T2' and reg in ('DOWNTREND', 'UNCERTAIN'):
                 continue
             st = int(row['signal_time'] or payload.get('signal_time') or 0)
             if st > 0 and signal_time > 0 and abs(st - int(signal_time)) < cooldown_ms:
                 return True
     except Exception:
         return False
+    return False
+
+
+def _has_higher_priority_r2_signal(own_shadow_db, market_db, signal_time, cooldown_ms):
+    own = Path(own_shadow_db).resolve()
+    db_dir = Path(market_db).resolve().parent if market_db else own.parent
+    root_dir = db_dir.parent
+    for cand in (
+        root_dir / 'r2' / 'r2-v2-state.sqlite',
+        root_dir / 'r2' / 'r2-state-read.sqlite',
+        root_dir / 'r2' / 'r2-state.sqlite',
+        db_dir / 'r2-v2-state.sqlite',
+        db_dir / 'r2-state-read.sqlite',
+        db_dir / 'r2-state.sqlite',
+    ):
+        try:
+            path = cand.resolve()
+        except Exception:
+            continue
+        if not path.exists():
+            continue
+        try:
+            with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=3)) as db:
+                db.row_factory = sqlite3.Row
+                rows = db.execute(
+                    "SELECT payload, status FROM r2_outbox WHERE status='PENDING' ORDER BY rowid DESC LIMIT 10"
+                ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row['payload'])
+                except Exception:
+                    continue
+                st = int(payload.get('signal_time') or 0)
+                if st > 0 and signal_time > 0 and abs(st - int(signal_time)) < cooldown_ms:
+                    return True
+        except Exception:
+            continue
     return False
 
 
@@ -155,6 +208,7 @@ def acquire_cross_shadow_entry_guard(
     guard_db=None,
     cooldown_ms=CROSS_STRATEGY_COOLDOWN_MS,
     max_combined_slots=None,
+    regime=None,
 ):
     """Enforce live-aligned cross-strategy cooldown, priority, and single-slot sync across P3 and R2 shadow processes."""
     if max_combined_slots is None:
@@ -195,6 +249,12 @@ def acquire_cross_shadow_entry_guard(
             )
             if strategy_id == 'R2' and _has_higher_priority_strategy_signal(strat_path, int(signal_time or now_ms), cooldown_ms):
                 raise ShadowRejected('CROSS_STRATEGY_COOLDOWN', 'higher-priority T1/T2 signal active within cooldown window')
+            if (
+                strategy_id == 'T2'
+                and str(regime or '').upper() in ('DOWNTREND', 'UNCERTAIN')
+                and _has_higher_priority_r2_signal(own_shadow_db, market_db, int(signal_time or now_ms), cooldown_ms)
+            ):
+                raise ShadowRejected('CROSS_STRATEGY_COOLDOWN', 'higher-priority R2 signal active within cooldown window')
 
             claims = conn.execute(
                 "SELECT signal_id, strategy_id, signal_time, claimed_at FROM shadow_entry_claims WHERE status='CLAIMED' AND signal_id!=?",
@@ -346,6 +406,92 @@ def plan_signal(payload,features,account,now,market_db_path=None):
     if sizing.status!='RESEARCH_SIZED' or (signal['strategy_id']!='T2' and pricing.status!='RESEARCH_CANDIDATE'):reasons.append('MATH_NOT_APPROVED')
     return signal,original,result
 
+
+def plan_live_aligned_entry(
+    payload,
+    features,
+    account,
+    now,
+    rules,
+    *,
+    shared_cfg=None,
+    allowed_strategies=None,
+):
+    """Compute SOL-bot Live-aligned order price & size for P3 Shadow execution."""
+    signal, _original = normalize_signal(payload)
+    sid = str(signal.get('strategy_id') or '').upper()
+    allow = allowed_strategies if allowed_strategies is not None else parse_allowed_strategies(default=('T1', 'T2', 'R2'))
+    ok, deny_reason = strategy_entry_allowed(sid, payload.get('regime'), allowed=allow)
+    if not ok:
+        return None, deny_reason
+
+    context = make_context(
+        symbol=signal['symbol'],
+        account_id=ACCOUNTS[signal['symbol']],
+        strategy_id=sid,
+        strategy_version=signal['strategy_version'],
+        signal_id=signal['signal_id'],
+        decision_time_ms=now,
+        features=features,
+        inputs={'signal': signal, 'account': account},
+        parameter_version='p3-live-aligned-1',
+    )
+    f_reasons = list(feature_reasons(context, features))
+    if f_reasons:
+        return None, f_reasons[0]
+    if not signal.get('accepted'):
+        return None, 'UPSTREAM_SIGNAL_REJECTED'
+    if not signal['signal_time'] <= now < signal['expires_at']:
+        return None, 'SIGNAL_EXPIRED_OR_FUTURE'
+
+    price, price_err = compute_entry_limit_price(
+        sid,
+        signal.get('entry_low'),
+        signal.get('entry_high'),
+        features.get('bid'),
+        features.get('ask'),
+        rules.tick_size,
+    )
+    if price is None:
+        return None, price_err
+
+    stop_dist = resolve_stop_distance(payload, entry_ref=signal.get('entry_low') or price)
+    if stop_dist is None and sid == 'T1':
+        stop_dist = Decimal('0.010')
+
+    min_u = D(shared_cfg['min_order_usdt']) if shared_cfg else LIVE_MIN_ORDER_USDT
+    max_u = D(shared_cfg['max_order_usdt']) if shared_cfg else LIVE_MAX_ORDER_USDT
+    is_custom = is_custom_trading_config({'custom': bool(shared_cfg)}, min_u, max_u)
+
+    free_cash = floor_step(
+        (D(account['cash']) - D(account['reserved'])) / (Decimal('1') + DEFAULT_FEE_RATE),
+        Decimal('0.01'),
+    )
+    ref_equity = max(Decimal('2000'), D(account['last_equity']))
+    qty, _order_notional, notional, size_err = compute_live_order_size(
+        sid,
+        price,
+        free_cash,
+        ref_equity,
+        stop_dist,
+        fee_rate=DEFAULT_FEE_RATE,
+        score=payload.get('score') or '75',
+        min_order_usdt=min_u,
+        max_order_usdt=max_u,
+        is_custom_cfg=is_custom,
+        step_size=rules.step_size,
+        min_qty=rules.min_qty,
+        rules_min_notional=rules.min_notional,
+    )
+    if qty is None:
+        return None, size_err
+    return {
+        'limit_price': format(price, 'f'),
+        'notional': str(floor_step(notional, Decimal('0.01'))),
+        'stop_distance': format(stop_dist.normalize(), 'f') if stop_dist is not None else None,
+        'quantity': format(qty, 'f'),
+    }, None
+
 def main():
     parser=argparse.ArgumentParser()
     for name in ('symbol','market-db','strategy-db','micro-db','audit-db','status-path'):parser.add_argument('--'+name,required=True)
@@ -363,6 +509,7 @@ def main():
     port=8000 if args.symbol=='SOLUSDT' else 8001
     last_error_key=None
     last_snapshot_ms=0
+    flow_smoother=FlowSmoother()
     while True:
         now=time.time_ns()//1000000
         status={'symbol':args.symbol,'updated_at':now,'engine':'P3','live_authorized':False,'status':'unavailable'}
@@ -371,6 +518,7 @@ def main():
             if features is None:raise ValueError('no public depth snapshot')
             features=refresh_features(features,now)
             if args.shadow_db and ledger is None:ledger=P3ShadowExecutor(args.shadow_db,rules=SymbolRules.from_exchange_info(features['rules'],args.symbol),fee_rate='0.00075',minimum_notional='500',maximum_notional='1000')
+            shared_cfg=None
             if ledger:
                 shared_cfg=load_shared_trading_config(args.market_db,args.shadow_db)
                 if shared_cfg:
@@ -385,13 +533,15 @@ def main():
                     if checkpoint:
                         with scheduler.reader() as db:
                             db.execute('BEGIN');candles=scheduler._inputs(db,checkpoint)
-                        evidence=from_closed_inputs(args.symbol,candles,features,checkpoint)
+                        smoothed_features=smooth_micro_features(features,flow_smoother)
+                        evidence=from_closed_inputs(args.symbol,candles,smoothed_features,checkpoint)
                         if ledger and ledger.snapshot()['positions']:
                             features=dict(features,protection_closed_candles=candles,protection_as_of_ms=checkpoint)
             except Exception as exc:status['candle_error']=str(exc)[:160]
             # Always run existing protection before any new admission, including
             # while candle health or trade-flow warmup is unavailable.
             if ledger:
+                ledger.chase_pending(features,now)
                 status['execution']=ledger.process_market(features,evidence,now_ms=now)
                 account=ledger.snapshot();status['shadow']=account
                 status['last_successful_write_at']=now
@@ -412,16 +562,15 @@ def main():
                     key=payload['signal_id'] if payload['accepted'] else f"diagnostic:{payload['strategy_id']}:{payload['candidate_time']}"
                     if audit.contains(key):continue
                     normalized,original,result=plan_signal(payload,features,account,now,args.market_db)
-                    sizing_ok=result.get('sizing',{}).get('status')=='RESEARCH_SIZED'
-                    effective_gates=[r for r in result['gate_reasons'] if not (payload.get('strategy_id') in ('T1','T2') and sizing_ok and r=='MATH_NOT_APPROVED')]
-                    if ledger and payload['accepted'] and not effective_gates:
-                        pricing,sizing=result['pricing'],result['sizing']
+                    live_order_plan,live_deny=(None,None)
+                    if ledger and payload['accepted']:
+                        live_order_plan,live_deny=plan_live_aligned_entry(
+                            payload,features,account,now,ledger.rules,shared_cfg=shared_cfg,
+                        )
+                    if ledger and payload['accepted'] and live_order_plan is not None:
                         candidate=dict(payload)
-                        if payload['strategy_id']=='T2' or not pricing.get('limit_price'):
-                            limit_price=payload['entry_high']
-                        else:
-                            candidate['entry_low']=str(min(D(candidate['entry_low']),D(pricing['limit_price'])))
-                            limit_price=pricing['limit_price']
+                        if live_order_plan.get('stop_distance'):
+                            candidate['stop_distance']=live_order_plan['stop_distance']
                         attach_reference_price(candidate,ledger.rules,features,args.market_db,now)
                         claimed=False
                         try:
@@ -432,8 +581,15 @@ def main():
                                 signal_time=int(candidate.get('signal_time') or now),
                                 now_ms=now,
                                 strategy_db=args.strategy_db,
+                                regime=candidate.get('regime'),
                             )
-                            result['order']=ledger.submit_candidate(candidate,notional=sizing['notional'],limit_price=limit_price,now_ms=now)
+                            result['order']=ledger.submit_candidate(
+                                candidate,
+                                notional=live_order_plan['notional'],
+                                limit_price=live_order_plan['limit_price'],
+                                now_ms=now,
+                                allow_price_below_low=True,
+                            )
                             account=ledger.snapshot();status['shadow']=account
                             publish(Path(args.shadow_db),Path(args.shadow_db).with_name('sol-shadow-read.sqlite'))
                             last_snapshot_ms=now
@@ -441,6 +597,8 @@ def main():
                             if claimed:
                                 release_cross_shadow_entry_guard(args.market_db,candidate['signal_id'],own_shadow_db=args.shadow_db)
                             result['order_rejected']={'code':exc.code,'message':str(exc)}
+                    elif ledger and payload['accepted'] and live_deny:
+                        result['order_rejected']={'code':live_deny,'message':f'blocked by live-aligned policy: {live_deny}'}
                     audit.record(key,now,{'signal':normalized,'p2_original_payload':original,'features':features,'account':account},result)
             status.update(status='ready' if market_ready and features.get('ready') else 'protection_only',micro_ready=features.get('ready'),risk_policy=ledger.risk_policy if ledger else 'LIVE_DENIED')
         except Exception as exc:

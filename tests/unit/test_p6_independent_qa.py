@@ -160,6 +160,8 @@ class AppBoundaryQA(unittest.TestCase):
         self.assertEqual(self.client.post(path,content=body,headers=h).status_code,200)
         self.assertEqual(self.client.post(path,content=body,headers=h).status_code,401)
         self.assertEqual(self.control.calls,[])
+        alerts_after_retry=self.client.get('/api/v1/app/alerts',headers=self.fixture.sign('GET','/api/v1/app/alerts',b'',session=self.fixture.session)).json()['items']
+        self.assertFalse(any(a['kind']=='SECURITY_ALERT' and a['details'].get('security_code')=='REPLAY_BLOCKED' for a in alerts_after_retry))
         with self.fixture.store.tx() as db:
             count=db.execute("SELECT COUNT(*) FROM control_requests WHERE action='disable'").fetchone()[0]
         self.assertEqual(count,1)
@@ -178,6 +180,6 @@ class AppBoundaryQA(unittest.TestCase):
         res=self.client.post('/api/v1/app/devices/pair',content=rogue_body,headers=rogue_headers)
         self.assertEqual(res.status_code,401)
         alerts=self.client.get('/api/v1/app/alerts',headers=self.fixture.sign('GET','/api/v1/app/alerts',b'',session=self.fixture.session)).json()['items']
-        self.assertTrue(any(a['kind']=='SECURITY_ALERT' and a['details'].get('source_ip')=='198.51.100.42' for a in alerts))
+        self.assertTrue(any(a['kind']=='SECURITY_ALERT' and a['severity']=='SILENT' and a['details'].get('source_ip')=='198.51.100.42' for a in alerts))
 
 if __name__=='__main__':unittest.main()

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
+from decimal import Decimal
 import glob
 import json
 import os
@@ -12,8 +14,10 @@ except ImportError:  # Windows test host
 import re
 import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +47,66 @@ LOG_FILES = {
 OPTIMIZE_COOLDOWN_SEC = 60
 ORPHAN_MIN_AGE_SEC = 600
 TMP_MAX_AGE_SEC = 3 * 86400
+SHADOW_SERVICE_UNITS = ("sol-shadow.service", "sol-r2-shadow.service")
+DEFAULT_SHADOW_PATHS = {
+    "p3_db": Path("/var/lib/sol-bot/database/sol-shadow.sqlite"),
+    "p3_read_db": Path("/var/lib/sol-bot/database/sol-shadow-read.sqlite"),
+    "r2_db": Path("/var/lib/sol-bot/r2/r2-v2-shadow.sqlite"),
+    "r2_read_db": Path("/var/lib/sol-bot/r2/r2-shadow-read.sqlite"),
+    "r2_state_db": Path("/var/lib/sol-bot/r2/r2-v2-state.sqlite"),
+    "r2_state_read_db": Path("/var/lib/sol-bot/r2/r2-state-read.sqlite"),
+    "entry_guard_db": Path("/var/lib/sol-bot/database/shadow-entry-guard.sqlite"),
+    "p3_status": Path("/var/lib/sol-bot/sol-shadow-status.json"),
+    "r2_status": Path("/var/lib/sol-bot/r2/status.json"),
+    "trading_config": Path("/var/lib/sol-bot/shared/trading-config.json"),
+}
+
+
+def _capture_owner_mode(path: Path) -> tuple[int, int, int] | None:
+    try:
+        if path.exists():
+            st = os.stat(path)
+            return int(st.st_uid), int(st.st_gid), stat.S_IMODE(st.st_mode)
+    except OSError:
+        return None
+    return None
+
+
+def _apply_owner_mode(path: Path, meta: tuple[int, int, int] | None) -> None:
+    if meta is None:
+        return
+    uid, gid, mode = meta
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    if hasattr(os, "chown"):
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+
+
+def _publish_sqlite_snapshot(source_db: Path, read_db: Path) -> None:
+    if not source_db.exists():
+        return
+    meta = _capture_owner_mode(read_db) or _capture_owner_mode(source_db)
+    read_db.parent.mkdir(parents=True, exist_ok=True)
+    tmp = read_db.with_name(f".{read_db.name}.reset.{os.getpid()}.tmp")
+    try:
+        with closing(sqlite3.connect(source_db, timeout=10)) as src:
+            with closing(sqlite3.connect(tmp, timeout=10)) as dst:
+                dst.execute("PRAGMA journal_mode=DELETE")
+                src.backup(dst)
+                dst.commit()
+        _apply_owner_mode(tmp, meta)
+        os.replace(tmp, read_db)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 _SECRET_RE = re.compile(
     r"(?i)(password|passphrase|secret|token|authorization|api[_-]?key)\s*[:=]\s*\S+"
@@ -268,6 +332,9 @@ class OpsBackend:
         apt_cache_dir: Path = Path("/var/cache/apt/archives"),
         tmp_dir: Path = Path("/tmp"),
         log_files: dict[str, Path] | None = None,
+        shadow_paths: dict[str, Path] | None = None,
+        manage_services: bool = True,
+        metrics_cache_ttl_sec: float = 8.0,
         clock=None,
     ) -> None:
         self.drop_caches_path = drop_caches_path
@@ -279,9 +346,28 @@ class OpsBackend:
         self.apt_cache_dir = apt_cache_dir
         self.tmp_dir = tmp_dir
         self.log_files = log_files or dict(LOG_FILES)
+        self.shadow_paths = dict(DEFAULT_SHADOW_PATHS)
+        if shadow_paths:
+            self.shadow_paths.update(shadow_paths)
+        self.manage_services = manage_services
+        self.metrics_cache_ttl_sec = max(0.0, float(metrics_cache_ttl_sec))
         self.clock = clock or time.time
         self._last_cpu: tuple[int, int] | None = None
         self._last_optimize_ts: float = 0.0
+        self._cache_lock = threading.Lock()
+        self._metrics_compute_lock = threading.Lock()
+        self._metrics_cache_ts: float = 0.0
+        self._metrics_cache: dict[str, Any] | None = None
+        self._journal_cache_ts: float = 0.0
+        self._journal_cache_bytes: int | None = None
+
+    def _invalidate_metrics_cache(self, clear_journal: bool = False) -> None:
+        with self._cache_lock:
+            self._metrics_cache = None
+            self._metrics_cache_ts = 0.0
+            if clear_journal:
+                self._journal_cache_bytes = None
+                self._journal_cache_ts = 0.0
 
     def _cpu_pct(self) -> float:
         cur = _read_proc_cpu_totals(self.proc_stat_path)
@@ -405,6 +491,10 @@ class OpsBackend:
         return {"currently_failed": 0, "total_failed": 0, "currently_banned": 0, "total_banned": 0, "banned_ips": []}
 
     def _journal_disk_bytes(self) -> int:
+        now_s = self.clock()
+        with self._cache_lock:
+            if self._journal_cache_bytes is not None and 0 <= (now_s - self._journal_cache_ts) < 30.0:
+                return self._journal_cache_bytes
         try:
             proc = subprocess.run(
                 ["journalctl", "--disk-usage"],
@@ -415,13 +505,18 @@ class OpsBackend:
             )
             m = re.search(r"take up\s+([0-9.]+)\s*([KMG]?)", proc.stdout)
             if not m:
-                return 0
-            val = float(m.group(1))
-            unit = m.group(2).upper()
-            mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1)
-            return int(val * mult)
+                val_bytes = 0
+            else:
+                val = float(m.group(1))
+                unit = m.group(2).upper()
+                mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1)
+                val_bytes = int(val * mult)
         except (OSError, subprocess.SubprocessError, ValueError):
-            return 0
+            val_bytes = 0
+        with self._cache_lock:
+            self._journal_cache_ts = self.clock()
+            self._journal_cache_bytes = val_bytes
+        return val_bytes
 
     def _find_orphan_sqlite_temps(self) -> list[Path]:
         now_sec = self.clock()
@@ -589,6 +684,8 @@ class OpsBackend:
         total_freed += tmp_freed
 
         disk_after = shutil.disk_usage("/")
+        if not dry_run:
+            self._invalidate_metrics_cache(clear_journal=True)
         return {
             "ok": True,
             "dry_run": dry_run,
@@ -620,6 +717,7 @@ class OpsBackend:
         self._last_optimize_ts = now_s
         after = parse_meminfo(self.meminfo_path.read_text(encoding="utf-8", errors="replace"))
         reclaimed = max(0, after["ram_available_mb"] - before["ram_available_mb"])
+        self._invalidate_metrics_cache()
         return {
             "ok": True,
             "reclaimed_mb": reclaimed,
@@ -684,7 +782,29 @@ class OpsBackend:
             "entries": list(reversed(entries)),
         }
 
+    def _is_metrics_cache_fresh(self) -> dict[str, Any] | None:
+        if self.metrics_cache_ttl_sec <= 0:
+            return None
+        now_s = self.clock()
+        with self._cache_lock:
+            if (
+                self._metrics_cache is not None
+                and 0 <= (now_s - self._metrics_cache_ts) < self.metrics_cache_ttl_sec
+            ):
+                return self._metrics_cache
+        return None
+
     def metrics(self) -> dict[str, Any]:
+        cached = self._is_metrics_cache_fresh()
+        if cached is not None:
+            return cached
+        with self._metrics_compute_lock:
+            cached = self._is_metrics_cache_fresh()
+            if cached is not None:
+                return cached
+            return self._collect_metrics()
+
+    def _collect_metrics(self) -> dict[str, Any]:
         mem = parse_meminfo(self.meminfo_path.read_text(encoding="utf-8", errors="replace"))
         cpu_pct = self._cpu_pct()
         try:
@@ -717,7 +837,7 @@ class OpsBackend:
         auth_summary = parse_auth_summary(auth_lines)
         clean_preview = self.clean_cache(dry_run=True)
 
-        return {
+        doc = {
             "ok": True,
             "hostname": socket.gethostname(),
             "cpu_pct": cpu_pct,
@@ -750,6 +870,11 @@ class OpsBackend:
             },
             "collected_at": int(self.clock() * 1000),
         }
+        if self.metrics_cache_ttl_sec > 0:
+            with self._cache_lock:
+                self._metrics_cache_ts = self.clock()
+                self._metrics_cache = doc
+        return doc
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any]:
         action = message.get("action")
@@ -765,7 +890,214 @@ class OpsBackend:
             return self.optimize_memory()
         if action == "clean_cache":
             return self.clean_cache(dry_run=bool(message.get("dry_run", True)))
+        if action == "reset_shadow_data":
+            return self.reset_shadow_data()
         raise ValueError("unsupported ops action")
+
+    def _compute_shadow_reset_capital(self) -> tuple[Decimal, Decimal]:
+        cfg_path = self.shadow_paths.get("trading_config")
+        max_order = Decimal("1000")
+        max_slots = Decimal("2")
+        if cfg_path and cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                max_order = Decimal(str(cfg.get("max_order_usdt") or cfg.get("min_order_usdt") or "1000"))
+                max_slots = Decimal(str(cfg.get("max_slots") or "2"))
+            except Exception:
+                max_order = Decimal("1000")
+                max_slots = Decimal("2")
+        needed = max(Decimal("2000"), (max_order * max_slots * Decimal("1.10")).quantize(Decimal("0.01")))
+        topup = needed - Decimal("2000")
+        return needed, topup
+
+    @staticmethod
+    def _reset_shadow_ledger_db(db_path: Path, capital: Decimal, topup: Decimal, now_ms: int) -> dict[str, int]:
+        counts = {"orders": 0, "positions": 0, "fills": 0, "protection": 0}
+        if not db_path.exists():
+            return counts
+        cap_str = format(capital.normalize(), "f")
+        topup_str = format(topup.normalize(), "f")
+        with closing(sqlite3.connect(db_path, timeout=15, isolation_level=None)) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for key, table in (
+                    ("fills", "shadow_fills"),
+                    ("protection", "shadow_protection"),
+                    ("orders", "shadow_orders"),
+                    ("positions", "shadow_positions"),
+                ):
+                    if table in tables:
+                        counts[key] = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                        db.execute(f"DELETE FROM {table}")
+                if "shadow_account" in tables:
+                    cols = {r[1] for r in db.execute("PRAGMA table_info(shadow_account)").fetchall()}
+                    updates = []
+                    params: list[Any] = []
+                    for col, val in (
+                        ("cash", cap_str),
+                        ("reserved", "0"),
+                        ("last_equity", cap_str),
+                        ("peak_equity", cap_str),
+                        ("hard_locked", 0),
+                        ("lock_reason", None),
+                    ):
+                        if col in cols:
+                            updates.append(f"{col}=?")
+                            params.append(val)
+                    if updates:
+                        db.execute(f"UPDATE shadow_account SET {','.join(updates)} WHERE singleton=1", params)
+                if "shadow_p3_metadata" in tables:
+                    db.execute(
+                        "INSERT INTO shadow_p3_metadata(key,value) VALUES('virtual_capital_added',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (topup_str,),
+                    )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+            try:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+        return counts
+
+    @staticmethod
+    def _reset_r2_state_db(db_path: Path, now_ms: int) -> int:
+        cleared = 0
+        if not db_path.exists():
+            return cleared
+        with closing(sqlite3.connect(db_path, timeout=15, isolation_level=None)) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if "r2_outbox" in tables:
+                    cleared = db.execute("SELECT COUNT(*) FROM r2_outbox WHERE status='PENDING'").fetchone()[0]
+                    db.execute(
+                        "UPDATE r2_outbox SET status='DONE', outcome=? WHERE status='PENDING'",
+                        (json.dumps({"rejected": "SHADOW_RESET"}),),
+                    )
+                if "r2_state" in tables:
+                    row = db.execute("SELECT as_of_ms, payload FROM r2_state WHERE singleton=1").fetchone()
+                    if row is not None:
+                        as_of_ms = int(row[0] or now_ms)
+                        idle_payload = json.dumps({"state": "IDLE", "as_of_ms": as_of_ms, "reset_at": now_ms})
+                        db.execute(
+                            "UPDATE r2_state SET payload=? WHERE singleton=1",
+                            (idle_payload,),
+                        )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+            try:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+        return cleared
+
+    @staticmethod
+    def _clear_entry_guard_db(db_path: Path) -> None:
+        if not db_path.exists():
+            return
+        with closing(sqlite3.connect(db_path, timeout=10, isolation_level=None)) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "shadow_entry_claims" in tables:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("DELETE FROM shadow_entry_claims")
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+                try:
+                    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+
+    @staticmethod
+    def _reset_status_json(path: Path, capital: Decimal, now_ms: int) -> None:
+        if not path.exists():
+            return
+        meta = _capture_owner_mode(path)
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(doc, dict):
+            return
+        cap_str = format(capital.normalize(), "f")
+        doc["updated_at"] = now_ms
+        if isinstance(doc.get("shadow"), dict):
+            doc["shadow"].update(
+                cash=cap_str,
+                reserved="0",
+                last_equity=cap_str,
+                peak_equity=cap_str,
+                hard_locked=0,
+                lock_reason=None,
+                positions=[],
+                pending_orders=[],
+                protection=[],
+            )
+        doc.pop("candidate", None)
+        tmp = path.with_name(f".{path.name}.reset.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            _apply_owner_mode(tmp, meta)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def _service_action(self, action: str, units: tuple[str, ...]) -> None:
+        if not self.manage_services:
+            return
+        subprocess.run(
+            ["systemctl", action, *units],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+
+    def reset_shadow_data(self) -> dict[str, Any]:
+        now_ms = int(self.clock() * 1000)
+        capital, topup = self._compute_shadow_reset_capital()
+        p3_db = self.shadow_paths["p3_db"]
+        r2_db = self.shadow_paths["r2_db"]
+        r2_state_db = self.shadow_paths["r2_state_db"]
+
+        self._service_action("stop", SHADOW_SERVICE_UNITS)
+        try:
+            p3_counts = self._reset_shadow_ledger_db(p3_db, capital, topup, now_ms)
+            r2_counts = self._reset_shadow_ledger_db(r2_db, capital, topup, now_ms)
+            pending_outbox = self._reset_r2_state_db(r2_state_db, now_ms)
+            self._clear_entry_guard_db(self.shadow_paths["entry_guard_db"])
+            _publish_sqlite_snapshot(p3_db, self.shadow_paths["p3_read_db"])
+            _publish_sqlite_snapshot(r2_db, self.shadow_paths["r2_read_db"])
+            _publish_sqlite_snapshot(r2_state_db, self.shadow_paths["r2_state_read_db"])
+            self._reset_status_json(self.shadow_paths["p3_status"], capital, now_ms)
+            self._reset_status_json(self.shadow_paths["r2_status"], capital, now_ms)
+        finally:
+            self._service_action("start", SHADOW_SERVICE_UNITS)
+
+        cleared_orders = p3_counts["orders"] + r2_counts["orders"]
+        cleared_positions = p3_counts["positions"] + r2_counts["positions"]
+        self._invalidate_metrics_cache()
+        return {
+            "ok": True,
+            "reset_at": now_ms,
+            "initial_capital_usdt": format(capital.normalize(), "f"),
+            "cleared_orders": cleared_orders,
+            "cleared_positions": cleared_positions,
+            "cleared_fills": p3_counts["fills"] + r2_counts["fills"],
+            "cleared_pending_outbox": pending_outbox,
+            "message": f"Shadow 模拟盘交易数据已重置（已清除 {cleared_orders} 条委托与历史盈亏）",
+        }
 
 
 def receive_line(sock: socket.socket) -> dict[str, Any]:
@@ -780,12 +1112,40 @@ def receive_line(sock: socket.socket) -> dict[str, Any]:
     return json.loads(data.split(b"\n", 1)[0])
 
 
+def _handle_client(
+    conn: socket.socket,
+    backend: OpsBackend,
+    allowed_uid: int,
+    slots: threading.BoundedSemaphore,
+) -> None:
+    import struct
+
+    try:
+        with conn:
+            conn.settimeout(25)
+            try:
+                _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if uid not in (allowed_uid, 0):
+                    raise PermissionError("peer denied")
+                req = receive_line(conn)
+                res = backend.handle(req)
+                conn.sendall(json.dumps(res, ensure_ascii=False).encode("utf-8") + b"\n")
+            except Exception as exc:
+                try:
+                    conn.sendall(json.dumps({"ok": False, "error": str(exc)[:120]}).encode("utf-8") + b"\n")
+                except OSError:
+                    pass
+    finally:
+        slots.release()
+
+
 def serve(path: str, backend: OpsBackend, allowed_uid: int) -> None:
     if os.path.lexists(path):
         if not stat.S_ISSOCK(os.lstat(path).st_mode):
             raise ValueError("not a socket")
         os.unlink(path)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    slots = threading.BoundedSemaphore(8)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(path)
         os.chmod(path, 0o660)
@@ -797,21 +1157,12 @@ def serve(path: str, backend: OpsBackend, allowed_uid: int) -> None:
         server.listen(16)
         while True:
             conn, _ = server.accept()
-            with conn:
-                conn.settimeout(10)
-                try:
-                    import struct
-                    _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                    if uid not in (allowed_uid, 0):
-                        raise PermissionError("peer denied")
-                    req = receive_line(conn)
-                    res = backend.handle(req)
-                    conn.sendall(json.dumps(res, ensure_ascii=False).encode("utf-8") + b"\n")
-                except Exception as exc:
-                    try:
-                        conn.sendall(json.dumps({"ok": False, "error": str(exc)[:120]}).encode("utf-8") + b"\n")
-                    except OSError:
-                        pass
+            slots.acquire()
+            threading.Thread(
+                target=_handle_client,
+                args=(conn, backend, allowed_uid, slots),
+                daemon=True,
+            ).start()
 
 
 def main() -> None:

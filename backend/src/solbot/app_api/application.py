@@ -31,6 +31,9 @@ def _alert_auth_failure(notifications,exc,source_ip):
     if notifications is None or not callable(getattr(notifications,'publish_security_alert',None)):return
     err=str(exc)
     if err in ('ADMIN_REQUIRED','CONTROL_FORBIDDEN','NOT_AUTHORIZED','RISK_CONFIRMATION_REQUIRED'):return
+    # Paired-device P-256 signature already verified before replay table conflict (e.g. proxy TCP retry):
+    # keep HTTP 401 REPLAY_REJECTED strict without recording a false intrusion alert.
+    if err=='REPLAY_REJECTED' and getattr(exc,'verified_device',False):return
     code={
         'PAIRING_LOCKED':'PAIRING_BLOCKED',
         'PASSPHRASE_REJECTED':'PAIRING_BLOCKED',
@@ -336,7 +339,7 @@ def create_app(auth,reader,notifications,control,vault=None,ops=None):
                     if not item.get('entry_price') and prot.get('entry_price'):
                         item['entry_price']=prot.get('entry_price')
                         item['cost']=prot.get('entry_price')
-                    item['custody_anchor_price']=item.get('entry_price') or prot.get('entry_price')
+                    item['custody_anchor_price']=prot.get('entry_price') or item.get('entry_price')
             else:
                 item['custody_on']=intent in active
                 item['authorization_id']=active.get(intent)
@@ -356,6 +359,7 @@ def create_app(auth,reader,notifications,control,vault=None,ops=None):
                     'stage':item.get('stage') or 'S0',
                     'stop_price':item.get('stop_price'),
                     'entry_price':item.get('entry_price'),
+                    'custody_anchor_price':item.get('custody_anchor_price'),
                     'apts':item.get('apts'),
                 }
         return result
@@ -388,6 +392,29 @@ def create_app(auth,reader,notifications,control,vault=None,ops=None):
     async def shadow_orders(limit:int=50,offset:int=0):
         if not 0<=offset<=100000:raise ValueError('offset')
         return reader.shadow_orders(bounded(limit),offset)
+    @app.post(PREFIX+'/shadow/reset')
+    async def shadow_reset(request:Request):
+        p=principal(request)
+        if p['role'] not in ('operator','admin'):raise AuthError('CONTROL_FORBIDDEN')
+        auth.rate('shadow-reset:'+p['device_id'],4)
+        raw=await request.body()
+        try:
+            body=json.loads(raw) if raw else {}
+        except ValueError:
+            body={}
+        if not isinstance(body,dict) or body.get('confirm') is not True:
+            return JSONResponse({'ok':False,'error':'RESET_CONFIRMATION_REQUIRED','message':'需要二次确认才能重置模拟盘数据'},status_code=400)
+        result=ops_monitor.reset_shadow_data()
+        if result.get('ok'):
+            try:
+                notifications.reset_shadow_cursors()
+            except Exception:
+                pass
+            with auth.tx() as db:
+                db.execute('INSERT INTO control_requests VALUES(?,?,?,?,?)',(p['request_id'],p['device_id'],'shadow-reset',json.dumps(result),auth.clock()))
+        else:
+            return JSONResponse(result,status_code=503 if result.get('error')=='OPS_AGENT_UNAVAILABLE' else 400)
+        return result
     async def change_live(request,action):
         p=principal(request)
         if p['role'] not in ('operator','admin'):raise AuthError('CONTROL_FORBIDDEN')
@@ -588,7 +615,7 @@ def create_app(auth,reader,notifications,control,vault=None,ops=None):
             except RuntimeError:pass
     return app
 
-def _notification_loop(reader,auth,notifications,fcm_path,interval=2.0):
+def _notification_loop(reader,auth,notifications,fcm_path,interval=2.0,ops_monitor=None):
     from .notifications import FCMHttpV1,SourceEventCollector
     log=logging.getLogger('solbot.app_api.notifications')
     cred=Path(fcm_path) if fcm_path else None
@@ -596,6 +623,7 @@ def _notification_loop(reader,auth,notifications,fcm_path,interval=2.0):
     collector=SourceEventCollector(reader,notifications)
     notifications.recover()
     last_warn=0.0
+    tick=0
     while True:
         try:
             if cred and not sender.enabled and cred.is_file():sender.enabled=True
@@ -605,11 +633,18 @@ def _notification_loop(reader,auth,notifications,fcm_path,interval=2.0):
                 now_s=time.monotonic()
                 if now_s-last_warn>=60.0:
                     last_warn=now_s;log.warning('notification collector poll failed: %s',poll_exc)
+            if ops_monitor is not None and tick%5==0:
+                try:ops_monitor.check_critical_faults(notifications)
+                except Exception as ops_exc:
+                    now_s=time.monotonic()
+                    if now_s-last_warn>=60.0:
+                        last_warn=now_s;log.warning('ops critical fault probe failed: %s',ops_exc)
             notifications.dispatch(sender,device_active=auth.active)
         except Exception as exc:
             now_s=time.monotonic()
             if now_s-last_warn>=60.0:
                 last_warn=now_s;log.warning('notification loop failed: %s',exc)
+        tick+=1
         time.sleep(interval)
 
 def main():
@@ -638,9 +673,10 @@ def main():
     )
     notifications=NotificationStore(root/'notifications.sqlite')
     vault=AccountVault(root)
-    app=create_app(auth,DataReader(),notifications,ControlClient(a.control_socket,pwd.getpwnam('solbot-exec').pw_uid),vault)
+    ops_monitor=OpsMonitor(auth_db=auth.path,notifications_db=notifications.path)
+    app=create_app(auth,DataReader(),notifications,ControlClient(a.control_socket,pwd.getpwnam('solbot-exec').pw_uid),vault,ops=ops_monitor)
     fcm_path=os.environ.get('SOLBOT_FCM_CREDENTIALS','/etc/sol-bot/secrets/firebase-adminsdk.json')
     threading.Thread(target=loop,args=(vault,DataReader()),name='custody-apts',daemon=True).start()
-    threading.Thread(target=_notification_loop,args=(DataReader(),auth,notifications,fcm_path),name='notification-loop',daemon=True).start()
+    threading.Thread(target=_notification_loop,args=(DataReader(),auth,notifications,fcm_path),kwargs={'ops_monitor':ops_monitor},name='notification-loop',daemon=True).start()
     uvicorn.run(app,host='127.0.0.1',port=a.port,workers=1,proxy_headers=True,forwarded_allow_ips='127.0.0.1',access_log=False)
 if __name__=='__main__':main()

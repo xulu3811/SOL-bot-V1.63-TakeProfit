@@ -13,6 +13,7 @@ import sqlite3
 import zlib
 
 from .shadow import ShadowExecutor,ShadowRejected
+from .live_policy import DEFAULT_SLIPPAGE_RATE, LIVE_MAX_STOP_DISTANCE, LIVE_MIN_STOP_DISTANCE, compute_entry_limit_price, resolve_stop_distance
 from ._storage import verify_existing_store
 from .models import timestamp
 from solbot.mathematics.contracts import make_context,SymbolRules
@@ -145,14 +146,90 @@ class P3ShadowExecutor(ShadowExecutor):
         initial_stop(price,self.rules.tick_size)
         return quantity
 
-    def submit_candidate(self,candidate,*,notional='300',now_ms=None,limit_price=None):
+    def submit_candidate(self,candidate,*,notional='300',now_ms=None,limit_price=None,allow_price_below_low=False):
         if not isinstance(candidate,dict):raise ValueError('candidate must be a mapping')
         price=D(limit_price if limit_price is not None else candidate.get('entry_high'),positive=True)
         quantity=self._quantity(D(notional,positive=True),price)
         reasons=self.rules.validate_order(price,quantity,'BUY',reference_price=candidate.get('p3_reference_price'),
                                           reference_minutes=candidate.get('p3_reference_minutes'))
         if reasons:raise ShadowRejected('DENY_EXCHANGE_RULES',','.join(reasons))
-        return super().submit_candidate(candidate,notional=notional,now_ms=now_ms,limit_price=limit_price)
+        return super().submit_candidate(candidate,notional=notional,now_ms=now_ms,limit_price=limit_price,allow_price_below_low=allow_price_below_low)
+
+    def chase_pending(self, features, now_ms):
+        """Re-quote unfilled R2/T2 pending BUY orders upward within entry_high, matching Live."""
+        now_ms = timestamp(now_ms)
+        if not isinstance(features, dict) or not features.get('ready'):
+            return []
+        stamp = features.get('exchange_time_ms')
+        received = features.get('received_time_ms')
+        if (
+            features.get('synced') is not True
+            or type(stamp) is not int
+            or type(received) is not int
+            or not 0 <= now_ms - stamp <= 3000
+            or not 0 <= now_ms - received <= 3000
+        ):
+            return []
+        bid, ask = features.get('bid'), features.get('ask')
+        if not bid or not ask:
+            return []
+        chase_state = getattr(self, '_chase_state', None)
+        if chase_state is None:
+            chase_state = {}
+            self._chase_state = chase_state
+        chased = []
+        with self._transaction() as db:
+            if self._account(db)['hard_locked']:
+                return []
+            rows = db.execute(
+                "SELECT * FROM shadow_orders WHERE side='BUY' AND status='PENDING' "
+                "AND protection_order=0 AND executed_quantity='0' "
+                "AND strategy_id IN ('R2','T2') AND expires_at>?",
+                (now_ms,),
+            ).fetchall()
+            for row in rows:
+                order = dict(row)
+                oid = order['order_id']
+                count, last_ts = chase_state.get(oid, (0, int(order['created_at'] or 0)))
+                if count >= 4 or now_ms - last_ts < 5000:
+                    continue
+                try:
+                    cand = json.loads(order['candidate_json'] or '{}')
+                except Exception:
+                    continue
+                entry_high = cand.get('entry_high')
+                if not entry_high:
+                    continue
+                new_price, _err = compute_entry_limit_price(
+                    order['strategy_id'],
+                    cand.get('entry_low'),
+                    entry_high,
+                    bid,
+                    ask,
+                    self.rules.tick_size,
+                )
+                if new_price is None or new_price <= D(order['limit_price']):
+                    continue
+                try:
+                    new_qty = self._quantity(D(order['notional']), new_price)
+                except ShadowRejected:
+                    continue
+                reasons = self.rules.validate_order(
+                    new_price,
+                    new_qty,
+                    'BUY',
+                    reference_price=cand.get('p3_reference_price'),
+                    reference_minutes=cand.get('p3_reference_minutes'),
+                )
+                if reasons:
+                    continue
+                db.execute(
+                    'UPDATE shadow_orders SET limit_price=?, quantity=? WHERE order_id=?',
+                    (str(new_price), str(new_qty), oid),
+                )
+                chase_state[oid] = (count + 1, now_ms)
+                chased.append({'order_id': oid, 'limit_price': str(new_price), 'quantity': str(new_qty), 'chase_count': count + 1})
+        return chased
 
     @staticmethod
     def _occupied_slots(db):
@@ -205,15 +282,15 @@ class P3ShadowExecutor(ShadowExecutor):
 
     def _signal_stop_distance(self, db, position):
         distance = Decimal('0.008')
-        max_stop = Decimal('0.02') if position.get('strategy_id') == 'T2' else Decimal('0.015')
         row = db.execute("SELECT candidate_json FROM shadow_orders WHERE signal_id=? AND side='BUY' ORDER BY created_at DESC LIMIT 1", (position['signal_id'],)).fetchone()
         if row and row[0]:
             try:
-                raw = Decimal(str(json.loads(row[0]).get('stop_distance') or '0.008'))
+                payload = json.loads(row[0])
+                raw = resolve_stop_distance(payload, entry_ref=position.get('entry_price'))
+                if raw is not None and LIVE_MIN_STOP_DISTANCE <= raw <= LIVE_MAX_STOP_DISTANCE:
+                    return raw
             except Exception:
-                raw = distance
-            if Decimal('0.008') <= raw <= max_stop:
-                distance = raw
+                pass
         return distance
 
     def _t2_stop_price(self, db, position):
@@ -221,25 +298,18 @@ class P3ShadowExecutor(ShadowExecutor):
 
     def _protection(self,db,features,evidence,now_ms):
         outputs=[]
+        apts_slippage = '0' if self.slippage_rate == 0 else format(DEFAULT_SLIPPAGE_RATE, 'f')
         for raw in db.execute("SELECT * FROM shadow_positions WHERE status='OPEN'").fetchall():
             position=dict(raw)
             context=self._context(position,features,now_ms,{'position':position,'evidence':evidence})
             previous=db.execute('SELECT state_json FROM shadow_protection WHERE position_id=?',(position['position_id'],)).fetchone()
             sig_distance = self._signal_stop_distance(db, position)
-            structure_stop = None
-            if position['strategy_id'] == 'R2':
-                row = db.execute("SELECT candidate_json FROM shadow_orders WHERE signal_id=? AND side='BUY' LIMIT 1", (position['signal_id'],)).fetchone()
-                structure_stop = floor_step(D(json.loads(row[0])['stop_price']), self.rules.tick_size)
             if previous:
                 state=APTSState.from_dict(json.loads(previous[0]))
                 changed=(state.entry_price!=D(position['entry_price']) or state.quantity!=D(position['quantity']))
                 # Added entry partial fills can tighten but never lower the stop.
-                # Preserve wider signal stop distances (e.g. T1 1.0% or T2 <= 2.0%) rather than overwriting with 0.8%.
-                if structure_stop is not None:
-                    state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
-                        stop_price=max(state.stop_price,structure_stop),
-                        last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
-                elif sig_distance > Decimal('0.008'):
+                # Preserve resolved stop distances (0.5%-5.0% matching SOL-bot Live).
+                if sig_distance != Decimal('0.008'):
                     new_stop = max(state.stop_price, initial_stop(position['entry_price'], self.rules.tick_size, stop_distance=sig_distance)) if changed else state.stop_price
                     state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
                         stop_price=new_stop,
@@ -250,15 +320,13 @@ class P3ShadowExecutor(ShadowExecutor):
                         last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
             else:
                 state=APTSState.create(context,position['entry_price'],position['quantity'],self.rules.tick_size,
-                    entry_fee_rate=self.fee_rate,exit_fee_rate=self.fee_rate,slippage_rate=self.slippage_rate,
+                    entry_fee_rate=self.fee_rate,exit_fee_rate=self.fee_rate,slippage_rate=apts_slippage,
                     stop_distance=sig_distance,entry_time_ms=int(position.get('opened_at') or now_ms),
                     reversal_confirm_ticks=2)
                 if position['strategy_id']=='T2':
                     wide=self._t2_stop_price(db,position)
                     if wide<state.stop_price:
                         state=replace(state,stop_price=wide)
-                if structure_stop is not None:
-                    state=replace(state,stop_price=structure_stop)
                 # Evaluate the first fresh post-fill quote, including an adverse
                 # spread crossing the initial stop at the moment of entry.
                 state=replace(state,last_decision_time_ms=now_ms-1)

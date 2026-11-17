@@ -45,7 +45,7 @@ interface AppApi {
         factory.init(store)
         val trust=factory.trustManagers.filterIsInstance<javax.net.ssl.X509TrustManager>().single()
         val ssl=javax.net.ssl.SSLContext.getInstance("TLS");ssl.init(null,arrayOf(trust),java.security.SecureRandom())
-        return OkHttpClient.Builder().sslSocketFactory(ssl.socketFactory,trust).connectTimeout(10,TimeUnit.SECONDS).readTimeout(15,TimeUnit.SECONDS).callTimeout(20,TimeUnit.SECONDS).pingInterval(15,TimeUnit.SECONDS).followRedirects(false).followSslRedirects(false).build()
+        return OkHttpClient.Builder().sslSocketFactory(ssl.socketFactory,trust).connectTimeout(10,TimeUnit.SECONDS).readTimeout(15,TimeUnit.SECONDS).callTimeout(20,TimeUnit.SECONDS).pingInterval(15,TimeUnit.SECONDS).retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false).build()
     }
 }
 @Singleton class BotRepository @Inject constructor(
@@ -189,13 +189,15 @@ interface AppApi {
             val record = buildAlertRecord(row, now)
             val inserted = database.alerts().insert(record)
             if (inserted != -1L) {
+                val kind = row.optString("kind").trim().uppercase()
+                val severity = row.optString("severity", "HIGH").trim().uppercase()
+                val silentSecurity = kind == "SECURITY_ALERT" || severity == "SILENT" || eventId.startsWith("sec:")
                 val createdAt = row.optLong("created_at", now).let { if (it > 0L) it else now }
                 val ageMs = now - createdAt
-                // Ring alarm if already primed and event is not stale history (>15 min old),
-                // or even on first run if the event just happened within the last 2 minutes.
-                val shouldRing = (primed && ageMs <= 900_000L) || ageMs <= 120_000L
-                if (shouldRing) {
-                    val urgent = row.optString("severity", "HIGH").uppercase() != "NORMAL"
+                // Ring alarm only for non-security alerts when already primed (<=15 min) or fresh (<=2 min).
+                val shouldNotify = !silentSecurity && ((primed && ageMs <= 900_000L) || ageMs <= 120_000L)
+                if (shouldNotify) {
+                    val urgent = severity != "NORMAL"
                     AlertNotifier.notify(appContext, record, urgent = urgent)
                 }
             }

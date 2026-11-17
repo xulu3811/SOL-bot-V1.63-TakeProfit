@@ -2,6 +2,7 @@ package com.lu.cryptobot
 
 import com.lu.cryptobot.ui.charts.parseCandleSeries
 import com.lu.cryptobot.ui.components.BotFormatters
+import com.lu.cryptobot.ui.components.mergeSecurityNotices
 import com.lu.cryptobot.ui.components.optCleanString
 import org.json.JSONArray
 import org.json.JSONObject
@@ -228,5 +229,30 @@ class UiSyncHelpersTest {
         val updated = FrameSyncHelper.mergeFrame(kept, frameWithOverview)
         assertEquals(39.2, updated["system/overview"]!!.getJSONObject("server").getDouble("ram_pct"), 1e-6)
         assertEquals(12, updated["system/overview"]!!.getJSONObject("bot_modules").getInt("active_count"))
+    }
+
+    @Test
+    fun mergeSecurityNoticesDedupesAndExcludesTradeAlerts() {
+        val sec = JSONObject().put(
+            "recent_alerts",
+            JSONArray().put(
+                JSONObject()
+                    .put("id", "sec:aaa")
+                    .put("created_at", 2000L)
+                    .put("time_text", "11-16 15:19:00")
+                    .put("title", "SOLUSDT · 接口安全拦截记录")
+                    .put("message", "已静默记录"),
+            ),
+        )
+        val local = listOf(
+            AlertRecord("sec:aaa", "dup", "dup", "markets", 2000L),
+            AlertRecord("sec:bbb", "SOLUSDT · SSH安全拦截记录", "SSH拦截", "markets", 3000L),
+            AlertRecord("bot:123", "SOLUSDT R2 买入成交", "不应混入ServStatus", "live", 4000L),
+        )
+        val merged = mergeSecurityNotices(sec, local)
+        assertEquals(2, merged.size)
+        assertEquals("sec:bbb", merged[0].id)
+        assertEquals("sec:aaa", merged[1].id)
+        assertEquals("11-16 15:19:00", merged[1].timeText)
     }
 }

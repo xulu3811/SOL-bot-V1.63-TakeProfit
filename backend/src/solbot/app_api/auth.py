@@ -5,7 +5,12 @@ from contextlib import contextmanager,closing
 from cryptography.hazmat.primitives import serialization,hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
-class AuthError(PermissionError): pass
+class AuthError(PermissionError):
+    """Authentication/authorization error preserving exact HTTP error code."""
+
+    def __init__(self, code, *, verified_device=False):
+        super().__init__(code)
+        self.verified_device = bool(verified_device)
 def canonical(method,path,body,timestamp,nonce,request_id):
     return '\n'.join((method.upper(),path,hashlib.sha256(body).hexdigest(),str(timestamp),nonce,request_id)).encode()
 def hashed(value): return hashlib.sha256(value.encode()).hexdigest()
@@ -68,10 +73,10 @@ class AuthStore:
             key.verify(base64.b64decode(h['x-signature'],validate=True),canonical(method,path,body,timestamp,nonce,rid),ec.ECDSA(hashes.SHA256()))
         except Exception:raise AuthError('INVALID_SIGNATURE_OR_TIME') from None
         return nonce,rid
-    def _consume(self,db,device,nonce,rid):
+    def _consume(self,db,device,nonce,rid,*,verified_device=False):
         db.execute('DELETE FROM replays WHERE expires_at<?',(self.clock(),))
         try:db.execute('INSERT INTO replays VALUES(?,?,?,?)',(device,nonce,rid,self.clock()+90000))
-        except sqlite3.IntegrityError:raise AuthError('REPLAY_REJECTED') from None
+        except sqlite3.IntegrityError:raise AuthError('REPLAY_REJECTED',verified_device=verified_device) from None
     def _session(self,db,device):
         token=secrets.token_urlsafe(32)
         db.execute('INSERT INTO sessions VALUES(?,?,?,0)',(hashed(token),device,0))
@@ -117,7 +122,7 @@ class AuthStore:
             session=db.execute('SELECT device_id,expires_at,revoked FROM sessions WHERE hash=?',(hashed(token[7:]),)).fetchone()
             if not row or row[2] or not session or session[0]!=device or session[2] or (session[1] and session[1]<=self.clock()):raise AuthError('SESSION_EXPIRED_OR_REVOKED')
             self._check_device_allowlist(device_id=device,device_name=row[3],pem=row[0])
-            nonce,rid=self._proof(self.public_key(row[0]),method,path,body,h);self._consume(db,device,nonce,rid)
+            nonce,rid=self._proof(self.public_key(row[0]),method,path,body,h);self._consume(db,device,nonce,rid,verified_device=True)
             db.execute('INSERT INTO auth_audit(device_id,action,result,created_at) VALUES(?,?,?,?)',(device,method+' '+path.split('?')[0],'AUTHENTICATED',self.clock()))
             return {'device_id':device,'role':row[1],'request_id':rid}
     def active(self,device):

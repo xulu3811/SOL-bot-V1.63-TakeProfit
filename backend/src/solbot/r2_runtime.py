@@ -11,7 +11,7 @@ from solbot.execution.r2_shadow import R2ShadowExecutor
 from solbot.execution.shadow import ShadowRejected
 from solbot.mathematics.contracts import SymbolRules
 from solbot.mathematics.decimal_utils import json_safe
-from solbot.mathematics.trend_exhaustion import TrendEvidence, from_closed_inputs
+from solbot.mathematics.trend_exhaustion import FlowSmoother, TrendEvidence, from_closed_inputs, smooth_micro_features
 from solbot.p2_runtime import atomic_json
 from solbot.p3_runtime import (
     acquire_cross_shadow_entry_guard,
@@ -63,6 +63,7 @@ def main():
     candles = None
     last_error = None
     last_snapshot_ms = 0
+    flow_smoother = FlowSmoother()
     while True:
         now = time.time_ns() // 1000000
         status = {'symbol': 'SOLUSDT', 'mode': 'SHADOW', 'strategy_id': 'R2', 'updated_at': now,
@@ -84,8 +85,10 @@ def main():
                     ledger.invalidate_pending(latest[0], now)
             if candles:
                 event = candles['1m'][-1]['close_time']
-                evidence = from_closed_inputs('SOLUSDT', candles, features, event)
+                smoothed_features = smooth_micro_features(features, flow_smoother)
+                evidence = from_closed_inputs('SOLUSDT', candles, smoothed_features, event)
                 ledger.invalidate_pending(candles['1m'][-1]['close'], now)
+            ledger.chase_pending(features, now)
             status['execution'] = ledger.process_market(features, evidence, now_ms=now)
             outbox_changed = bool(status['execution'].get('fills'))
             with closing(sqlite3.connect(Path(args.market_db).resolve().as_uri()+'?mode=ro', uri=True)) as db:
@@ -117,7 +120,12 @@ def main():
                         signal_time=int(intent.get('signal_time') or now),
                         now_ms=now,
                     )
-                    order = ledger.submit_intent(intent, now)
+                    order = ledger.submit_intent(
+                        intent,
+                        now,
+                        bid=features.get('bid'),
+                        ask=features.get('ask'),
+                    )
                     outcome = {'order_id': order['order_id'], 'status': order['status']}
                 except ShadowRejected as exc:
                     if claimed:

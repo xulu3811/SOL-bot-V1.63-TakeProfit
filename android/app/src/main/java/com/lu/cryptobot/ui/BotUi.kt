@@ -99,8 +99,10 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
 
     val deviceId = state.deviceId
     val baseUrl = state.baseUrl
-    val unreadCount = remember(alerts, state.alertsSeenAt) {
-        alerts.count { it.receivedAt > state.alertsSeenAt }
+    val tradeAlerts = remember(alerts) { alerts.filterNot { it.eventId.startsWith("sec:") } }
+    val securityAlerts = remember(alerts) { alerts.filter { it.eventId.startsWith("sec:") } }
+    val unreadCount = remember(tradeAlerts, state.alertsSeenAt) {
+        tradeAlerts.count { it.receivedAt > state.alertsSeenAt }
     }
 
     val micro = state.values["markets"]?.optJSONObject("micro")
@@ -121,7 +123,7 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                         microReady = microReady,
                         unreadAlerts = unreadCount,
                         onOpenAlerts = {
-                            val newest = alerts.maxOfOrNull { it.receivedAt } ?: System.currentTimeMillis()
+                            val newest = tradeAlerts.maxOfOrNull { it.receivedAt } ?: System.currentTimeMillis()
                             vm.markAlertsRead(newest)
                             showAlerts = true
                         },
@@ -243,9 +245,22 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                                 onSelectTimeframe = { tf -> vm.refreshCandles(tf) },
                                 opsBusy = state.opsBusy,
                                 opsMessage = state.opsMessage,
+                                servAlertsSeenAt = state.servAlertsSeenAt,
+                                localSecurityAlerts = securityAlerts,
+                                onMarkServAlertsRead = { latestAt -> vm.markServAlertsRead(latestAt) },
                                 onOptimizeMemory = { vm.optimizeServerMemory() },
                                 onRequestCleanCache = { vm.previewCleanServerCache() },
-                                onOpenServerLogs = { showServerLogs = true },
+                                onOpenServerLogs = {
+                                    val latestSecAt = maxOf(
+                                        state.values["system/overview"]
+                                            ?.optJSONObject("server")
+                                            ?.optJSONObject("security")
+                                            ?.optLong("latest_alert_at", 0L) ?: 0L,
+                                        securityAlerts.maxOfOrNull { it.receivedAt } ?: 0L,
+                                    )
+                                    vm.markServAlertsRead(latestSecAt)
+                                    showServerLogs = true
+                                },
                                 onDismissOpsMessage = { vm.clearOpsMessage() },
                                 modifier = Modifier.fillMaxSize(),
                             )
@@ -268,6 +283,10 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
                                 values = state.values,
                                 onInspectOrder = { ord -> inspectingOrder = ord },
                                 onOpenTradingConfig = { showTradingConfig = true },
+                                shadowResetBusy = state.shadowResetBusy,
+                                shadowResetMessage = state.shadowResetMessage,
+                                onResetShadowData = { vm.resetShadowTradingData() },
+                                onDismissResetMessage = { vm.dismissShadowResetMessage() },
                                 modifier = Modifier.fillMaxSize(),
                             )
                         }
@@ -291,7 +310,7 @@ fun BotUi(vm: BotViewModel, start: String = "markets") {
 
         if (showAlerts) {
             AlertsInboxSheet(
-                alerts = alerts,
+                alerts = tradeAlerts,
                 onNavigateRoute = { target ->
                     if (DESTINATIONS.any { it.route == target }) route = target
                 },

@@ -72,12 +72,13 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
         and cur_rsi5 >= 24.0
         and (cur_rsi5 - min_rsi5) >= 12.0
     ):
+        # Require 1m breakout confirmation on extreme oversold reversals to avoid catching falling knives.
         return {
             "trend": round(min(1.0, 0.85 + 0.15 * max(0.0, (22.0 - min_rsi15) / 10.0)), 4),
             "momentum": round(min(1.0, 0.85 + 0.15 * max(0.0, (cur_rsi5 - min_rsi5 - 12.0) / 10.0)), 4),
             "participation": round(min(1.0, 0.85 + 0.15 * max(0.0, (max_rvol5 - 1.8) / 1.0)), 4),
-            "structure": 1.0,
-        }, []
+            "structure": 1.0 if confirmed else 0.5,
+        }, ([] if confirmed else ["ONE_MINUTE_BREAKOUT_UNCONFIRMED"])
 
     factors = {
         "trend": float(four_up) if four_up else round(max(0.0, min(0.85, (35.0 - min_rsi15) / 20.0)), 4),

@@ -50,17 +50,17 @@ def _read_json_file(path: Path | None) -> dict[str, Any] | None:
 class OpsAgentClient:
     """AF_UNIX client communicating with solbot-ops-agent."""
 
-    def __init__(self, socket_path: str = "/run/solbot-ops/ops.sock", expected_uid: int | None = 0, timeout: float = 2.5) -> None:
+    def __init__(self, socket_path: str = "/run/solbot-ops/ops.sock", expected_uid: int | None = 0, timeout: float = 5.0) -> None:
         self.socket_path = socket_path
         self.expected_uid = expected_uid
         self.timeout = timeout
 
-    def call(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+    def call(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any] | None:
         if not self.socket_path or not os.path.exists(self.socket_path):
             return None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
+                sock.settimeout(self.timeout if timeout is None else float(timeout))
                 sock.connect(self.socket_path)
                 if self.expected_uid is not None and hasattr(socket, "SO_PEERCRED"):
                     _, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
@@ -106,6 +106,10 @@ class OpsMonitor:
         self._lock = threading.Lock()
         self._cached_at = 0.0
         self._cached_overview: dict[str, Any] | None = None
+        self._startup_ms = int(self.clock())
+        self._fault_streaks: dict[tuple[str, str, str], int] = {}
+        self._fault_startup_grace_ms = 90_000
+        self._fault_confirm_ticks = 2
 
     def _read_sqlite(self, path: Path | None, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         if path is None or not path.is_file():
@@ -122,21 +126,44 @@ class OpsMonitor:
         return []
 
     def _api_security_summary(self, now_ms: int) -> dict[str, Any]:
+        from .notifications import _describe_event
+
         since = now_ms - 86_400_000
         rows = self._read_sqlite(
             self.notifications_db,
-            "SELECT details FROM notification_events WHERE kind='SECURITY_ALERT' AND created_at>=?",
+            "SELECT event_id, created_at, symbol, details FROM notification_events WHERE kind='SECURITY_ALERT' AND created_at>=? ORDER BY sequence DESC",
             (since,),
         )
         alerts_24h = 0
+        latest_alert_at = 0
+        recent_alerts: list[dict[str, Any]] = []
         for row in rows:
             try:
                 det = json.loads(row.get("details") or "{}")
             except ValueError:
                 det = {}
-            if det.get("security_code") == "SSH_DESKTOP_LOGIN":
+            code = det.get("security_code") or "UNAUTHORIZED_DEVICE"
+            if code == "SSH_DESKTOP_LOGIN":
                 continue
             alerts_24h += 1
+            created_at = int(row.get("created_at") or 0)
+            if created_at > latest_alert_at:
+                latest_alert_at = created_at
+            if len(recent_alerts) < 15:
+                title, body, _, _ = _describe_event("SECURITY_ALERT", row.get("symbol"), det)
+                recent_alerts.append(
+                    {
+                        "id": str(row.get("event_id") or f"sec:{created_at}:{alerts_24h}"),
+                        "created_at": created_at,
+                        "time_text": _fmt_ts(created_at),
+                        "level": "warn",
+                        "code": code,
+                        "channel": det.get("security_channel") or "HTTPS_API",
+                        "source_ip": det.get("source_ip") or "未知IP",
+                        "title": title,
+                        "message": body,
+                    }
+                )
         auth_fail_rows = self._read_sqlite(
             self.auth_db,
             "SELECT COUNT(*) AS n FROM auth_audit WHERE result NOT IN ('OK','AUTHENTICATED','PERMANENT') AND created_at>=?",
@@ -146,6 +173,8 @@ class OpsMonitor:
         return {
             "api_alerts_24h": alerts_24h,
             "api_auth_failures_24h": auth_fails,
+            "latest_alert_at": latest_alert_at,
+            "recent_alerts": recent_alerts,
         }
 
     def _api_logs(self, only_alerts: bool, limit: int) -> dict[str, Any]:
@@ -340,6 +369,190 @@ class OpsMonitor:
             "services": enriched_services,
         }
 
+    @staticmethod
+    def _is_recent_health_fail(entry: dict[str, Any] | None, now_ms: int, max_age_ms: int = 900_000) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        text = str(entry.get("text") or "")
+        if "status=fail" not in text:
+            return False
+        token = text.split(None, 1)[0]
+        try:
+            dt = datetime.fromisoformat(token)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_BJT)
+            ts_ms = int(dt.timestamp() * 1000)
+            return 0 <= (now_ms - ts_ms) <= max_age_ms
+        except ValueError:
+            return False
+
+    def _collect_faults(
+        self,
+        now_ms: int,
+        *,
+        agent_ok: bool,
+        raw_metrics: dict[str, Any],
+        services: list[dict[str, Any]],
+        enforce_heartbeats: bool = False,
+        health_entry: dict[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
+        """Collect active Category-1 urgent faults (Server faults + SOL-bot service faults)."""
+        faults: list[dict[str, str]] = []
+        if not agent_ok:
+            faults.append(
+                {
+                    "kind": "SERVER_ERROR",
+                    "fault_code": "OPS_AGENT_DOWN",
+                    "fault_unit": "ops-agent",
+                    "summary": "Ops 运维代理无响应",
+                }
+            )
+            return faults
+
+        disk_pct = raw_metrics.get("disk_pct")
+        if isinstance(disk_pct, (int, float)) and disk_pct >= 92.0:
+            faults.append(
+                {
+                    "kind": "SERVER_ERROR",
+                    "fault_code": "DISK_CRITICAL",
+                    "fault_unit": "disk",
+                    "summary": f"磁盘使用率 {disk_pct:.1f}% (≥92%)",
+                }
+            )
+
+        ram_pct = raw_metrics.get("ram_pct")
+        ram_avail = raw_metrics.get("ram_available_mb")
+        if (isinstance(ram_pct, (int, float)) and ram_pct >= 95.0) or (
+            isinstance(ram_avail, (int, float)) and ram_avail < 120
+        ):
+            faults.append(
+                {
+                    "kind": "SERVER_ERROR",
+                    "fault_code": "RAM_CRITICAL",
+                    "fault_unit": "memory",
+                    "summary": f"内存告急 ({ram_pct}% / 可用 {ram_avail} MB)",
+                }
+            )
+
+        if self._is_recent_health_fail(health_entry, now_ms):
+            faults.append(
+                {
+                    "kind": "SERVER_ERROR",
+                    "fault_code": "HEALTHCHECK_FAIL",
+                    "fault_unit": "health",
+                    "summary": "health.log 巡检出现 status=fail",
+                }
+            )
+
+        systemctl_available = any(
+            (s.get("active_state") or ("active" if s.get("active") else "inactive")) != "unknown"
+            for s in services
+        )
+        if systemctl_available:
+            for s in services:
+                if s.get("active", True):
+                    continue
+                unit = str(s.get("unit") or "system")
+                label = str(s.get("label") or unit)
+                if unit == "nginx.service":
+                    faults.append(
+                        {
+                            "kind": "SERVER_ERROR",
+                            "fault_code": "NGINX_DOWN",
+                            "fault_unit": "nginx.service",
+                            "summary": "Nginx TLS 网关已停止",
+                        }
+                    )
+                else:
+                    faults.append(
+                        {
+                            "kind": "SOLBOT_SERVICE_FAULT",
+                            "fault_code": "SERVICE_DOWN",
+                            "fault_unit": unit,
+                            "summary": f"{label} ({unit}) 已停止",
+                        }
+                    )
+
+        if enforce_heartbeats:
+            hb_specs = (
+                ("micro_sol", ("received_time_ms", "feature_generated_time_ms"), 60_000),
+                ("shadow", ("updated_at",), 180_000),
+                ("r2", ("updated_at",), 180_000),
+                ("guardian", (), 0),
+                ("execution", (), 0),
+            )
+            for key, ts_fields, max_age_ms in hb_specs:
+                st = _read_json_file(self.status_paths.get(key))
+                if not st:
+                    continue
+                if st.get("error"):
+                    faults.append(
+                        {
+                            "kind": "SOLBOT_SERVICE_FAULT",
+                            "fault_code": "MODULE_ERROR",
+                            "fault_unit": key,
+                            "summary": f"模块 {key} 状态报错: {st.get('error')}",
+                        }
+                    )
+                    continue
+                if max_age_ms > 0:
+                    ts = next((st.get(f) for f in ts_fields if isinstance(st.get(f), (int, float))), None)
+                    if ts is not None and (now_ms - int(ts)) > max_age_ms:
+                        age_sec = max(0, (now_ms - int(ts)) // 1000)
+                        faults.append(
+                            {
+                                "kind": "SOLBOT_SERVICE_FAULT",
+                                "fault_code": "HEARTBEAT_STALE",
+                                "fault_unit": key,
+                                "summary": f"模块 {key} 心跳超时 ({age_sec}s)",
+                            }
+                        )
+        return faults
+
+    def check_critical_faults(self, notifications: Any, *, cooldown_ms: int = 300_000) -> list[dict[str, str]]:
+        """Probe critical server & SOL-bot faults with 2-check debounce and emit urgent alerts."""
+        if notifications is None or not callable(getattr(notifications, "publish_fault_alert", None)):
+            return []
+        now_ms = int(self.clock())
+        raw_metrics = self.agent.call({"action": "metrics"})
+        agent_ok = bool(raw_metrics and raw_metrics.get("ok"))
+        services = raw_metrics.get("services", []) if agent_ok else []
+        health_entry: dict[str, Any] | None = None
+        if agent_ok:
+            h_res = self.agent.call({"action": "logs", "source": "health", "only_alerts": False, "limit": 1})
+            if isinstance(h_res, dict) and h_res.get("ok") and isinstance(h_res.get("entries"), list) and h_res["entries"]:
+                health_entry = h_res["entries"][0]
+        past_grace = (now_ms - self._startup_ms) >= self._fault_startup_grace_ms
+        faults = self._collect_faults(
+            now_ms,
+            agent_ok=agent_ok,
+            raw_metrics=raw_metrics or {},
+            services=services,
+            enforce_heartbeats=past_grace,
+            health_entry=health_entry,
+        )
+        active_map = {(f["kind"], f["fault_code"], f["fault_unit"]): f for f in faults}
+        for k in list(self._fault_streaks):
+            if k not in active_map:
+                self._fault_streaks.pop(k, None)
+        triggered: list[dict[str, str]] = []
+        for key, fault in active_map.items():
+            streak = self._fault_streaks.get(key, 0) + 1
+            self._fault_streaks[key] = streak
+            required_ticks = 3 if fault["fault_code"] == "OPS_AGENT_DOWN" else self._fault_confirm_ticks
+            if streak >= required_ticks:
+                try:
+                    if notifications.publish_fault_alert(
+                        fault["kind"],
+                        fault["fault_code"],
+                        fault["fault_unit"],
+                        cooldown_ms=cooldown_ms,
+                    ):
+                        triggered.append(fault)
+                except Exception:
+                    pass
+        return triggered
+
     def overview(self, *, cached: bool = False, live_status_doc: dict[str, Any] | None = None, fcm_enabled: bool | None = None) -> dict[str, Any]:
         now_s = time.monotonic()
         if cached:
@@ -360,13 +573,24 @@ class OpsMonitor:
         f2b_total_failed = int(sec_raw.get("fail2ban_total_failed", 0))
         api_alerts = int(api_sec.get("api_alerts_24h", 0))
         api_fails = int(api_sec.get("api_auth_failures_24h", 0))
+        latest_alert_at = int(api_sec.get("latest_alert_at", 0))
+        recent_alerts = api_sec.get("recent_alerts", [])
 
-        if f2b_banned > 0 or api_alerts > 0 or api_fails > 0 or ssh_failed >= 5:
-            sec_status = "ALERT"
-            sec_label = f"异常 {f2b_banned + api_alerts + ssh_failed}"
-        elif ssh_failed > 0 or f2b_total_failed > 0:
-            sec_status = "WARN"
-            sec_label = f"拦截 {max(ssh_failed, f2b_total_failed)}"
+        past_grace = (now_ms - self._startup_ms) >= self._fault_startup_grace_ms
+        faults = self._collect_faults(
+            now_ms,
+            agent_ok=agent_ok,
+            raw_metrics=raw_metrics or {},
+            services=services,
+            enforce_heartbeats=past_grace,
+        )
+        has_server_fault = any(f["kind"] == "SERVER_ERROR" for f in faults)
+        fault_label = "服务器故障" if has_server_fault else ("SOL-bot故障" if faults else "")
+        fault_summary = "；".join(f["summary"] for f in faults[:2])
+
+        if faults:
+            sec_status = "FAULT"
+            sec_label = fault_label
         else:
             sec_status = "OK"
             sec_label = "安全正常"
@@ -400,6 +624,12 @@ class OpsMonitor:
             "security": {
                 "status": sec_status,
                 "status_label": sec_label,
+                "critical_fault": bool(faults),
+                "fault_label": fault_label,
+                "fault_summary": fault_summary,
+                "critical_faults": faults,
+                "latest_alert_at": latest_alert_at,
+                "recent_alerts": recent_alerts,
                 "ssh_active_count": ssh_active,
                 "ssh_sessions": sec_raw.get("ssh_sessions", []),
                 "ssh_failed_recent": ssh_failed,
@@ -411,7 +641,7 @@ class OpsMonitor:
                 "fail2ban_banned_ips": sec_raw.get("fail2ban_banned_ips", []),
                 "api_alerts_24h": api_alerts,
                 "api_auth_failures_24h": api_fails,
-                "summary_text": f"SSH 在线 {ssh_active} · 拦截 {max(ssh_failed, f2b_total_failed)} · API异常 {api_alerts + api_fails}",
+                "summary_text": f"⚠️ {fault_summary}" if faults else f"SSH 在线 {ssh_active} · 拦截 {max(ssh_failed, f2b_total_failed)} · 静默安全记录 {api_alerts}",
             },
         }
 
@@ -452,4 +682,12 @@ class OpsMonitor:
         if not dry_run:
             with self._lock:
                 self._cached_overview = None
+        return res
+
+    def reset_shadow_data(self) -> dict[str, Any]:
+        res = self.agent.call({"action": "reset_shadow_data"}, timeout=20.0)
+        if not res:
+            return {"ok": False, "error": "OPS_AGENT_UNAVAILABLE", "message": "本地运维代理未连接"}
+        with self._lock:
+            self._cached_overview = None
         return res

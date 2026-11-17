@@ -34,6 +34,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lu.cryptobot.AlertRecord
 import com.lu.cryptobot.ui.charts.ProCandleChart
 import com.lu.cryptobot.ui.components.BotFormatters
 import com.lu.cryptobot.ui.components.BotSurfaceCard
@@ -54,6 +55,9 @@ fun MarketsScreen(
     onSelectTimeframe: (String) -> Unit,
     opsBusy: Boolean = false,
     opsMessage: String? = null,
+    servAlertsSeenAt: Long = 0L,
+    localSecurityAlerts: List<AlertRecord> = emptyList(),
+    onMarkServAlertsRead: (Long) -> Unit = {},
     onOptimizeMemory: () -> Unit = {},
     onRequestCleanCache: () -> Unit = {},
     onOpenServerLogs: () -> Unit = {},
@@ -257,6 +261,9 @@ fun MarketsScreen(
                 systemOverview = values["system/overview"],
                 opsBusy = opsBusy,
                 opsMessage = opsMessage,
+                servAlertsSeenAt = servAlertsSeenAt,
+                localSecurityAlerts = localSecurityAlerts,
+                onMarkServAlertsRead = onMarkServAlertsRead,
                 onOptimizeMemory = onOptimizeMemory,
                 onRequestCleanCache = onRequestCleanCache,
                 onOpenLogs = onOpenServerLogs,

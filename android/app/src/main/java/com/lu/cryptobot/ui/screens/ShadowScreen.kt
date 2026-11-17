@@ -22,8 +22,13 @@ import androidx.compose.material.icons.automirrored.outlined.ReceiptLong
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -57,6 +62,10 @@ fun ShadowScreen(
     values: Map<String, JSONObject>,
     onInspectOrder: (JSONObject) -> Unit,
     onOpenTradingConfig: () -> Unit = {},
+    shadowResetBusy: Boolean = false,
+    shadowResetMessage: String? = null,
+    onResetShadowData: () -> Unit = {},
+    onDismissResetMessage: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val bot = LocalBotColors.current
@@ -86,6 +95,7 @@ fun ShadowScreen(
 
     val negPnl = BotFormatters.isNegative(pnl)
     var rulesExpanded by remember { mutableStateOf(false) }
+    var showResetConfirm by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -93,6 +103,35 @@ fun ShadowScreen(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (!shadowResetMessage.isNullOrBlank()) {
+            val isResetErr = shadowResetMessage.startsWith("重置失败")
+            Surface(
+                shape = MaterialTheme.shapes.medium,
+                color = if (isResetErr) bot.lossSoft else bot.infoSoft,
+                border = BorderStroke(1.dp, if (isResetErr) bot.loss.copy(alpha = 0.25f) else bot.info.copy(alpha = 0.25f)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = shadowResetMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isResetErr) bot.loss else bot.info,
+                        modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    )
+                    Text(
+                        text = "知道了",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isResetErr) bot.loss else bot.info,
+                        modifier = Modifier.clickable { onDismissResetMessage() }.padding(4.dp),
+                    )
+                }
+            }
+        }
         if (shadow?.optBoolean("synced", false) != true) {
             val healthMessage = when (shadow?.optString("reason")) {
                 "ENGINE_HEARTBEAT_STALE" -> "影子执行服务心跳已过期"
@@ -137,27 +176,61 @@ fun ShadowScreen(
                     ) {
                         Icon(Icons.Outlined.Science, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(17.dp))
                         Text("Shadow-bot", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        StatusBadge("影子沙盒账本", bot.infoSoft, bot.info)
+                        StatusBadge("影子沙盒", bot.infoSoft, bot.info)
                     }
-                    Surface(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { onOpenTradingConfig() },
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer,
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(enabled = !shadowResetBusy) { showResetConfirm = true },
+                            shape = RoundedCornerShape(8.dp),
+                            color = bot.lossSoft,
                         ) {
-                            Icon(Icons.Outlined.Tune, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(13.dp))
-                            Text(
-                                text = "配置同步",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                if (shadowResetBusy) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 1.6.dp,
+                                        color = bot.loss,
+                                    )
+                                } else {
+                                    Icon(Icons.Outlined.RestartAlt, null, tint = bot.loss, modifier = Modifier.size(13.dp))
+                                }
+                                Text(
+                                    text = if (shadowResetBusy) "重置中" else "重置",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = bot.loss,
+                                )
+                            }
+                        }
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onOpenTradingConfig() },
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(Icons.Outlined.Tune, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(13.dp))
+                                Text(
+                                    text = "配置",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                )
+                            }
                         }
                     }
                 }
@@ -317,7 +390,7 @@ fun ShadowScreen(
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                text = "• 与实盘共享 T1/T2/R2 信号（跨策略 15m 冷却与槽位上限同步）及 APTS v2 移动止损状态机（S0 初始保护 → S1 +0.8% 保本 → S2 +1.5%+ 双 tick 追踪，未触发止损一直持仓）。",
+                                text = "• 与实盘共享 T1/T2/R2 信号（跨策略 15m 冷却与槽位上限同步）及 APTS v2 移动止损状态机（S0 初始保护 → S1 +0.8% 保本 / +1.1% 动态锁盈 → S2 +1.2%+ 追尾与超买衰竭 0.40% 收紧，未触发止损一直持仓）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -455,6 +528,40 @@ fun ShadowScreen(
             }
         }
         Spacer(Modifier.height(12.dp))
+    }
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            title = {
+                Text("重置交易数据", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text(
+                    text = "将清除 Shadow-bot 历史委托、模拟持仓、成交流水、保护状态及累计盈亏，并按当前仓位配置重新校准模拟本金（实盘账户、K 线与策略历史不受影响）。此操作不可撤销，确认继续？",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showResetConfirm = false
+                        onResetShadowData()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = bot.loss,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                    ),
+                ) {
+                    Text("重置交易数据")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirm = false }) {
+                    Text("取消")
+                }
+            },
+        )
     }
 }
 

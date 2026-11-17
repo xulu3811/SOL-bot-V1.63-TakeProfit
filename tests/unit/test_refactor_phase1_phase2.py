@@ -345,10 +345,10 @@ class Phase2APTSv2Tests(unittest.TestCase):
         self.assertEqual(d3.state.reversal_hits, 0)
         # Two consecutive CONFIRMED_REVERSAL ticks -> exit!
         t4 = t3 + 60_000
-        d4 = update_protection(d3.state, replace(self._ctx(t4), decision_time_ms=t4, book_time_ms=t4, valid_until_ms=t4 + 5000), "101.70", rev, tick_size="0.01")
+        d4 = update_protection(d3.state, replace(self._ctx(t4), decision_time_ms=t4, book_time_ms=t4, valid_until_ms=t4 + 5000), "101.75", rev, tick_size="0.01")
         self.assertFalse(d4.exit_required)
         t5 = t4 + 60_000
-        d5 = update_protection(d4.state, replace(self._ctx(t5), decision_time_ms=t5, book_time_ms=t5, valid_until_ms=t5 + 5000), "101.60", rev, tick_size="0.01")
+        d5 = update_protection(d4.state, replace(self._ctx(t5), decision_time_ms=t5, book_time_ms=t5, valid_until_ms=t5 + 5000), "101.65", rev, tick_size="0.01")
         self.assertTrue(d5.exit_required)
         self.assertEqual(d5.state.trigger_reason, "CONFIRMED_REVERSAL")
 

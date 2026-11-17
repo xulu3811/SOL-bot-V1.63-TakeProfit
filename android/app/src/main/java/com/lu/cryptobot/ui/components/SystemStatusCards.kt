@@ -53,10 +53,62 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lu.cryptobot.AlertRecord
 import com.lu.cryptobot.ui.theme.LocalBotColors
 import com.lu.cryptobot.ui.theme.tnum
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+data class ServSecurityNotice(
+    val id: String,
+    val createdAt: Long,
+    val timeText: String,
+    val title: String,
+    val message: String,
+    val sourceIp: String = "",
+)
+
+internal fun mergeSecurityNotices(
+    sec: JSONObject?,
+    localAlerts: List<AlertRecord>,
+): List<ServSecurityNotice> {
+    val byId = linkedMapOf<String, ServSecurityNotice>()
+    val formatter = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault())
+    val recentArr = sec?.optJSONArray("recent_alerts")
+    if (recentArr != null) {
+        for (i in 0 until recentArr.length()) {
+            val obj = recentArr.optJSONObject(i) ?: continue
+            val id = obj.optString("id").trim()
+            if (id.isEmpty()) continue
+            val ts = obj.optLong("created_at", 0L)
+            val timeText = obj.optCleanString("time_text").orEmpty().ifBlank {
+                if (ts > 0L) formatter.format(Date(ts)) else "—"
+            }
+            byId[id] = ServSecurityNotice(
+                id = id,
+                createdAt = ts,
+                timeText = timeText,
+                title = obj.optCleanString("title").orEmpty().ifBlank { "安全拦截记录" },
+                message = obj.optCleanString("message").orEmpty(),
+                sourceIp = obj.optCleanString("source_ip").orEmpty(),
+            )
+        }
+    }
+    for (rec in localAlerts) {
+        if (!rec.eventId.startsWith("sec:") || rec.eventId in byId) continue
+        byId[rec.eventId] = ServSecurityNotice(
+            id = rec.eventId,
+            createdAt = rec.receivedAt,
+            timeText = formatter.format(Date(rec.receivedAt)),
+            title = rec.title.ifBlank { "安全拦截记录" },
+            message = rec.message,
+        )
+    }
+    return byId.values.sortedByDescending { it.createdAt }.take(15)
+}
 
 private enum class MiddlePanel { SERV, BOT }
 
@@ -65,6 +117,9 @@ fun ServAndBotStatusSection(
     systemOverview: JSONObject?,
     opsBusy: Boolean,
     opsMessage: String?,
+    servAlertsSeenAt: Long = 0L,
+    localSecurityAlerts: List<AlertRecord> = emptyList(),
+    onMarkServAlertsRead: (Long) -> Unit = {},
     onOptimizeMemory: () -> Unit,
     onRequestCleanCache: () -> Unit,
     onOpenLogs: () -> Unit,
@@ -76,10 +131,24 @@ fun ServAndBotStatusSection(
 
     val server = systemOverview?.optJSONObject("server")
     val botModules = systemOverview?.optJSONObject("bot_modules")
+    val sec = server?.optJSONObject("security")
+    val notices = remember(sec?.toString(), localSecurityAlerts) {
+        mergeSecurityNotices(sec, localSecurityAlerts)
+    }
+    val latestNoticeAt = maxOf(
+        sec?.optLong("latest_alert_at", 0L) ?: 0L,
+        notices.maxOfOrNull { it.createdAt } ?: 0L,
+    )
+    val unreadCount = remember(notices, servAlertsSeenAt) {
+        notices.count { it.createdAt > servAlertsSeenAt }
+    }
 
     fun setPanel(next: MiddlePanel?) {
         expandedPanel = next
         onExpandedChange(next != null)
+        if (next == MiddlePanel.SERV && unreadCount > 0) {
+            onMarkServAlertsRead(latestNoticeAt)
+        }
     }
 
     Column(
@@ -95,6 +164,7 @@ fun ServAndBotStatusSection(
         ) {
             ServStatusCompactCard(
                 server = server,
+                unreadSecurityCount = unreadCount,
                 expanded = expandedPanel == MiddlePanel.SERV,
                 onClick = {
                     setPanel(if (expandedPanel == MiddlePanel.SERV) null else MiddlePanel.SERV)
@@ -120,6 +190,7 @@ fun ServAndBotStatusSection(
             when (expandedPanel) {
                 MiddlePanel.SERV -> ServStatusDrawer(
                     server = server,
+                    notices = notices,
                     opsBusy = opsBusy,
                     opsMessage = opsMessage,
                     onOptimizeMemory = onOptimizeMemory,
@@ -141,6 +212,7 @@ fun ServAndBotStatusSection(
 @Composable
 private fun ServStatusCompactCard(
     server: JSONObject?,
+    unreadSecurityCount: Int,
     expanded: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -148,14 +220,15 @@ private fun ServStatusCompactCard(
     val bot = LocalBotColors.current
     val connected = server?.optBoolean("ops_agent_connected", false) == true
     val sec = server?.optJSONObject("security")
-    val secStatus = sec?.optString("status", "OK").orEmpty()
-    val secLabel = sec?.optString("status_label", "待同步").orEmpty().ifBlank { "待同步" }
+    val criticalFault = sec?.optBoolean("critical_fault", false) == true
+    val faultLabel = sec?.optCleanString("fault_label").orEmpty().ifBlank { "服务故障" }
+    val faultSummary = sec?.optCleanString("fault_summary").orEmpty()
 
-    val (badgeBg, badgeFg, dotColor) = when {
-        !connected -> Triple(MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.outline)
-        secStatus == "ALERT" -> Triple(bot.lossSoft, bot.loss, bot.loss)
-        secStatus == "WARN" -> Triple(bot.warnSoft, bot.warn, bot.warn)
-        else -> Triple(bot.gainSoft, bot.gain, bot.gain)
+    val (badgeText, badgeBg, badgeFg, dotColor) = when {
+        criticalFault -> BadgeStyle(faultLabel, bot.lossSoft, bot.loss, bot.loss)
+        !connected -> BadgeStyle("等待代理", MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.outline)
+        unreadSecurityCount > 0 -> BadgeStyle("未读 $unreadSecurityCount", bot.warnSoft, bot.warn, bot.warn)
+        else -> BadgeStyle("安全正常", bot.gainSoft, bot.gain, bot.gain)
     }
 
     val ramPct = server?.optDouble("ram_pct", Double.NaN)?.takeIf { !it.isNaN() }
@@ -163,15 +236,16 @@ private fun ServStatusCompactCard(
     val diskPct = server?.optDouble("disk_pct", Double.NaN)?.takeIf { !it.isNaN() }
     val sshCount = sec?.optInt("ssh_active_count", 0) ?: 0
 
-    val line1 = if (connected && ramPct != null && cpuPct != null) {
-        "RAM ${ramPct.toInt()}% · CPU ${cpuPct.toInt()}%"
-    } else {
-        "节点资源待同步"
+    val line1 = when {
+        connected && ramPct != null && cpuPct != null -> "RAM ${ramPct.toInt()}% · CPU ${cpuPct.toInt()}%"
+        criticalFault -> "检测到一类紧急故障"
+        else -> "节点资源待同步"
     }
-    val line2 = if (connected && diskPct != null) {
-        "盘 ${diskPct.toInt()}% · SSH $sshCount"
-    } else {
-        "点击展开运维面板"
+    val line2 = when {
+        criticalFault -> faultSummary.ifBlank { "请立即展开排查故障" }
+        unreadSecurityCount > 0 -> "未读安全消息 $unreadSecurityCount 条 · 点击查看"
+        connected && diskPct != null -> "盘 ${diskPct.toInt()}% · SSH $sshCount"
+        else -> "点击展开运维面板"
     }
 
     Surface(
@@ -181,8 +255,12 @@ private fun ServStatusCompactCard(
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(
-            width = if (expanded) 1.5.dp else 1.dp,
-            color = if (expanded) MaterialTheme.colorScheme.primary else bot.hairline,
+            width = if (expanded || criticalFault) 1.5.dp else 1.dp,
+            color = when {
+                criticalFault -> bot.loss.copy(alpha = 0.7f)
+                expanded -> MaterialTheme.colorScheme.primary
+                else -> bot.hairline
+            },
         ),
     ) {
         Column(
@@ -201,7 +279,7 @@ private fun ServStatusCompactCard(
                     Icon(
                         imageVector = Icons.Outlined.Dns,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = if (criticalFault) bot.loss else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
@@ -220,7 +298,7 @@ private fun ServStatusCompactCard(
             }
 
             StatusBadge(
-                text = if (connected) secLabel else "等待代理",
+                text = badgeText,
                 containerColor = badgeBg,
                 contentColor = badgeFg,
                 dotColor = dotColor,
@@ -238,7 +316,7 @@ private fun ServStatusCompactCard(
                 Text(
                     text = line2,
                     style = MaterialTheme.typography.labelSmall.tnum(),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (criticalFault) bot.loss else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -344,6 +422,7 @@ private fun BotStatusCompactCard(
 @Composable
 private fun ServStatusDrawer(
     server: JSONObject?,
+    notices: List<ServSecurityNotice>,
     opsBusy: Boolean,
     opsMessage: String?,
     onOptimizeMemory: () -> Unit,
@@ -375,12 +454,11 @@ private fun ServStatusDrawer(
 
     val sec = server?.optJSONObject("security")
     val secStatus = sec?.optString("status", "OK").orEmpty()
-    val secSummary = sec?.optCleanString("summary_text").orEmpty().ifBlank { "SSH/API 安全审计" }
-    val secAlertCount = (sec?.optInt("ssh_failed_recent", 0) ?: 0) +
-        (sec?.optInt("api_alerts_24h", 0) ?: 0) +
-        (sec?.optInt("fail2ban_currently_banned", 0) ?: 0)
+    val criticalFault = sec?.optBoolean("critical_fault", false) == true
+    val faultSummary = sec?.optCleanString("fault_summary").orEmpty()
+    val secSummary = sec?.optCleanString("summary_text").orEmpty().ifBlank { "SSH/API 安全审计（静默记录）" }
 
-    BotSurfaceCard(borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)) {
+    BotSurfaceCard(borderColor = if (criticalFault) bot.loss.copy(alpha = 0.65f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -406,7 +484,23 @@ private fun ServStatusDrawer(
 
         Spacer(Modifier.height(10.dp))
 
-        if (!connected) {
+        if (criticalFault) {
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = bot.lossSoft,
+                border = BorderStroke(1.dp, bot.loss.copy(alpha = 0.4f)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "紧急故障：${faultSummary.ifBlank { "检测到服务器或 SOL-bot 服务异常，请立即排查" }}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = bot.loss,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+        } else if (!connected) {
             Surface(
                 shape = MaterialTheme.shapes.small,
                 color = bot.warnSoft,
@@ -481,8 +575,8 @@ private fun ServStatusDrawer(
                 .clip(RoundedCornerShape(10.dp))
                 .clickable(onClick = onOpenLogs),
             shape = RoundedCornerShape(10.dp),
-            color = if (secStatus == "ALERT") bot.lossSoft.copy(alpha = 0.65f) else MaterialTheme.colorScheme.surfaceContainerLow,
-            border = BorderStroke(1.dp, if (secStatus == "ALERT") bot.loss.copy(alpha = 0.35f) else bot.hairline),
+            color = if (criticalFault) bot.lossSoft.copy(alpha = 0.65f) else MaterialTheme.colorScheme.surfaceContainerLow,
+            border = BorderStroke(1.dp, if (criticalFault) bot.loss.copy(alpha = 0.35f) else bot.hairline),
         ) {
             Row(
                 modifier = Modifier
@@ -499,15 +593,15 @@ private fun ServStatusDrawer(
                     Icon(
                         imageVector = Icons.Outlined.Security,
                         contentDescription = null,
-                        tint = when (secStatus) {
-                            "ALERT" -> bot.loss
-                            "WARN" -> bot.warn
+                        tint = when {
+                            criticalFault || secStatus == "FAULT" -> bot.loss
+                            notices.isNotEmpty() -> bot.warn
                             else -> bot.gain
                         },
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        text = if (secAlertCount > 0) "$secSummary（关注）" else secSummary,
+                        text = secSummary,
                         style = MaterialTheme.typography.labelMedium.tnum(),
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
@@ -530,6 +624,63 @@ private fun ServStatusDrawer(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                }
+            }
+        }
+
+        if (notices.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "最近静默安全拦截记录（24h 共 ${notices.size} 条，已静音防弹窗）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                notices.take(4).forEach { notice ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onOpenLogs),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(1.dp, bot.hairline),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = notice.title,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text(
+                                    text = notice.timeText,
+                                    style = MaterialTheme.typography.labelSmall.tnum(),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (notice.message.isNotBlank()) {
+                                Text(
+                                    text = notice.message,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -122,12 +122,12 @@ class NotificationsTests(unittest.TestCase):
     def test_high_priority_and_payload_no_secrets(self):
         self.store.register('device',self.token);self.store.publish('risk','HARD_LOCK','SUIUSDT',self.now,{'secret':'DO_NOT_LEAK','reason':'DO_NOT_LEAK'})
         sent=[];self.store.dispatch(lambda m:sent.append(m) or 'SENT',device_active=lambda d:True)
-        self.assertEqual(sent[0]['android']['priority'],'HIGH');self.assertNotIn('DO_NOT_LEAK',json.dumps(sent))
+        self.assertEqual(sent[0]['android']['priority'],'high');self.assertEqual(sent[0]['data']['severity'],'HIGH');self.assertNotIn('notification',sent[0]);self.assertNotIn('DO_NOT_LEAK',json.dumps(sent))
         self.assertEqual(self.store.dispatch(lambda m:self.fail('duplicate'),device_active=lambda d:True),[])
     def test_market_priority_normal(self):
         self.store.register('device',self.token);self.store.publish('market','MARKET_SYNC','SOLUSDT',self.now)
         sent=[];self.store.dispatch(lambda m:sent.append(m) or 'SENT',device_active=lambda d:True)
-        self.assertEqual(sent[0]['android']['priority'],'NORMAL')
+        self.assertEqual(sent[0]['android']['priority'],'normal');self.assertEqual(sent[0]['data']['severity'],'NORMAL');self.assertNotIn('notification',sent[0])
     def test_device_revocation_prevents_send(self):
         self.store.register('device',self.token);self.store.publish('one','BUY_FILL','SUIUSDT',self.now)
         self.store.dispatch(lambda m:self.fail('revoked'),device_active=lambda d:False)
@@ -198,8 +198,13 @@ class NotificationsTests(unittest.TestCase):
         self.assertFalse(self.store.publish_security_alert('HTTPS_API','UNAUTHORIZED_DEVICE',source_ip='203.0.113.99',device_model='UNKNOWN'))
         alerts=self.store.alerts()['items']
         self.assertEqual(alerts[-1]['kind'],'SECURITY_ALERT')
-        self.assertEqual(alerts[-1]['severity'],'HIGH')
+        self.assertEqual(alerts[-1]['severity'],'SILENT')
         self.assertIn('203.0.113.99',alerts[-1]['message'])
+        sent=[];self.store.dispatch(lambda m:sent.append(m) or 'SENT',device_active=lambda d:True)
+        self.assertEqual(len(sent),1)
+        self.assertNotIn('notification',sent[0])
+        self.assertEqual(sent[0]['android']['priority'],'normal')
+        self.assertEqual(sent[0]['data']['severity'],'SILENT')
         f2b=self.root/'fail2ban.log';auth_log=self.root/'auth.log'
         f2b.write_text('init\n',encoding='utf-8');auth_log.write_text('init\n',encoding='utf-8')
         os.environ['SOLBOT_FAIL2BAN_LOG']=str(f2b);os.environ['SOLBOT_AUTH_LOG']=str(auth_log)
@@ -211,5 +216,38 @@ class NotificationsTests(unittest.TestCase):
             self.assertEqual(collector.poll()['ssh_security'],1)
         finally:
             os.environ.pop('SOLBOT_FAIL2BAN_LOG',None);os.environ.pop('SOLBOT_AUTH_LOG',None)
+    def test_collector_skips_suiusdt_and_r1_research_signals(self):
+        sui_db=self.root/'sui_strategy.sqlite'
+        sol_db=self.root/'sol_strategy.sqlite'
+        with closing(sqlite3.connect(sui_db)) as db,db:
+            db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY,symbol TEXT,strategy_id TEXT,signal_time INTEGER,accepted INTEGER)')
+            db.execute('INSERT INTO decisions VALUES(1,?,?,?,1)',('SUIUSDT','T2',self.now))
+        with closing(sqlite3.connect(sol_db)) as db,db:
+            db.execute('CREATE TABLE decisions(id INTEGER PRIMARY KEY,symbol TEXT,strategy_id TEXT,signal_time INTEGER,accepted INTEGER)')
+            db.execute('INSERT INTO decisions VALUES(1,?,?,?,1)',('SOLUSDT','R1',self.now))
+            db.execute('INSERT INTO decisions VALUES(2,?,?,?,1)',('SOLUSDT','T2',self.now+1000))
+        reader=DataReader({'SUIUSDT_strategy':sui_db,'SOLUSDT_strategy':sol_db},clock=lambda:self.now)
+        collector=SourceEventCollector(reader,self.store)
+        collector.poll()
+        items=self.store.alerts()['items']
+        self.assertEqual([(i['symbol'],i['kind'],i['details'].get('strategy')) for i in items],[
+            ('SOLUSDT','STRATEGY_SIGNAL','T2'),
+        ])
+    def test_critical_fault_alerts_are_high_priority(self):
+        self.store.register('s24',self.token)
+        self.assertTrue(self.store.publish_fault_alert('SERVER_ERROR','DISK_CRITICAL','disk'))
+        self.assertFalse(self.store.publish_fault_alert('SERVER_ERROR','DISK_CRITICAL','disk'))
+        self.assertTrue(self.store.publish_fault_alert('SOLBOT_SERVICE_FAULT','SERVICE_DOWN','solbot-execution-p5.service'))
+        items=self.store.alerts()['items']
+        self.assertEqual(items[0]['severity'],'HIGH')
+        self.assertIn('服务器故障',items[0]['title'])
+        self.assertEqual(items[1]['severity'],'HIGH')
+        self.assertIn('SOL-bot 服务故障',items[1]['title'])
+        sent=[];self.store.dispatch(lambda m:sent.append(m) or 'SENT',device_active=lambda d:True)
+        self.assertEqual(len(sent),2)
+        for msg in sent:
+            self.assertNotIn('notification',msg)
+            self.assertEqual(msg['android']['priority'],'high')
+            self.assertEqual(msg['data']['severity'],'HIGH')
 
 if __name__=='__main__':unittest.main()

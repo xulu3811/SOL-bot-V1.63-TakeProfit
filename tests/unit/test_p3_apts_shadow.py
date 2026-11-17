@@ -53,10 +53,68 @@ class APTSTests(unittest.TestCase):
         self.assertEqual(self.step(state,'100.79',1).state.stage,'S0_INITIAL_PROTECTION')
         state=self.step(state,'100.80',2).state
         self.assertEqual(state.stage,'S1_PROFIT_PROTECTION')
-        state=self.step(state,'101.5',3).state
+        state=self.step(state,'101.2',3).state
         self.assertEqual(state.stage,'S1_PROFIT_PROTECTION')
-        state=self.step(state,'101.51',4).state
+        state=self.step(state,'101.21',4).state
         self.assertEqual(state.stage,'S2_ADAPTIVE_TRAILING')
+
+    def test_s1_dynamic_lock_and_overbought_exhaustion_near_one_point_two_percent(self):
+        state=APTSState.create(context(NOW),'71.85','18.912','.01',entry_fee_rate='0.00075',exit_fee_rate='0.00075',slippage_rate='0.0005')
+        s1_mid=self.step(state,'72.43',1,NORMAL)
+        self.assertEqual(s1_mid.state.stage,'S1_PROFIT_PROTECTION')
+        self.assertEqual(s1_mid.stop_price,Dec('72.01'))
+        # Below +1.10% stays at fixed net-profit floor (72.01); at >= +1.10% (72.65), dynamic S1 trailing raises stop.
+        s1_below=self.step(s1_mid.state,'72.64',2,NORMAL)
+        self.assertEqual(s1_below.stop_price,Dec('72.01'))
+        s1_dyn=self.step(s1_below.state,'72.65',3,NORMAL)
+        self.assertEqual(s1_dyn.state.stage,'S1_PROFIT_PROTECTION')
+        self.assertEqual(s1_dyn.stop_price,Dec('72.26'))
+        # Climb to 72.74 (+1.24% > +1.20%) enters S2 (< 2.0% exhaustion tighten threshold).
+        s2_peak=self.step(s1_dyn.state,'72.74',4,TrendEvidence(ready=True,higher_low_1m=True,higher_low_5m=True,rvol=Dec('1.8'),buy_ratio=Dec('0.60'),previous_buy_ratio=Dec('0.55'),rsi=Dec('89.2'),previous_rsi=Dec('84.0'),atr=Dec('0.25'),previous_atr=Dec('0.20')))
+        self.assertEqual(s2_peak.state.stage,'S2_ADAPTIVE_TRAILING')
+        exhausted=TrendEvidence(ready=True,higher_low_1m=True,higher_low_5m=True,rvol=Dec('1.5'),buy_ratio=Dec('0.361'),previous_buy_ratio=Dec('0.671'),rsi=Dec('75.2'),previous_rsi=Dec('87.4'),atr=Dec('0.25'),previous_atr=Dec('0.20'))
+        s2_no_tight=self.step(s2_peak.state,'72.52',5,exhausted)
+        self.assertFalse(s2_no_tight.exit_required)
+        self.assertEqual(s2_no_tight.stop_price,Dec('72.26'))
+        # Climb to 73.30 (+2.02% >= +2.00%): 1st exhaustion bar holds prior band, 2nd consecutive 1m bar tightens to 0.40% (73.01).
+        s2_high=self.step(s2_no_tight.state,'73.30',10,TrendEvidence(ready=True,higher_low_1m=True,higher_low_5m=True,rvol=Dec('1.8'),buy_ratio=Dec('0.60'),previous_buy_ratio=Dec('0.55'),rsi=Dec('85.0'),previous_rsi=Dec('80.0'),atr=Dec('0.25'),previous_atr=Dec('0.20')))
+        s2_bar1=self.step(s2_high.state,'73.15',15,exhausted)
+        self.assertIn('S2_EXHAUSTION_PENDING_CONFIRMATION',s2_bar1.reasons)
+        self.assertLess(s2_bar1.stop_price,Dec('73.01'))
+        s2_bar2=self.step(s2_bar1.state,'73.10',60_015,exhausted)
+        self.assertFalse(s2_bar2.exit_required)
+        self.assertEqual(s2_bar2.stop_price,Dec('73.01'))
+        self.assertIn('S2_EXHAUSTION_TRAILING_TIGHTENED',s2_bar2.reasons)
+        s2_hit=self.step(s2_bar2.state,'72.95',60_020,exhausted)
+        self.assertTrue(s2_hit.exit_required)
+
+    def test_post_5m_intraday_blowoff_sets_failed_new_high(self):
+        from solbot.mathematics.trend_exhaustion import from_closed_inputs
+        from solbot.storage.models import INTERVAL_MS
+        as_of=1794600000000+180_000-1  # 3 minutes into current 5m bar
+        base_5m=(as_of//300_000)*300_000  # start of open 5m bar
+        candles={}
+        for iv,step in INTERVAL_MS.items():
+            end_close=((as_of+1)//step)*step-1
+            rows=[]
+            for idx in range(70):
+                c_end=end_close-(69-idx)*step
+                c_open=c_end-step+1
+                o,h,low,c='71.80','72.10','71.70','72.00'
+                if iv=='1m' and c_open>=base_5m:
+                    rel=(c_open-base_5m)//60_000
+                    if rel==0:o,h,low,c='72.00','72.40','71.98','72.35'
+                    elif rel==1:o,h,low,c='72.35','72.75','72.32','72.70'
+                    else:o,h,low,c='72.70','72.72','72.38','72.40'
+                rows.append({
+                    'symbol':'SOLUSDT','interval':iv,'open_time':c_open,'close_time':c_end,'is_closed':True,
+                    'open':o,'high':h,'low':low,'close':c,'volume':'100','quote_volume':'7200','taker_buy_quote_volume':'3600',
+                })
+            candles[iv]=rows
+        ev=from_closed_inputs('SOLUSDT',candles,{'symbol':'SOLUSDT','ready':True,'buy_ratio':'0.35'},as_of)
+        self.assertTrue(ev.ready)
+        self.assertTrue(ev.failed_new_high)
+        self.assertEqual(classify(ev),'WEAKENING')
 
     def test_strong_breakout_normal_retracement_survives_and_continues(self):
         normal=self.step(self.state(),'102',1).state
@@ -143,14 +201,64 @@ class APTSTests(unittest.TestCase):
         d_cont=self.step(d_dip.state,'70.95',3,main_force)
         self.assertFalse(d_cont.exit_required)
         self.assertEqual(d_cont.stop_price,Dec('70.10'))
-        # Main-force exhaustion at top (failed_new_high + buy_ratio drops to 0.42) tightens trailing stop to 0.40% (70.67)
+        # Main-force exhaustion at top (failed_new_high + buy_ratio drops to 0.42): bar 1 holds 1.2% band (70.10), bar 2 confirms 0.40% tighten (70.67)
         exhaust_ev=replace(main_force,failed_new_high=True,adverse_move=True,buy_ratio=Dec('0.42'),previous_buy_ratio=Dec('0.61'),rsi=Dec('62.0'),previous_rsi=Dec('75.0'))
         self.assertEqual(classify(exhaust_ev),'WEAKENING')
-        d_tight=self.step(d_cont.state,'70.80',4,exhaust_ev)
+        d_pending=self.step(d_cont.state,'70.80',4,exhaust_ev)
+        self.assertFalse(d_pending.exit_required)
+        self.assertEqual(d_pending.stop_price,Dec('70.10'))
+        self.assertIn('S2_EXHAUSTION_PENDING_CONFIRMATION',d_pending.reasons)
+        # Same-minute poll does not double-count exhaustion bar.
+        d_same_min=self.step(d_pending.state,'70.79',100,exhaust_ev)
+        self.assertEqual(d_same_min.state.exhaustion_hits,1)
+        self.assertEqual(d_same_min.stop_price,Dec('70.10'))
+        # Second consecutive 1m bar confirms tightening to 0.40% (70.67).
+        d_tight=self.step(d_same_min.state,'70.80',60_004,exhaust_ev)
         self.assertFalse(d_tight.exit_required)
         self.assertEqual(d_tight.stop_price,Dec('70.67'))
-        d_exit=self.step(d_tight.state,'70.66',5,exhaust_ev)
+        self.assertIn('S2_EXHAUSTION_TRAILING_TIGHTENED',d_tight.reasons)
+        d_exit=self.step(d_tight.state,'70.66',60_005,exhaust_ev)
         self.assertTrue(d_exit.exit_required)
+
+    def test_decoupled_flow_smoothing_removes_45_cliff_and_preserves_s3_reversal(self):
+        from solbot.mathematics.trend_exhaustion import FlowSmoother, from_closed_inputs, smooth_micro_features
+        from solbot.storage.models import INTERVAL_MS
+        as_of=1794600000000+180_000-1
+        candles={}
+        for iv,step in INTERVAL_MS.items():
+            end_close=((as_of+1)//step)*step-1
+            rows=[]
+            for idx in range(70):
+                c_end=end_close-(69-idx)*step
+                c_open=c_end-step+1
+                base_p=Dec('70.00')+Dec(idx)*Dec('0.02')
+                o,h,low,c=str(base_p),str(base_p+Dec('0.12')),str(base_p-Dec('0.03')),str(base_p+Dec('0.08'))
+                rows.append({
+                    'symbol':'SOLUSDT','interval':iv,'open_time':c_open,'close_time':c_end,'is_closed':True,
+                    'open':o,'high':h,'low':low,'close':c,'volume':'200','quote_volume':'14000','taker_buy_quote_volume':'9800',
+                })
+            candles[iv]=rows
+        smoother=FlowSmoother()
+        for k,ratio in enumerate(('0.64','0.62','0.60','0.63')):
+            smooth_micro_features({'symbol':'SOLUSDT','ready':True,'buy_ratio':ratio,'exchange_time_ms':as_of-10_000+k*1000},smoother)
+        # Single-tick 0.44 dip stays STRONG_BREAKOUT under decoupled EWMA + smooth [0.35, 0.55] blend.
+        dip=smooth_micro_features({'symbol':'SOLUSDT','ready':True,'buy_ratio':'0.441','exchange_time_ms':as_of},smoother)
+        ev_dip=from_closed_inputs('SOLUSDT',candles,dip,as_of)
+        self.assertEqual(classify(ev_dip),'STRONG_BREAKOUT')
+        self.assertEqual(ev_dip.raw_buy_ratio,Dec('0.441'))
+        # When structure breaks + RSI plunges + raw buy_ratio < 0.40, CONFIRMED_REVERSAL fires without EWMA lag.
+        ev_rev=replace(ev_dip,structure_broken=True,raw_buy_ratio=Dec('0.34'),previous_buy_ratio=Dec('0.60'),rsi=Dec('40'),previous_rsi=Dec('52'))
+        self.assertEqual(classify(ev_rev),'CONFIRMED_REVERSAL')
+
+    def test_legacy_apts_state_from_dict_backfills_new_confirm_fields(self):
+        st=APTSState.create(context(),'100','3','.01')
+        legacy=st.asdict()
+        for k in ('exhaustion_hits','exhaustion_last_bar_ms','exhaustion_confirm_bars','last_normal_distance'):
+            legacy.pop(k,None)
+        restored=APTSState.from_dict(legacy)
+        self.assertEqual(restored.exhaustion_confirm_bars,2)
+        self.assertEqual(restored.exhaustion_hits,0)
+        self.assertEqual(restored.last_normal_distance,Dec('.005'))
 
 
 class P3ShadowTests(unittest.TestCase):

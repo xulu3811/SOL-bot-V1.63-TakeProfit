@@ -371,7 +371,7 @@ fun AptsTimelineCard(
     val steps = listOf(
         Triple("S0", initialStopLabel, bot.lossSoft to bot.loss),
         Triple("S1", "+0.8% 保本", bot.infoSoft to bot.info),
-        Triple("S2", "+1.5% 追尾", bot.gainSoft to bot.gain),
+        Triple("S2", "+1.2% 追尾", bot.gainSoft to bot.gain),
         Triple("长持", "不限时持仓", bot.warnSoft to bot.warn),
     )
 
@@ -512,8 +512,8 @@ fun AptsTimelineCard(
             Spacer(Modifier.height(8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("• S0 初始保护：策略开仓 -1.0%（人工托管 -0.8%）交易所原生挂单。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("• S1 移动保本：浮盈达 +0.8% 后，止损抬升至成本上方保本位（覆盖手续费与滑点）。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("• S2 动态跟踪：浮盈 ≥ +1.5% 启动动态回撤保护，需连续 2-tick 确认防插针。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("• S1 移动保本：浮盈达 +0.8% 上移至保本底线；≥ +1.1% 启动动态锁盈追踪（0.55%）。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("• S2 动态跟踪：浮盈 > +1.2% 启动动态回撤保护，高位走弱或超买衰竭时收紧至 0.40%，需连续 2-tick 确认防插针。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("• 持续持仓规则：已取消 12h 限时退场，未触发止损或趋势衰竭前将一直持仓。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
