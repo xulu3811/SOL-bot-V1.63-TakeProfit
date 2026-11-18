@@ -9,10 +9,10 @@ StartLimitBurst=5
 Type=simple
 User=solbot
 Group=solbot
-WorkingDirectory=/opt/sol-bot
+WorkingDirectory=/opt/sol-bot/p5
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=PYTHONPATH=/opt/sol-bot/backend/src
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
 Environment=SOLBOT_DB_PATH=/var/lib/sol-bot/database/market.sqlite
 ExecStart=/opt/sol-bot/venv/bin/python -m solbot.main
 Restart=on-failure

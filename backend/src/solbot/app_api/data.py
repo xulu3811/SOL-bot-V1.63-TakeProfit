@@ -32,6 +32,7 @@ class DataReader:
         self._custom_paths=set((paths or {}).keys())
         self.paths={k:Path(v).resolve() for k,v in (DEFAULTS|dict(paths or {})).items()}
         self.clock=clock or (lambda:time.time_ns()//1000000)
+        self._day_stats_cache={}
     @staticmethod
     def bounds(limit,offset=0):
         if type(limit) is not int or not 1<=limit<=500 or type(offset) is not int or not 0<=offset<=100000: raise ValueError('invalid pagination')
@@ -70,19 +71,28 @@ class DataReader:
         if value>=Decimal('1000'):return f'{(value/Decimal("1000")):.2f}K'
         return f'{value:.2f}'
     def _day_stats(self,key,symbol,live_price=None):
-        try:
-            rows=self.read(key,"SELECT open_time,open,high,low,close,volume FROM market_klines WHERE symbol=? AND interval='1m' ORDER BY open_time DESC LIMIT 1500",(symbol,))
-        except (sqlite3.Error,OSError):
-            return {}
-        if len(rows)<2:return {}
-        rows=rows[::-1]
-        end=rows[-1]['open_time']
-        window=[row for row in rows if end-row['open_time']<=86400000]
-        if len(window)<2 or end-window[0]['open_time']<23*3600000:return {}
-        high=max(Decimal(row['high']) for row in window)
-        low=min(Decimal(row['low']) for row in window)
-        volume=sum((Decimal(row['volume']) for row in window),Decimal('0'))
-        first,last=Decimal(window[0]['open']),Decimal(window[-1]['close'])
+        now_bucket=self.clock()//2000
+        cache_key=(key,symbol)
+        cached=self._day_stats_cache.get(cache_key) if not self._custom_paths else None
+        if cached and cached[0]==now_bucket:
+            first,base_last,base_high,base_low,volume=cached[1]
+        else:
+            try:
+                rows=self.read(key,"SELECT open_time,open,high,low,close,volume FROM market_klines WHERE symbol=? AND interval='1m' ORDER BY open_time DESC LIMIT 1500",(symbol,))
+            except (sqlite3.Error,OSError):
+                return {}
+            if len(rows)<2:return {}
+            rows=rows[::-1]
+            end=rows[-1]['open_time']
+            window=[row for row in rows if end-row['open_time']<=86400000]
+            if len(window)<2 or end-window[0]['open_time']<23*3600000:return {}
+            base_high=max(Decimal(row['high']) for row in window)
+            base_low=min(Decimal(row['low']) for row in window)
+            volume=sum((Decimal(row['volume']) for row in window),Decimal('0'))
+            first,base_last=Decimal(window[0]['open']),Decimal(window[-1]['close'])
+            if not self._custom_paths:
+                self._day_stats_cache[cache_key]=(now_bucket,(first,base_last,base_high,base_low,volume))
+        high,low,last=base_high,base_low,base_last
         if live_price is not None:
             try:
                 lp=Decimal(str(live_price))
@@ -145,7 +155,7 @@ class DataReader:
         return {'available':True,'ready':False,'bid':str(payload.get('bid') or ''),'ask':str(payload.get('ask') or ''),
                 'spread_bps':str(payload.get('spread_bps') or ''),'imbalance':str(payload.get('imbalance') or ''),
                 'age_ms':age,'price_source':'LIVE_ORDERBOOK','stale':True}
-    def markets(self,symbol='SOLUSDT',timeframe='1m',limit=100):
+    def markets(self,symbol='SOLUSDT',timeframe='1m',limit=100,*,_include_day_stats=True):
         self.bounds(limit)
         if symbol not in ('SOLUSDT','SUIUSDT') or timeframe not in ('1m','5m','15m','1h','4h'):raise ValueError('unsupported market')
         def load():
@@ -179,7 +189,8 @@ class DataReader:
                 spread=(float(ema20)-float(ema50))/float(ema50)*100.0
                 ema_spread_pct=round(spread,4)
                 ema_alignment='BULLISH' if spread>0.05 else ('BEARISH' if spread<-0.05 else 'CONVERGING')
-            return dict(symbol=symbol,timeframe=timeframe,candles=rows[-limit:],latest_price=rows[-1]['close'],price_source='LAST_CLOSED_CANDLE',updated_at=rows[-1]['ingested_at'],state='FRESH' if 0<=age<=120000 else 'STALE',indicators=latest,ema_alignment=ema_alignment,ema_spread_pct=ema_spread_pct,volume_24h_asset=symbol[:-4] if symbol.endswith('USDT') else symbol,micro=micro,**self._day_stats(key,symbol,live_price=live_mid))
+            day_extra=self._day_stats(key,symbol,live_price=live_mid) if _include_day_stats else {}
+            return dict(symbol=symbol,timeframe=timeframe,candles=rows[-limit:],latest_price=rows[-1]['close'],price_source='LAST_CLOSED_CANDLE',updated_at=rows[-1]['ingested_at'],state='FRESH' if 0<=age<=120000 else 'STALE',indicators=latest,ema_alignment=ema_alignment,ema_spread_pct=ema_spread_pct,volume_24h_asset=symbol[:-4] if symbol.endswith('USDT') else symbol,micro=micro,**day_extra)
         return self._safe(load)
     def market_summary(self,symbol='SOLUSDT',timeframe='1m'):
         full=self.markets(symbol,timeframe,2)
@@ -190,7 +201,7 @@ class DataReader:
         if symbol=='SOLUSDT' and full.get('available'):
             by_tf={}
             for tf in ('1m','5m','15m','1h','4h'):
-                doc=full if tf==timeframe else self.markets(symbol,tf,2)
+                doc=full if tf==timeframe else self.markets(symbol,tf,2,_include_day_stats=False)
                 if doc.get('available'):
                     by_tf[tf]={
                         'timeframe':tf,
@@ -214,39 +225,45 @@ class DataReader:
         sid=row.get('strategy_id')
         reasons=list(row.get('reasons') or [])
         ind=row.get('indicators') if isinstance(row.get('indicators'),dict) else {}
+        m15=ind.get('15m') if isinstance(ind.get('15m'),dict) else {}
         h1=ind.get('1h') if isinstance(ind.get('1h'),dict) else {}
         h4=ind.get('4h') if isinstance(ind.get('4h'),dict) else {}
+        data_not_ready=(
+            row.get('regime')=='DATA_NOT_READY'
+            or any(str(r).startswith(('WARMUP:','INDICATOR_NOT_READY:','STALE_OR_MISSING_CLOSE:','NON_CONTIGUOUS_CANDLES:','SYMBOL_OR_INTERVAL_MISMATCH:','INVALID_CANDLE_VALUES:')) for r in reasons)
+        )
         if sid=='T1':
+            htf_ok=(not data_not_ready) and ('HIGHER_TIMEFRAME_WEAK_TREND' not in reasons if (reasons or 'HIGHER_TIMEFRAME_WEAK_TREND' in reasons) else True)
             gates={
-                'regime_uptrend':(row.get('regime')=='UPTREND' or not reasons) if row.get('regime') else 'REGIME_NOT_UPTREND' not in reasons,
-                'trend_4h_above_ema20':'HIGHER_TIMEFRAME_WEAK_TREND' not in reasons if reasons or 'HIGHER_TIMEFRAME_WEAK_TREND' in reasons else True,
-                'adx_1h_ge_23':float(h1.get('adx14'))>=23.0 if h1.get('adx14') is not None else 'HIGHER_TIMEFRAME_WEAK_TREND' not in reasons,
-                'rsi_recover_above_48':'RSI_PULLBACK_NOT_RECOVERED' not in reasons,
-                'rvol_ge_1_2':'RVOL_BELOW_1_2' not in reasons,
-                'vwap_reclaim':'VWAP_OR_SUPPORT_NOT_RECLAIMED' not in reasons,
-                'breakout_1m':'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
-                'chase_1m_ok':'ONE_MINUTE_CHASE_EXCEEDED' not in reasons,
+                'regime_uptrend':(not data_not_ready) and ((row.get('regime')=='UPTREND' or not reasons) if row.get('regime') else 'REGIME_NOT_UPTREND' not in reasons),
+                'trend_4h_above_ema20':htf_ok,
+                'adx_1h_ge_23':htf_ok or ((not data_not_ready) and (float(h1.get('adx14'))>=23.0 if h1.get('adx14') is not None else False)),
+                'rsi_recover_above_48':(not data_not_ready) and 'RSI_PULLBACK_NOT_RECOVERED' not in reasons,
+                'rvol_ge_1_2':(not data_not_ready) and 'RVOL_BELOW_1_2' not in reasons,
+                'vwap_reclaim':(not data_not_ready) and 'VWAP_OR_SUPPORT_NOT_RECLAIMED' not in reasons,
+                'breakout_1m':(not data_not_ready) and 'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
+                'chase_1m_ok':(not data_not_ready) and 'ONE_MINUTE_CHASE_EXCEEDED' not in reasons,
                 'cooldown_ok':'STRATEGY_COOLDOWN_ACTIVE' not in reasons and cooldown_remaining_ms==0,
             }
         elif sid=='T2':
             gates={
-                'trend_4h_up':'FOUR_HOUR_DOWNTREND' not in reasons and 'FOUR_HOUR_EMA_NOT_UP' not in reasons,
-                'pullback_1h':'ONE_HOUR_NOT_PULLED_BACK' not in reasons,
-                'reclaim_15m':'FIFTEEN_MINUTE_NOT_RECLAIMED' not in reasons,
-                'rvol_15m_ok':'RVOL_15M_BELOW_1' not in reasons,
-                'rsi_5m_turn':'RSI_TURN_NOT_CONFIRMED' not in reasons,
-                'breakout_1m':'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
+                'trend_4h_up':(not data_not_ready) and 'FOUR_HOUR_DOWNTREND' not in reasons and 'FOUR_HOUR_EMA_NOT_UP' not in reasons,
+                'pullback_1h':(not data_not_ready) and 'ONE_HOUR_NOT_PULLED_BACK' not in reasons,
+                'reclaim_15m':(not data_not_ready) and 'FIFTEEN_MINUTE_NOT_RECLAIMED' not in reasons,
+                'rvol_15m_ok':(not data_not_ready) and 'RVOL_15M_BELOW_1' not in reasons,
+                'rsi_5m_turn':(not data_not_ready) and 'RSI_TURN_NOT_CONFIRMED' not in reasons,
+                'breakout_1m':(not data_not_ready) and 'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
             }
         else:
             gates={
-                'regime_range':'R1_REQUIRES_RANGE' not in reasons,
-                'macro_4h_guard':'MACRO_DOWNTREND_GUARD' not in reasons,
-                'not_accelerating_drop':'ACCELERATING_DECLINE' not in reasons,
-                'rsi_oversold_recover':'RSI_OVERSOLD_NOT_RECOVERED' not in reasons,
-                'rvol_ge_1_5':'RVOL_BELOW_1_5' not in reasons,
-                'taker_buy_ok':'TAKER_BUY_NOT_RECOVERED' not in reasons,
-                'floor_5m':'FIVE_MINUTE_FLOOR_UNCONFIRMED' not in reasons,
-                'breakout_1m':'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
+                'regime_range':(not data_not_ready) and 'R1_REQUIRES_RANGE' not in reasons,
+                'macro_4h_guard':(not data_not_ready) and 'MACRO_DOWNTREND_GUARD' not in reasons,
+                'not_accelerating_drop':(not data_not_ready) and 'ACCELERATING_DECLINE' not in reasons,
+                'rsi_oversold_recover':(not data_not_ready) and 'RSI_OVERSOLD_NOT_RECOVERED' not in reasons,
+                'rvol_ge_1_5':(not data_not_ready) and 'RVOL_BELOW_1_5' not in reasons,
+                'taker_buy_ok':(not data_not_ready) and 'TAKER_BUY_NOT_RECOVERED' not in reasons,
+                'floor_5m':(not data_not_ready) and 'FIVE_MINUTE_FLOOR_UNCONFIRMED' not in reasons,
+                'breakout_1m':(not data_not_ready) and 'ONE_MINUTE_BREAKOUT_UNCONFIRMED' not in reasons,
             }
         default_stop='0.010' if sid=='T1' else ('0.008' if sid=='T2' else None)
         return {
@@ -260,55 +277,228 @@ class DataReader:
             'signal_id':row.get('signal_id'),'event_id':row.get('event_id'),
             'strategy_version':row.get('strategy_version'),'risk_flags':row.get('risk_flags') or [],
             'gates':gates,'cooldown_remaining_ms':cooldown_remaining_ms,
-            'htf_snapshot':{'adx_1h':h1.get('adx14'),'ema20_4h':h4.get('ema20'),'ema50_4h':h4.get('ema50')} if (h1 or h4) else None,
+            'htf_snapshot':{
+                'adx_1h':h1.get('adx14'),
+                'ema20_1h':h1.get('ema20'),
+                'ema50_1h':h1.get('ema50'),
+                'ema20_15m':m15.get('ema20'),
+                'ema50_15m':m15.get('ema50'),
+                'rvol_15m':m15.get('rvol20'),
+                'ema20_4h':h4.get('ema20'),
+                'ema50_4h':h4.get('ema50'),
+            } if (m15 or h1 or h4) else None,
         }
-    def _r2_engine_view(self,allowed,now_ms):
-        state_rows=self._read_r2('r2_state','SELECT as_of_ms,payload FROM r2_state WHERE singleton=1')
-        outbox_rows=self._read_r2('r2_state','SELECT rowid AS id,payload FROM r2_outbox ORDER BY rowid DESC LIMIT 1')
-        st={}
-        if state_rows:
-            try:st=json.loads(state_rows[0].get('payload') or '{}')
-            except Exception:st={}
-        last_intent={}
-        if outbox_rows:
-            try:last_intent=json.loads(outbox_rows[0].get('payload') or '{}')
-            except Exception:last_intent={}
-        stage=str(st.get('state') or 'IDLE')
-        reason=str(st.get('reason') or '')
-        accepted=stage=='TRIGGERED' or (bool(last_intent.get('accepted')) and int(last_intent.get('expires_at') or 0)>now_ms)
-        gates={
-            'oversold_event':stage in ('WATCHING','ARMED','TRIGGERED','CONSUMED'),
-            'floor_held':reason!='CANDIDATE_LOW_BROKEN' and stage in ('WATCHING','ARMED','TRIGGERED','CONSUMED'),
-            'rsi_turn':bool(st.get('recovery_time') or st.get('climax_turn_time')) or stage in ('ARMED','TRIGGERED','CONSUMED'),
-            'vwap_or_climax':stage in ('ARMED','TRIGGERED','CONSUMED'),
-            'breakout_1m':stage in ('TRIGGERED','CONSUMED') or accepted,
-        }
-        try:max_rvol=float(st.get('max_rvol') or 0.0)
-        except Exception:max_rvol=0.0
-        factors={
-            'trend':18.0 if stage!='IDLE' else 8.0,
-            'momentum':23.0 if gates['rsi_turn'] else (14.0 if gates['oversold_event'] else 6.0),
-            'participation':19.0 if max_rvol>=1.5 else 8.0,
-            'structure':14.0 if gates['floor_held'] else 4.0,
-            'execution':18.0 if gates['breakout_1m'] else (10.0 if stage=='ARMED' else 2.0),
-        }
-        score=round(sum(factors.values()),1) if not accepted else max(82.0,round(sum(factors.values()),1))
-        reasons=[] if accepted else ([reason] if reason else ['WAITING_OVERSOLD_CANDIDATE'])
+    @staticmethod
+    def _int_ms(value):
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _finite_float(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            num = float(value)
+        except Exception:
+            return None
+        return num if num == num and abs(num) != float('inf') else None
+
+    def _r2_idle_factors(self, regime, indicators_5m):
+        """Score R2 readiness strictly below threshold from live 5m indicators when idle."""
+        ind5 = indicators_5m if isinstance(indicators_5m, dict) else {}
+        trend_scores = {'DOWNTREND': 12.0, 'UNCERTAIN': 12.0, 'RANGE': 10.0, 'UPTREND': 6.0}
+        trend = trend_scores.get(regime, 8.0)
+
+        rsi6 = self._finite_float(ind5.get('rsi6'))
+        if rsi6 is None:
+            momentum = 4.0
+        else:
+            momentum = round(max(3.0, min(18.0, 18.0 - max(0.0, rsi6 - 20.0) * 0.375)), 1)
+
+        rvol = self._finite_float(ind5.get('rvol'))
+        if rvol is None:
+            participation = 4.0
+        else:
+            participation = round(min(12.0, max(2.0, 12.0 * min(max(rvol, 0.0), 1.5) / 1.5)), 1)
+
+        close = self._finite_float(ind5.get('close'))
+        vwap = self._finite_float(ind5.get('vwap'))
+        if close is None or vwap is None or vwap <= 0:
+            structure = 4.0
+        elif close < vwap:
+            structure = 8.0 if (rsi6 is not None and rsi6 <= 30.0) else 6.0
+        else:
+            structure = 4.0
+
         return {
-            'strategy_id':'R2','live_enabled':'R2' in allowed,'r1_live_allowed':False,
-            'score':score,'threshold':75.0,'priority':'HIGH' if accepted else 'REJECT',
-            'accepted':accepted,'regime':last_intent.get('regime') or 'DOWNTREND',
-            'reasons':reasons,'score_factors':factors,
-            'stop_distance':last_intent.get('stop_distance') or '0.012',
-            'stop_price':last_intent.get('stop_price') or st.get('candidate_low'),
-            'signal_time':last_intent.get('signal_time') or st.get('as_of_ms'),
-            'candidate_time':st.get('origin_time'),
-            'expires_at':st.get('expires_at'),
-            'entry_low':last_intent.get('entry_low'),'entry_high':last_intent.get('entry_high'),
-            'signal_id':last_intent.get('signal_id') or st.get('candidate_id'),
-            'strategy_version':last_intent.get('strategy_version') or 'r2-rebound-2',
-            'risk_flags':[],'gates':gates,'cooldown_remaining_ms':0,'r2_stage':stage,
-            'htf_snapshot':None,
+            'trend': trend,
+            'momentum': momentum,
+            'participation': participation,
+            'structure': structure,
+            'execution': 0.0,
+        }
+
+    def _r2_active_factors(self, stage, regime, gates, max_rvol, accepted):
+        if accepted:
+            return {
+                'trend': 18.0,
+                'momentum': 23.0,
+                'participation': 19.0 if max_rvol >= 1.5 else 15.0,
+                'structure': 18.0,
+                'execution': 14.0,
+            }
+        return {
+            'trend': 14.0 if regime in ('DOWNTREND', 'UNCERTAIN', 'RANGE') else 10.0,
+            'momentum': 21.0 if gates['rsi_turn'] else 13.0,
+            'participation': 16.0 if max_rvol >= 1.5 else 8.0,
+            'structure': 12.0 if stage == 'ARMED' else (8.0 if gates['floor_held'] else 2.0),
+            'execution': 9.0 if stage == 'ARMED' else 2.0,
+        }
+
+    def _r2_engine_view(self, allowed, now_ms, current_regime=None, indicators_5m=None):
+        """Build the live StrategyScreen view for R2 without latching stale terminal scores."""
+        state_rows = self._read_r2('r2_state', 'SELECT as_of_ms,payload FROM r2_state WHERE singleton=1')
+        outbox_rows = self._read_r2('r2_state', 'SELECT rowid AS id,payload FROM r2_outbox ORDER BY rowid DESC LIMIT 1')
+        st = {}
+        if state_rows:
+            try:
+                st = json.loads(state_rows[0].get('payload') or '{}')
+            except Exception:
+                st = {}
+        last_intent = {}
+        if outbox_rows:
+            try:
+                last_intent = json.loads(outbox_rows[0].get('payload') or '{}')
+            except Exception:
+                last_intent = {}
+
+        stage = str(st.get('state') or 'IDLE')
+        reason = str(st.get('reason') or '')
+        st_origin_ms = self._int_ms(st.get('origin_time'))
+        st_expires_ms = self._int_ms(st.get('expires_at'))
+        st_as_of_ms = self._int_ms(st.get('as_of_ms'))
+        intent_expires_ms = self._int_ms(last_intent.get('expires_at'))
+        intent_signal_ms = self._int_ms(last_intent.get('signal_time'))
+
+        newer_cycle_started = stage in ('WATCHING', 'ARMED', 'INVALIDATED', 'EXPIRED') and st_origin_ms > intent_signal_ms
+        intent_active = bool(last_intent.get('accepted')) and intent_expires_ms > now_ms and not newer_cycle_started
+        triggered_expired = stage == 'TRIGGERED' and (
+            (0 < st_expires_ms <= now_ms)
+            or (0 < intent_expires_ms <= now_ms and (last_intent.get('signal_id') == st.get('candidate_id') or intent_signal_ms >= st_origin_ms > 0))
+        )
+        accepted = (stage == 'TRIGGERED' and not triggered_expired) or intent_active
+
+        candidate_expired = stage in ('WATCHING', 'ARMED') and 0 < st_expires_ms <= now_ms
+        if accepted:
+            effective_stage = 'TRIGGERED' if stage == 'TRIGGERED' else 'CONSUMED'
+        elif triggered_expired:
+            effective_stage = 'CONSUMED' if last_intent else 'EXPIRED'
+        elif candidate_expired:
+            effective_stage = 'EXPIRED'
+        else:
+            effective_stage = stage
+
+        is_watching_or_armed = not accepted and effective_stage in ('WATCHING', 'ARMED')
+        max_rvol = self._finite_float(st.get('max_rvol')) or 0.0
+        regime = (
+            (last_intent.get('regime') or current_regime or 'DOWNTREND')
+            if accepted
+            else (current_regime or st.get('regime') or 'DOWNTREND')
+        )
+
+        if accepted:
+            gates = {
+                'oversold_event': True,
+                'floor_held': True,
+                'rsi_turn': True,
+                'vwap_or_climax': True,
+                'breakout_1m': True,
+            }
+            factors = self._r2_active_factors(effective_stage, regime, gates, max_rvol, accepted=True)
+            reasons = []
+            stop_distance = last_intent.get('stop_distance') or '0.012'
+            stop_price = last_intent.get('stop_price') or st.get('candidate_low')
+            signal_time = last_intent.get('signal_time') or st.get('as_of_ms')
+            candidate_time = st.get('origin_time')
+            expires_at = last_intent.get('expires_at') or st.get('expires_at')
+            entry_low = last_intent.get('entry_low')
+            entry_high = last_intent.get('entry_high')
+            signal_id = last_intent.get('signal_id') or st.get('candidate_id')
+        elif is_watching_or_armed:
+            gates = {
+                'oversold_event': True,
+                'floor_held': reason != 'CANDIDATE_LOW_BROKEN',
+                'rsi_turn': bool(st.get('recovery_time') or st.get('climax_turn_time')) or effective_stage == 'ARMED',
+                'vwap_or_climax': effective_stage == 'ARMED',
+                'breakout_1m': False,
+            }
+            factors = self._r2_active_factors(effective_stage, regime, gates, max_rvol, accepted=False)
+            active_reasons = {'WAITING_FOR_FLOOR', 'WAITING_FOR_RECOVERY_FLOOR_VWAP', 'WAITING_FOR_BREAKOUT'}
+            default_reason = 'WAITING_FOR_BREAKOUT' if effective_stage == 'ARMED' else 'WAITING_FOR_RECOVERY_FLOOR_VWAP'
+            reasons = [reason if reason in active_reasons else default_reason]
+            stop_distance = str(st.get('stop_distance') or '0.012')
+            stop_price = st.get('candidate_low')
+            signal_time = st.get('as_of_ms')
+            candidate_time = st.get('origin_time')
+            expires_at = st.get('expires_at')
+            entry_low = None
+            entry_high = None
+            signal_id = st.get('candidate_id')
+        else:
+            gates = {
+                'oversold_event': False,
+                'floor_held': False,
+                'rsi_turn': False,
+                'vwap_or_climax': False,
+                'breakout_1m': False,
+            }
+            factors = self._r2_idle_factors(regime, indicators_5m)
+            recent_terminal = st_as_of_ms > 0 and 0 <= now_ms - st_as_of_ms <= 300_000
+            if effective_stage in ('INVALIDATED', 'EXPIRED') and recent_terminal:
+                fallback = 'CANDIDATE_LOW_BROKEN' if effective_stage == 'INVALIDATED' else 'CANDIDATE_EXPIRED'
+                reasons = [reason if reason in ('CANDIDATE_LOW_BROKEN', 'CANDIDATE_EXPIRED') else fallback]
+            elif effective_stage in ('CONSUMED', 'INVALIDATED', 'EXPIRED'):
+                reasons = ['NO_RECENT_R2_CANDIDATE']
+            else:
+                reasons = ['WAITING_OVERSOLD_CANDIDATE']
+            ind5 = indicators_5m if isinstance(indicators_5m, dict) else {}
+            stop_distance = '0.012'
+            stop_price = None
+            signal_time = ind5.get('open_time') or st.get('as_of_ms')
+            candidate_time = None
+            expires_at = None
+            entry_low = None
+            entry_high = None
+            signal_id = None
+
+        score = round(sum(factors.values()), 1)
+        return {
+            'strategy_id': 'R2',
+            'live_enabled': 'R2' in allowed,
+            'r1_live_allowed': False,
+            'score': score,
+            'threshold': 75.0,
+            'priority': 'HIGH' if accepted else 'REJECT',
+            'accepted': accepted,
+            'regime': regime,
+            'reasons': reasons,
+            'score_factors': factors,
+            'stop_distance': stop_distance,
+            'stop_price': stop_price,
+            'signal_time': signal_time,
+            'candidate_time': candidate_time,
+            'expires_at': expires_at,
+            'entry_low': entry_low,
+            'entry_high': entry_high,
+            'signal_id': signal_id,
+            'strategy_version': last_intent.get('strategy_version') or 'r2-rebound-2',
+            'risk_flags': [],
+            'gates': gates,
+            'cooldown_remaining_ms': 0,
+            'r2_stage': effective_stage,
+            'htf_snapshot': None,
         }
     def strategies(self,symbol='SOLUSDT',limit=50):
         self.bounds(limit)
@@ -334,8 +524,10 @@ class DataReader:
                 match=next((row for row in values if row.get('strategy_id')==sid),None)
                 if match is not None:
                     engines[sid]=self._engine_view(match,allowed,now_ms,cooldown_by_sid.get(sid,0))
+            ind5=self._closed_indicators(symbol,'5m')
+            current_regime=next((row.get('regime') for row in values if row.get('regime')),None)
             if symbol=='SOLUSDT':
-                try:engines['R2']=self._r2_engine_view(allowed,now_ms)
+                try:engines['R2']=self._r2_engine_view(allowed,now_ms,current_regime=current_regime,indicators_5m=ind5)
                 except Exception:pass
             live_pool=[row for row in values if row.get('strategy_id') in allowed]
             live_latest=[row for sid in allowed for row in (next((r for r in values if r.get('strategy_id')==sid),None),) if row is not None]
@@ -351,8 +543,8 @@ class DataReader:
                 lsid=latest.get('strategy_id')
                 ev=self._engine_view(latest,allowed,now_ms,cooldown_by_sid.get(lsid,0))
                 picked={key:latest.get(key) for key in ('score','priority','score_factors','strategy_id','accepted','signal_time','entry_low','entry_high','signal_id','event_id','regime','reasons','stop_distance','stop_price','expires_at','candidate_time','strategy_version','risk_flags')}
-                picked.update(live_enabled=lsid in allowed,gates=ev['gates'],cooldown_remaining_ms=ev['cooldown_remaining_ms'],stop_distance=ev['stop_distance'])
-            return {'symbol':symbol,'items':values[:limit],'latest':picked,'score':None if picked is None else picked.get('score'),'priority':None if picked is None else picked.get('priority'),'score_factors':None if picked is None else picked.get('score_factors'),'score_label':'策略条件评分','score_is_profit_probability':False,'r1_live_allowed':False,'allowed_live_strategies':list(allowed),'live_strategy_id':None if picked is None else picked.get('strategy_id'),'engines':engines,'indicators_5m':self._closed_indicators(symbol,'5m')}
+                picked.update(live_enabled=lsid in allowed,gates=ev['gates'],cooldown_remaining_ms=ev['cooldown_remaining_ms'],stop_distance=ev['stop_distance'],htf_snapshot=ev.get('htf_snapshot'))
+            return {'symbol':symbol,'items':values[:limit],'latest':picked,'score':None if picked is None else picked.get('score'),'priority':None if picked is None else picked.get('priority'),'score_factors':None if picked is None else picked.get('score_factors'),'score_label':'策略条件评分','score_is_profit_probability':False,'r1_live_allowed':False,'allowed_live_strategies':list(allowed),'live_strategy_id':None if picked is None else picked.get('strategy_id'),'engines':engines,'indicators_5m':ind5}
         return self._safe(load)
     def strategy_summary(self,symbol='SOLUSDT'):
         full=self.strategies(symbol,20)
@@ -477,7 +669,7 @@ class DataReader:
             env_cfg = os.environ.get('SOLBOT_TRADING_CONFIG_PATH', '').strip()
             if env_cfg:
                 candidates.append(Path(env_cfg))
-            mkt = self.paths.get('market')
+            mkt = self.paths.get('SOLUSDT_market') or self.paths.get('market')
             if mkt:
                 candidates.append(Path(mkt).resolve().parent / 'trading-config.json')
             for cfg_path in candidates:
@@ -779,6 +971,8 @@ class DataReader:
             cap=min(500,limit+offset)
             p3_rows=self.read('shadow','SELECT * FROM shadow_orders ORDER BY created_at DESC,order_id LIMIT ?',(cap,))
             r2_rows=self._read_r2('r2_shadow','SELECT * FROM shadow_orders ORDER BY created_at DESC,order_id LIMIT ?',(cap,))
+            pos_rows=self._optional('shadow','SELECT * FROM shadow_positions LIMIT 500')+self._read_r2('r2_shadow','SELECT * FROM shadow_positions LIMIT 500')
+            pos_map={str(p.get('position_id') or ''):p for p in pos_rows if p.get('position_id')}
             seen=set();merged=[]
             for row in sorted(p3_rows+r2_rows,key=lambda r:(int(r.get('created_at') or 0),str(r.get('order_id') or '')),reverse=True):
                 oid=row.get('order_id')
@@ -786,6 +980,40 @@ class DataReader:
                 seen.add(oid);merged.append(row)
             items=[]
             for row in merged[offset:offset+limit]:
-                items.append({'symbol':row['symbol'],'side':row['side'],'status':row['status'],'price':row['fill_price'] or row['limit_price'],'quantity':row['quantity'],'time':row['created_at'],'order_id':row['order_id'],'fee':row['fee'],'strategy_id':row.get('strategy_id') or 'T1'})
+                oid=str(row.get('order_id') or '')
+                pid=str(row.get('position_id') or ('p-'+oid if oid else ''))
+                pos=pos_map.get(pid) or {}
+                px=row.get('fill_price') or row.get('limit_price')
+                qty=row.get('executed_quantity') if row.get('executed_quantity') not in (None,'','0','0.0') else row.get('quantity')
+                quote=row.get('executed_notional') if row.get('executed_notional') not in (None,'','0','0.0') else row.get('notional')
+                item={
+                    'symbol':row['symbol'],
+                    'side':row['side'],
+                    'status':row['status'],
+                    'price':px,
+                    'quantity':qty,
+                    'quote':quote,
+                    'time':row['created_at'],
+                    'created_at':row['created_at'],
+                    'filled_at':row.get('fill_at') or row['created_at'],
+                    'order_id':row['order_id'],
+                    'fee':row['fee'],
+                    'strategy_id':row.get('strategy_id') or 'T1',
+                }
+                if row.get('side')=='BUY' and pos:
+                    item['position_status']=pos.get('status')
+                    if pos.get('exit_price') is not None:item['exit_price']=pos.get('exit_price')
+                    if pos.get('realized_pnl') is not None:
+                        item['realized_pnl']=pos.get('realized_pnl')
+                        try:
+                            cost_dec=Decimal(str(pos.get('entry_cost') or quote or '0'))
+                            pnl_dec=Decimal(str(pos.get('realized_pnl') or '0'))
+                            if cost_dec>0:
+                                item['pnl_pct']=f'{(pnl_dec/cost_dec*Decimal("100")):+.2f}%'
+                        except Exception:
+                            pass
+                    if pos.get('closed_at') is not None:item['closed_at']=pos.get('closed_at')
+                    if pos.get('high_price') is not None:item['high_price']=pos.get('high_price')
+                items.append(item)
             return {'mode':'SIMULATED','is_preview':False,'items':items,'offset':offset,'limit':limit}
         return self._safe(load)

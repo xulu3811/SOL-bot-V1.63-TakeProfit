@@ -249,6 +249,11 @@ def compute_live_order_size(
     max_u = _dec(max_order_usdt)
     free = _dec(free_quote)
     price_dec = _dec(price)
+    eff_min_u = (
+        min(min_u, free)
+        if (min_u > LIVE_MIN_ORDER_USDT and free >= LIVE_MIN_ORDER_USDT and free >= min_u * Decimal("0.90"))
+        else min_u
+    )
 
     if sid == "T2":
         target = t2_risk_notional(
@@ -256,7 +261,7 @@ def compute_live_order_size(
             stop_distance,
             fee_rate,
             score,
-            min_order_usdt=min_u,
+            min_order_usdt=eff_min_u,
             max_order_usdt=max_u,
             is_custom_cfg=is_custom_cfg,
         )
@@ -268,7 +273,7 @@ def compute_live_order_size(
             stop_distance,
             fee_rate,
             score,
-            min_order_usdt=min_u,
+            min_order_usdt=eff_min_u,
             max_order_usdt=max_u,
             is_custom_cfg=is_custom_cfg,
         )
@@ -277,12 +282,12 @@ def compute_live_order_size(
     else:
         target = t1_target_notional(
             score,
-            min_order_usdt=min_u,
+            min_order_usdt=eff_min_u,
             max_order_usdt=max_u,
         )
 
-    notional = min(max_u, max(min_u, target), free)
-    if notional < min_u:
+    notional = min(max_u, max(eff_min_u, target), free)
+    if notional < eff_min_u:
         return (
             None,
             None,
@@ -294,7 +299,7 @@ def compute_live_order_size(
     min_qty_dec = _dec(min_qty or "0")
     qty = floor_step(notional / price_dec, step)
     order_notional = qty * price_dec
-    min_notional = max(min_u - price_dec * step, _dec(rules_min_notional or "5"))
+    min_notional = max(eff_min_u - price_dec * step, _dec(rules_min_notional or "5"))
     if qty <= 0 or qty < min_qty_dec or order_notional < min_notional:
         return None, None, None, "BELOW_MIN_NOTIONAL"
     return qty, order_notional, notional, None

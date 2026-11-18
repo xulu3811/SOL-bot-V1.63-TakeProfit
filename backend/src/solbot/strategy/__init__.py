@@ -148,7 +148,10 @@ def evaluate(symbol: str, candles_by_interval: dict, as_of_ms: int, micro_featur
         results.append(result)
     # One directional intent per symbol/bar. The two regimes are currently
     # exclusive, but preserve deterministic arbitration if research changes.
-    accepted = sorted((r for r in results if r["accepted"]), key=lambda r: (-r["score"], r["strategy_id"]))
+    accepted = sorted(
+        (r for r in results if r["accepted"]),
+        key=lambda r: (0 if r["strategy_id"] == "T1" else 1, -r["score"], r["strategy_id"]),
+    )
     for result in accepted[1:]:
         result["accepted"] = False
         result["reasons"].append("SYMBOL_INTENT_CONFLICT")

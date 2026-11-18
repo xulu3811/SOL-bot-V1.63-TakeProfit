@@ -78,7 +78,8 @@ fun LiveScreen(
     val binanceAccount = values["binance/account"]
 
     val configured = binanceAccount?.optBoolean("configured", false) ?: false
-    val fingerprint = binanceAccount.optCleanString("key_fingerprint")
+    val fingerprint = binanceAccount.optCleanString("key_hint")
+        .ifBlank { binanceAccount.optCleanString("key_fingerprint") }
     val readiness = liveStatus?.optJSONObject("readiness") ?: liveRisk?.optJSONObject("readiness")
     val tradingConfig = values["trading/config"] ?: readiness?.optJSONObject("trading_config") ?: liveStatus?.optJSONObject("trading_config")
     val minOrderUsdt = tradingConfig.optCleanString("min_order_usdt")
@@ -116,7 +117,7 @@ fun LiveScreen(
 
     val (heroBg, heroBorder, statusText, statusFg) = when (liveState) {
         "LIVE_ON" -> Quad4(bot.gainSoft.copy(alpha = 0.55f), bot.gain.copy(alpha = 0.35f), "实盘自动运行中", bot.gain)
-        "HARD_LOCK" -> Quad4(bot.lossSoft.copy(alpha = 0.65f), bot.loss.copy(alpha = 0.45f), "硬风控熔断锁定", bot.loss)
+        "HARD_LOCK", "HARD_LOCKED" -> Quad4(bot.lossSoft.copy(alpha = 0.65f), bot.loss.copy(alpha = 0.45f), "硬风控熔断锁定", bot.loss)
         "LIVE_OFF" -> Quad4(MaterialTheme.colorScheme.surfaceContainerLow, bot.hairline, "实盘暂停（安全只读）", MaterialTheme.colorScheme.onSurface)
         else -> Quad4(bot.warnSoft.copy(alpha = 0.45f), bot.hairline, "状态同步中", bot.warn)
     }
@@ -215,10 +216,11 @@ fun LiveScreen(
             }
 
             if (blockerMessage != null) {
+                val isSevereBlocker = blocker in setOf("GUARDIAN_HARD_LOCK", "HARD_LOCKED", "SPOT_PERMISSION_OFF", "TRADE_PERMISSION_REQUIRED")
                 Spacer(Modifier.height(8.dp))
                 Surface(
                     shape = MaterialTheme.shapes.small,
-                    color = if (blocker == "GUARDIAN_HARD_LOCK" || blocker == "SPOT_PERMISSION_OFF") bot.lossSoft else bot.warnSoft,
+                    color = if (isSevereBlocker) bot.lossSoft else bot.warnSoft,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
@@ -229,13 +231,13 @@ fun LiveScreen(
                         Icon(
                             Icons.Outlined.WarningAmber,
                             contentDescription = null,
-                            tint = if (blocker == "GUARDIAN_HARD_LOCK" || blocker == "SPOT_PERMISSION_OFF") bot.loss else bot.warn,
+                            tint = if (isSevereBlocker) bot.loss else bot.warn,
                             modifier = Modifier.size(16.dp),
                         )
                         Text(
                             text = blockerMessage,
                             style = MaterialTheme.typography.labelSmall.tnum(),
-                            color = if (blocker == "GUARDIAN_HARD_LOCK" || blocker == "SPOT_PERMISSION_OFF") bot.loss else bot.warn,
+                            color = if (isSevereBlocker) bot.loss else bot.warn,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,

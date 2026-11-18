@@ -257,6 +257,53 @@ class StrategyTests(unittest.TestCase):
         scored = score(factors)
         self.assertGreaterEqual(scored["score"], 80.0)
 
+    def test_intraday_recovery_uptrend_and_t1_breakout_when_4h_ema_lags(self):
+        from solbot.strategy import market_regime, t1_pullback
+        candles = {
+            "4h": [{"close": "72.96", "low": "71.0"}],
+            "1h": [{"close": "72.13", "low": "71.8"}],
+            "15m": (
+                [{"low": "71.60", "close": "72.00"}] * 9
+                + [
+                    {"low": "72.22", "close": "72.36"},
+                    {"low": "72.29", "close": "72.42"},
+                    {"low": "72.06", "close": "72.13"},
+                ]
+            ),
+            "5m": [
+                {"close_time": BOUNDARY - 900000, "open": "72.41", "high": "72.42", "low": "72.30", "close": "72.35", "quote_volume": "50000", "taker_buy_quote_volume": "21000"},
+                {"close_time": BOUNDARY - 600000, "open": "72.34", "high": "72.36", "low": "72.07", "close": "72.29", "quote_volume": "80000", "taker_buy_quote_volume": "32000"},
+                {"close_time": BOUNDARY - 300000, "open": "72.28", "high": "72.28", "low": "72.06", "close": "72.13", "quote_volume": "45000", "taker_buy_quote_volume": "16000"},
+                {"close_time": BOUNDARY - 120000, "open": "72.14", "high": "72.31", "low": "72.06", "close": "72.21", "quote_volume": "60000", "taker_buy_quote_volume": "24000"},
+                {"close_time": BOUNDARY - 60000, "open": "72.21", "high": "72.52", "low": "72.20", "close": "72.51", "quote_volume": "55000", "taker_buy_quote_volume": "30000"},
+            ],
+            "1m": [
+                {"close_time": BOUNDARY - 120000, "open": "72.40", "high": "72.49", "low": "72.38", "close": "72.48"},
+                {"close_time": BOUNDARY - 60000, "open": "72.48", "high": "72.52", "low": "72.45", "close": "72.51"},
+                {"close_time": BOUNDARY, "open": "72.51", "high": "72.56", "low": "72.49", "close": "72.54"},
+            ],
+        }
+        metrics = {
+            "4h": {"ema20": [73.40], "ema50": [78.18]},
+            "1h": {"ema20": [72.05, 72.09, 72.12, 72.15], "ema50": [72.30], "adx14": [11.9]},
+            "15m": {"ema20": [72.49], "ema50": [72.29], "rsi6": [31.3]},
+            "5m": {
+                "ema20": [72.41],
+                "vwap20": [72.43],
+                "rsi6": [39.5, 34.9, 25.4, 35.9, 60.7],
+                "rvol20": [1.12, 1.71, 0.95, 1.24, 1.03],
+                "atr14": [0.18],
+            },
+        }
+        regime, flags = market_regime.classify(candles, metrics)
+        self.assertEqual(regime, "UPTREND")
+        self.assertEqual(flags, [])
+        factors, reasons = t1_pullback.assess(candles, metrics, regime)
+        self.assertEqual(reasons, [])
+        factors["execution"] = 0.5
+        scored = score(factors)
+        self.assertGreaterEqual(scored["score"], 75.0)
+
 
 if __name__ == "__main__":
     unittest.main()

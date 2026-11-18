@@ -25,8 +25,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import retrofit2.Retrofit
 import retrofit2.http.*
+import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -56,15 +60,135 @@ interface AppApi {
     @param:ApplicationContext private val appContext: Context,
 ) {
     val frames = MutableSharedFlow<JSONObject>(extraBufferCapacity = 32)
-    val lastFrameAt = java.util.concurrent.atomic.AtomicLong(0L)
+    val lastFrameAt = AtomicLong(0L)
     private val alertScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val alertMutex = Mutex()
+    private val sessionMutex = Mutex()
+    private val marketCache = ConcurrentHashMap<String, JSONObject>()
+    private val snapshotCache = ConcurrentHashMap<String, JSONObject>()
+    private val persistDirty = AtomicBoolean(false)
+    private val lastPersistAt = AtomicLong(0L)
+    @Volatile var lastSelectedInterval: String = "5m"
+        private set
     @Volatile private var session: String=""
     @Volatile private var expiresAt: Long=0
+    @Volatile private var alertCursor: Int=0
+
+    init {
+        loadDiskCacheSync()
+    }
+
+    private fun cacheFile(): File? = runCatching { File(appContext.filesDir, "ui_snapshot_cache_v1.json") }.getOrNull()
+
+    private fun loadDiskCacheSync() {
+        runCatching {
+            val file = cacheFile() ?: return
+            if (!file.isFile) return
+            val root = JSONObject(file.readText(Charsets.UTF_8))
+            val savedTf = root.optString("selected_interval", "").trim()
+            if (savedTf in setOf("1m", "5m", "15m", "1h", "4h")) {
+                lastSelectedInterval = savedTf
+            }
+            root.optJSONObject("markets_by_tf")?.let { byTf ->
+                val keys = byTf.keys()
+                while (keys.hasNext()) {
+                    val tf = keys.next()
+                    byTf.optJSONObject(tf)?.let { marketCache[tf] = it }
+                }
+            }
+            root.optJSONObject("values")?.let { vals ->
+                val keys = vals.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    vals.optJSONObject(k)?.let { snapshotCache[k] = it }
+                }
+            }
+        }
+    }
+
+    fun saveIntervalPreference(interval: String) {
+        if (interval in setOf("1m", "5m", "15m", "1h", "4h")) {
+            lastSelectedInterval = interval
+            schedulePersistDiskCache(force = true)
+        }
+    }
+
+    fun getCachedMarket(timeframe: String): JSONObject? =
+        marketCache[timeframe]?.let { JSONObject(it.toString()) }
+
+    fun putCachedMarket(timeframe: String, doc: JSONObject) {
+        val candles = doc.optJSONArray("candles")
+        if (candles != null && candles.length() > 0) {
+            marketCache[timeframe] = JSONObject(doc.toString())
+            schedulePersistDiskCache()
+        }
+    }
+
+    fun updateCachedMarketsFromSummary(summary: JSONObject) {
+        for ((tf, cached) in marketCache.entries) {
+            runCatching {
+                marketCache[tf] = FrameSyncHelper.overlayMarket(cached, summary)
+            }
+        }
+    }
+
+    fun putCachedValues(values: Map<String, JSONObject>) {
+        for ((k, v) in values) {
+            if (k == "markets") {
+                val tf = v.optString("timeframe", "").trim()
+                if (tf.isNotEmpty() && v.optJSONArray("candles")?.length()?.let { it > 0 } == true) {
+                    marketCache[tf] = JSONObject(v.toString())
+                }
+            }
+            snapshotCache[k] = JSONObject(v.toString())
+        }
+        schedulePersistDiskCache()
+    }
+
+    fun getInitialCachedValues(interval: String): Map<String, JSONObject> {
+        val out = mutableMapOf<String, JSONObject>()
+        for ((k, v) in snapshotCache.entries) {
+            out[k] = JSONObject(v.toString())
+        }
+        marketCache[interval]?.let { out["markets"] = JSONObject(it.toString()) }
+        return out
+    }
+
+    private fun schedulePersistDiskCache(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastPersistAt.get() < 5_000L) return
+        if (!persistDirty.compareAndSet(false, true)) return
+        alertScope.launch {
+            try {
+                if (!force) delay(400L)
+                val file = cacheFile() ?: return@launch
+                val root = JSONObject()
+                root.put("selected_interval", lastSelectedInterval)
+                val byTf = JSONObject()
+                for ((tf, doc) in marketCache.entries) {
+                    byTf.put(tf, doc)
+                }
+                root.put("markets_by_tf", byTf)
+                val vals = JSONObject()
+                for (k in listOf("markets", "strategies", "live/status", "live/risk", "live/positions", "live/orders", "binance/account", "shadow/status", "shadow/orders", "trading/config", "system/overview")) {
+                    snapshotCache[k]?.let { vals.put(k, it) }
+                }
+                root.put("values", vals)
+                val tmp = File(file.parentFile, "${file.name}.tmp")
+                tmp.writeText(root.toString(), Charsets.UTF_8)
+                tmp.renameTo(file)
+                lastPersistAt.set(System.currentTimeMillis())
+            } catch (_: Exception) {
+            } finally {
+                persistDirty.set(false)
+            }
+        }
+    }
+
     suspend fun configured()=settings.get("base").isNotEmpty()
     suspend fun configure(base: String) {
         val url=base.toHttpUrl();require(url.isHttps && url.username.isEmpty() && url.password.isEmpty() && url.encodedPath=="/") { "需要可信 HTTPS 根地址" }
-        val old=settings.get("base"); if(old.isNotEmpty() && old!=url.toString()) { settings.put("device",""); session="";expiresAt=0 }
+        val old=settings.get("base"); if(old.isNotEmpty() && old!=url.toString()) { settings.put("device",""); session="";expiresAt=0;alertCursor=0 }
         settings.put("base",url.toString())
     }
     private suspend fun api(): AppApi {
@@ -73,6 +197,19 @@ interface AppApi {
         return Retrofit.Builder().baseUrl(base).client(http).build().create(AppApi::class.java)
     }
     private suspend fun request(path: String,body: JSONObject?=null,pairing: Boolean=false,noSession: Boolean=false): JSONObject = withContext(Dispatchers.IO) {
+        try {
+            executeSignedRequest(path, body, pairing, noSession)
+        } catch (error: IllegalStateException) {
+            val msg = error.message.orEmpty()
+            if (!pairing && !noSession && (msg == "SESSION_EXPIRED_OR_REVOKED" || msg == "UNAUTHENTICATED" || msg == "HTTP 401")) {
+                if (ensureSession(forceReconnect = true)) {
+                    return@withContext executeSignedRequest(path, body, pairing, noSession)
+                }
+            }
+            throw error
+        }
+    }
+    private suspend fun executeSignedRequest(path: String,body: JSONObject?=null,pairing: Boolean=false,noSession: Boolean=false): JSONObject {
         val bytes=body?.toString()?.toByteArray(Charsets.UTF_8) ?: byteArrayOf();val method=if(body==null) "GET" else "POST"
         val time=System.currentTimeMillis().toString();val nonce=UUID.randomUUID().toString();val requestId=UUID.randomUUID().toString()
         val device=if(pairing) "pairing" else settings.get("device")
@@ -88,7 +225,7 @@ interface AppApi {
             val detail=error.response()?.errorBody()?.string()?.let { runCatching { JSONObject(it).optString("error") }.getOrNull() }.orEmpty()
             throw IllegalStateException(if(detail.isNotEmpty()) detail else "HTTP ${error.code()}")
         }
-        response.use { JSONObject(it.string()) }
+        return response.use { JSONObject(it.string()) }
     }
     suspend fun pair(code: String) {
         val result=request("/api/v1/app/devices/pair",JSONObject().put("device_passphrase",code).put("public_key_pem",identity.publicPem()).put("device_name",android.os.Build.MODEL.take(80)),pairing=true)
@@ -99,11 +236,13 @@ interface AppApi {
         settings.put("session",session);settings.put("session_expires",expiresAt.toString())
     }
     suspend fun bound()=settings.get("device").isNotEmpty()
-    suspend fun ensureSession(): Boolean {
-        if(!bound()) return false
+    suspend fun ensureSession(forceReconnect: Boolean = false): Boolean = sessionMutex.withLock {
+        if(!bound()) return@withLock false
         if(settings.get("base").isEmpty()) configure("https://43.163.192.120/")
         if(session.isEmpty()) { session=settings.get("session");expiresAt=settings.get("session_expires").toLongOrNull() ?: 0L }
-        return try { reconnect();true } catch (_: Exception) { session.isNotEmpty() && (expiresAt==0L || System.currentTimeMillis()<expiresAt) }
+        val valid = session.isNotEmpty() && (expiresAt==0L || System.currentTimeMillis()<expiresAt)
+        if (valid && !forceReconnect) return@withLock true
+        return@withLock try { reconnect();true } catch (_: Exception) { valid }
     }
     suspend fun reconnect() {
         val device=settings.get("device");require(device.isNotEmpty())
@@ -122,7 +261,7 @@ interface AppApi {
             catch (_: java.io.IOException) { throw IllegalStateException("连接中断，请再拉一次刷新") }
         }
     }
-    suspend fun revokeSelf() { post("devices/revoke",JSONObject().put("device_id",settings.get("device")));session="";expiresAt=0;settings.put("device","");settings.put("session","");settings.put("session_expires","") }
+    suspend fun revokeSelf() { post("devices/revoke",JSONObject().put("device_id",settings.get("device")));session="";expiresAt=0;alertCursor=0;settings.put("device","");settings.put("session","");settings.put("session_expires","") }
     suspend fun registerToken(token: String) {
         if (token.isBlank()) return
         settings.put("pending_fcm_token", token)
@@ -159,6 +298,7 @@ interface AppApi {
                 runCatching {
                     val frame = JSONObject(text)
                     lastFrameAt.set(System.currentTimeMillis())
+                    frame.optJSONObject("markets")?.let { updateCachedMarketsFromSummary(it) }
                     frames.tryEmit(frame)
                     frame.optJSONObject("alerts")?.let { alertsObj ->
                         val items = alertsObj.optJSONArray("items")
@@ -168,15 +308,24 @@ interface AppApi {
                     }
                 }
             }
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null); if (!closed.isCompleted) closed.complete(Unit) }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (!closed.isCompleted) closed.complete(Unit) }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (code == 1008) session = ""
+                webSocket.close(code, null)
+                if (!closed.isCompleted) closed.complete(Unit)
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (response?.code in listOf(401, 403)) session = ""
+                if (!closed.isCompleted) closed.complete(Unit)
+            }
         })
     }
     suspend fun syncAlerts() {
-        val value = get("alerts?limit=100")
+        val value = get("alerts?after=$alertCursor&limit=100")
         ingestAlerts(value)
     }
     suspend fun ingestAlerts(value: JSONObject) = alertMutex.withLock {
+        val next = value.optInt("next_cursor", 0)
+        if (next > alertCursor) alertCursor = next
         val items = value.optJSONArray("items") ?: return@withLock
         if (items.length() == 0) return@withLock
         val now = System.currentTimeMillis()

@@ -895,17 +895,29 @@ class OpsBackend:
         raise ValueError("unsupported ops action")
 
     def _compute_shadow_reset_capital(self) -> tuple[Decimal, Decimal]:
+        candidates: list[Path] = []
         cfg_path = self.shadow_paths.get("trading_config")
+        if cfg_path:
+            candidates.append(Path(cfg_path))
+        env_cfg = os.environ.get("SOLBOT_TRADING_CONFIG_PATH", "").strip()
+        if env_cfg:
+            candidates.append(Path(env_cfg))
+        for fallback in (
+            Path("/var/lib/sol-bot/database/trading-config.json"),
+            Path("/var/lib/sol-bot-app/trading-config.json"),
+        ):
+            candidates.append(fallback)
         max_order = Decimal("1000")
         max_slots = Decimal("2")
-        if cfg_path and cfg_path.exists():
-            try:
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                max_order = Decimal(str(cfg.get("max_order_usdt") or cfg.get("min_order_usdt") or "1000"))
-                max_slots = Decimal(str(cfg.get("max_slots") or "2"))
-            except Exception:
-                max_order = Decimal("1000")
-                max_slots = Decimal("2")
+        for cand in candidates:
+            if cand and cand.exists():
+                try:
+                    cfg = json.loads(cand.read_text(encoding="utf-8"))
+                    max_order = Decimal(str(cfg.get("max_order_usdt") or cfg.get("min_order_usdt") or "1000"))
+                    max_slots = Decimal(str(cfg.get("max_slots") or "2"))
+                    break
+                except Exception:
+                    continue
         needed = max(Decimal("2000"), (max_order * max_slots * Decimal("1.10")).quantize(Decimal("0.01")))
         topup = needed - Decimal("2000")
         return needed, topup

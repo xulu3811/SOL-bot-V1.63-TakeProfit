@@ -36,6 +36,9 @@ def load_inputs(db, now):
     if errors:
         raise ValueError(','.join(errors))
     metrics = {key: indicators.series(rows) for key, rows in frames.items()}
+    for interval_key, values in metrics.items():
+        if any(not series or series[-1] is None for series in values.values()):
+            raise ValueError(f'INDICATOR_NOT_READY:{interval_key}')
     return frames, metrics
 
 
@@ -80,9 +83,15 @@ def main():
                 ledger.apply_trading_config(shared_cfg['min_order_usdt'], shared_cfg['max_order_usdt'], shared_cfg['max_slots'])
             evidence = TrendEvidence()
             with closing(sqlite3.connect(Path(args.market_db).resolve().as_uri()+'?mode=ro', uri=True)) as db:
-                latest = db.execute("SELECT close FROM market_klines WHERE interval='1m' AND is_closed=1 AND close_time<? ORDER BY close_time DESC LIMIT 1", (now,)).fetchone()
+                db.row_factory = sqlite3.Row
+                latest = db.execute("SELECT close, close_time FROM market_klines WHERE interval='1m' AND is_closed=1 AND close_time<? ORDER BY close_time DESC LIMIT 1", (now,)).fetchone()
                 if latest:
-                    ledger.invalidate_pending(latest[0], now)
+                    ledger.invalidate_pending(latest['close'], now)
+                    if candles is None:
+                        try:
+                            candles, _ = load_inputs(db, int(latest['close_time']))
+                        except Exception:
+                            candles = None
             if candles:
                 event = candles['1m'][-1]['close_time']
                 smoothed_features = smooth_micro_features(features, flow_smoother)
@@ -130,6 +139,8 @@ def main():
                 except ShadowRejected as exc:
                     if claimed:
                         release_cross_shadow_entry_guard(args.market_db, intent['signal_id'], own_shadow_db=args.shadow_db)
+                    if exc.code in ('CROSS_SHADOW_SLOTS_FULL', 'CROSS_STRATEGY_COOLDOWN', 'CHASE_EXCEEDED', 'DENY_MAX_SLOTS') and now < int(intent.get('expires_at') or 0):
+                        continue
                     outcome = {'rejected': str(exc), 'code': exc.code}
                 store.acknowledge(intent['signal_id'], outcome)
                 outbox_changed = True

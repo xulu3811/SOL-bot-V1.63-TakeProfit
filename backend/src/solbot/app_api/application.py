@@ -30,7 +30,7 @@ def _client_ip(headers,client):
 def _alert_auth_failure(notifications,exc,source_ip):
     if notifications is None or not callable(getattr(notifications,'publish_security_alert',None)):return
     err=str(exc)
-    if err in ('ADMIN_REQUIRED','CONTROL_FORBIDDEN','NOT_AUTHORIZED','RISK_CONFIRMATION_REQUIRED'):return
+    if err in ('ADMIN_REQUIRED','CONTROL_FORBIDDEN','NOT_AUTHORIZED','RISK_CONFIRMATION_REQUIRED','SESSION_EXPIRED_OR_REVOKED'):return
     # Paired-device P-256 signature already verified before replay table conflict (e.g. proxy TCP retry):
     # keep HTTP 401 REPLAY_REJECTED strict without recording a false intrusion alert.
     if err=='REPLAY_REJECTED' and getattr(exc,'verified_device',False):return
@@ -259,7 +259,9 @@ def create_app(auth,reader,notifications,control,vault=None,ops=None):
         return base
     def present_live_orders(limit:int=50,offset:int=0):
         base=dict(reader.live_orders(limit,offset) or {})
-        try: bot_rows=account_vault().bot_orders(limit,0) or []
+        try:
+            try: bot_rows=account_vault().bot_orders(limit,0,include_custody=True) or []
+            except TypeError: bot_rows=account_vault().bot_orders(limit,0) or []
         except Exception: bot_rows=[]
         try: manual_rows=(reader.live_positions() or {}).get('manual_orders') or []
         except Exception: manual_rows=[]

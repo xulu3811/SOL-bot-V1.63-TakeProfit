@@ -73,7 +73,6 @@ def _describe_event(kind,symbol,details):
         route='live'
     elif kind=='SIMULATED_TRADE':
         body=f'{prefix} 影子沙盒模拟单已成交'
-        route='live' if strat=='R2' else 'shadow'
         route='shadow'
     elif kind=='HARD_LOCK':
         body=f'{sym} 触发 5% 日内风控硬锁，已暂停新开仓'
@@ -235,7 +234,11 @@ class NotificationStore:
         return self.publish(ident,kind,'SOLUSDT',at,{'fault_code':fault_code,'fault_unit':unit_key})
     def alerts(self,after=0,limit=50):
         if type(after)is not int or after<0 or type(limit)is not int or not 1<=limit<=500:raise ValueError('invalid pagination')
-        with self.tx() as db:rows=[dict(r) for r in db.execute('SELECT * FROM notification_events WHERE sequence>? ORDER BY sequence LIMIT ?',(after,limit))]
+        with self.tx() as db:
+            if after==0:
+                rows=[dict(r) for r in db.execute('SELECT * FROM (SELECT * FROM notification_events ORDER BY sequence DESC LIMIT ?) ORDER BY sequence',(limit,))]
+            else:
+                rows=[dict(r) for r in db.execute('SELECT * FROM notification_events WHERE sequence>? ORDER BY sequence LIMIT ?',(after,limit))]
         for r in rows:
             det=json.loads(r['details'])
             title,body,route,priority=_describe_event(r['kind'],r.get('symbol'),det)

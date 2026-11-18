@@ -9,10 +9,10 @@ StartLimitBurst=5
 Type=simple
 User=solbot
 Group=solbot
-WorkingDirectory=/opt/sol-bot/p2
+WorkingDirectory=/opt/sol-bot/p5
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=PYTHONPATH=/opt/sol-bot/p2/backend/src
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
 Environment=SOLBOT_SYMBOL=SUIUSDT
 Environment=SOLBOT_PORT=8001
 Environment=SOLBOT_DB_PATH=/var/lib/sol-bot/database/sui-market.sqlite

@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import com.lu.cryptobot.AlertRecord
 import com.lu.cryptobot.ui.components.BotFormatters
 import com.lu.cryptobot.ui.components.StatusBadge
+import com.lu.cryptobot.ui.components.optCleanString
 import com.lu.cryptobot.ui.theme.LocalBotColors
 import com.lu.cryptobot.ui.theme.tnum
 import org.json.JSONObject
@@ -327,7 +328,7 @@ fun BinanceApiSheet(
 ) {
     val bot = LocalBotColors.current
     val configured = account?.optBoolean("configured", false) ?: false
-    val fingerprint = account?.optString("key_fingerprint").orEmpty()
+    val fingerprint = account.optCleanString("key_hint").ifBlank { account.optCleanString("key_fingerprint") }
     val ordersEnabled = account?.optBoolean("orders_enabled", false) ?: false
     val spotEnabled = account?.optBoolean("spot_trading_enabled", ordersEnabled) ?: false
 
@@ -647,6 +648,25 @@ fun OrderDetailSheet(
 ) {
     val bot = LocalBotColors.current
     val apts = order.optJSONObject("apts")
+    val status = order.optCleanString("status", "—").uppercase()
+    val orderKind = order.optCleanString("order_kind", "STRATEGY")
+    val strategyId = order.optCleanString("strategy_id")
+    val isCustodyExit = orderKind == "CUSTODY_EXIT" || strategyId == "APTS托管"
+    val entryPrice = order.optCleanString("price").ifBlank { order.optCleanString("limit_price") }
+    val exitPrice = order.optCleanString("exit_price")
+    val highPrice = order.optCleanString("high_price").ifBlank { apts.optCleanString("peak_price") }
+    val stopPrice = order.optCleanString("stop_price").ifBlank { apts.optCleanString("stop_price") }
+    val execQty = order.optCleanString("executed_qty")
+    val origQty = order.optCleanString("quantity")
+    val displayQty = if ((BotFormatters.parseBigDecimal(execQty)?.toDouble() ?: 0.0) > 0.0) execQty else origQty
+    val quoteRaw = order.optCleanString("quote")
+    val realizedPnl = order.optCleanString("realized_pnl")
+    val pnlPct = order.optCleanString("pnl_pct")
+    val stage = BotFormatters.stageLabel(order.optCleanString("stage").ifBlank { apts.optCleanString("stage") })
+    val createdAt = order.optLong("created_at", 0L)
+    val filledAt = order.optLong("filled_at", 0L).takeIf { it > 0L } ?: order.optLong("time", 0L).takeIf { it > 0L } ?: createdAt
+    val closedAt = order.optLong("closed_at", 0L).takeIf { it > 0L }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -662,28 +682,66 @@ fun OrderDetailSheet(
             Text("订单与执行明细", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             HorizontalDivider(color = bot.hairline)
 
-            val rows = buildList {
-                add("交易对" to order.optString("symbol", "SOLUSDT"))
-                add("方向 / 状态" to "${order.optString("side", "—")} · ${order.optString("status", "—")}")
-                if (order.optString("strategy_id").isNotBlank()) add("触发策略" to order.optString("strategy_id"))
-                add("价格" to "$${BotFormatters.formatCryptoPrice(order.optString("price").ifBlank { order.optString("limit_price") })}")
-                add("数量" to "${BotFormatters.formatPlainAmount(order.optString("executed_qty").ifBlank { order.optString("quantity") })} SOL")
-                if (order.optString("quote").isNotBlank()) add("成交额" to "$${BotFormatters.formatNumber(order.optString("quote"), 2)}")
-                if (order.optString("fee").isNotBlank()) add("手续费" to "${BotFormatters.formatPlainAmount(order.optString("fee"), 6)} BNB")
-                if (order.optString("stop_price").isNotBlank()) add("预设止损价" to "$${BotFormatters.formatCryptoPrice(order.optString("stop_price"))}")
-                val oid = order.optString("exchange_order_id").ifBlank { order.optString("order_id") }
-                if (oid.isNotBlank()) add("订单号" to oid)
-                if (order.optString("client_order_id").isNotBlank()) add("客户端 ID" to order.optString("client_order_id"))
-                val ts = order.optLong("filled_at", 0L).takeIf { it > 0L }
-                    ?: order.optLong("time", 0L).takeIf { it > 0L }
-                    ?: order.optLong("created_at", 0L)
-                add("时间" to BotFormatters.formatEpochFull(ts))
-                if (apts != null) {
-                    add("APTS 规则" to "初始止损 -${BotFormatters.formatNumber((apts.optString("initial_stop_pct", "0.010").toDoubleOrNull()?.times(100.0))?.toString(), 1)}% · 2-tick 确认 · 未止损持续持仓")
+            val posStatus = order.optCleanString("position_status").uppercase()
+            val isClosed = status == "CLOSED" || (order.optCleanString("side", "BUY").uppercase() == "BUY" && posStatus == "CLOSED")
+            val isPendingOrUnfilled = status in setOf("EXPIRED", "NEW", "PENDING", "CANCELED", "CANCELLED")
+
+            val statusLabel = when {
+                isCustodyExit -> "APTS 人工持仓托管 · 止损/止盈卖出已成交"
+                isClosed && realizedPnl.isNotBlank() && !BotFormatters.isNegative(realizedPnl) -> "策略闭环 · 已止盈平仓"
+                isClosed && realizedPnl.isNotBlank() -> "策略闭环 · 已止损平仓"
+                isClosed -> "策略闭环 · 已平仓"
+                status == "FILLED" -> "${if (order.optCleanString("side", "BUY") == "BUY") "买入" else "卖出"} · 已成交"
+                status == "EXPIRED" -> "限价买入委托 · 超时未成交撤单"
+                status in setOf("NEW", "PENDING") -> "限价委托 · 挂单等待成交"
+                status in setOf("CANCELED", "CANCELLED") -> "限价委托 · 已撤单"
+                else -> "${order.optCleanString("side", "—")} · $status"
+            }
+
+            val rows = buildList<Pair<String, String>> {
+                add("交易对" to order.optCleanString("symbol", "SOLUSDT"))
+                add("执行状态" to statusLabel)
+                if (strategyId.isNotBlank()) add("所属策略" to (if (stage.isNotBlank() && !isCustodyExit) "$strategyId · APTS $stage" else strategyId))
+                if (isCustodyExit) {
+                    add("触发卖出价" to "$${BotFormatters.formatCryptoPrice(entryPrice)}")
+                } else {
+                    add((if (isPendingOrUnfilled) "买入委托价" else "买入建仓价") to "$${BotFormatters.formatCryptoPrice(entryPrice)}")
+                }
+                if (!isCustodyExit && exitPrice.isNotBlank()) {
+                    add("卖出平仓价" to "$${BotFormatters.formatCryptoPrice(exitPrice)}")
+                }
+                if (highPrice.isNotBlank()) {
+                    add("持仓最高价" to "$${BotFormatters.formatCryptoPrice(highPrice)}")
+                }
+                if (stopPrice.isNotBlank()) {
+                    add("APTS 止损/保护价" to "$${BotFormatters.formatCryptoPrice(stopPrice)}")
+                }
+                add((if (isPendingOrUnfilled) "委托数量" else "成交数量") to "${BotFormatters.formatPlainAmount(displayQty)} SOL")
+                if (quoteRaw.isNotBlank()) add("交易金额" to "$${BotFormatters.formatNumber(quoteRaw, 2)} USDT")
+                if (realizedPnl.isNotBlank()) {
+                    add("实现净盈亏" to "${BotFormatters.formatSignedUsdt(realizedPnl)}${if (pnlPct.isNotBlank()) " ($pnlPct)" else ""}")
+                }
+                if (order.optCleanString("fee").isNotBlank()) add("手续费" to "${BotFormatters.formatPlainAmount(order.optCleanString("fee"), 6)} BNB")
+                val oid = order.optCleanString("exchange_order_id").ifBlank { order.optCleanString("order_id") }
+                if (oid.isNotBlank()) add("币安订单号" to oid)
+                if (order.optCleanString("client_order_id").isNotBlank()) add("买单客户端 ID" to order.optCleanString("client_order_id"))
+                val exitCid = order.optCleanString("exit_client_id").ifBlank { order.optCleanString("stop_client_id") }
+                if (exitCid.isNotBlank()) add("平仓单客户端 ID" to exitCid)
+                add((if (isPendingOrUnfilled) "委托时间" else "建仓时间") to BotFormatters.formatEpochFull(filledAt))
+                if (closedAt != null && !isCustodyExit) {
+                    add("平仓时间" to BotFormatters.formatEpochFull(closedAt))
+                }
+                if (apts != null && !isCustodyExit) {
+                    add("初始止损比例" to "-${BotFormatters.formatNumber((apts.optCleanString("initial_stop_pct", "0.010").toDoubleOrNull()?.times(100.0))?.toString(), 2)}%")
                 }
             }
 
             rows.forEach { (k, v) ->
+                val vColor = if (k == "实现净盈亏") {
+                    if (BotFormatters.isNegative(realizedPnl)) bot.loss else bot.gain
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -691,7 +749,7 @@ fun OrderDetailSheet(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(k, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(v, style = MaterialTheme.typography.bodySmall.tnum(), fontWeight = FontWeight.SemiBold)
+                    Text(v, style = MaterialTheme.typography.bodySmall.tnum(), fontWeight = FontWeight.SemiBold, color = vColor)
                 }
             }
             Spacer(Modifier.height(10.dp))

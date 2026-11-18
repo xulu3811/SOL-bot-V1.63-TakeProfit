@@ -45,7 +45,7 @@ class AuthStore:
     @contextmanager
     def tx(self):
         with closing(sqlite3.connect(self.path,isolation_level=None,timeout=10)) as db:
-            db.execute('PRAGMA synchronous=FULL');db.execute('BEGIN IMMEDIATE')
+            db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA synchronous=NORMAL');db.execute('BEGIN IMMEDIATE')
             try:yield db;db.commit()
             except BaseException:db.rollback();raise
     def rate(self,subject,limit=120):

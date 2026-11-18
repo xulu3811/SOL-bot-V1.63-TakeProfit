@@ -88,6 +88,47 @@ class T2RuleTests(unittest.TestCase):
         _, reasons = assess(candles(), metrics(), "UNCERTAIN")
         self.assertEqual(reasons, [])
 
+    def test_recovery_trend_reclaim_resolves_15m_5m_boundary_deadlock(self):
+        c = {
+            "5m": [
+                {"close_time": 1_200, "open": "72.28", "high": "72.28", "low": "72.06", "close": "72.13", "quote_volume": "45000", "taker_buy_quote_volume": "16000"},
+                {"close_time": 1_500, "open": "72.14", "high": "72.31", "low": "72.06", "close": "72.21", "quote_volume": "60000", "taker_buy_quote_volume": "24000"},
+                {"close_time": 1_800, "open": "72.21", "high": "72.52", "low": "72.20", "close": "72.51", "quote_volume": "55000", "taker_buy_quote_volume": "30000"},
+            ],
+            "1h": [{"close": "72.13"}],
+            "15m": (
+                [{"low": "71.60", "close": "72.00"}] * 9
+                + [
+                    {"low": "72.22", "close": "72.36"},
+                    {"low": "72.29", "close": "72.42"},
+                    {"low": "72.06", "close": "72.13"},
+                ]
+            ),
+            "1m": [
+                {"open_time": 1_680, "close_time": 1_740, "open": "72.40", "high": "72.49", "low": "72.38", "close": "72.48"},
+                {"open_time": 1_740, "close_time": 1_800, "open": "72.48", "high": "72.52", "low": "72.45", "close": "72.51"},
+                {"open_time": 1_800, "close_time": 1_860, "open": "72.51", "high": "72.56", "low": "72.49", "close": "72.54"},
+            ],
+        }
+        m = {
+            "4h": {"ema20": [73.40], "ema50": [78.18]},
+            "1h": {"ema20": [72.05, 72.09, 72.12, 72.15]},
+            "15m": {"ema20": [72.49], "ema50": [72.29], "rvol20": [1.53], "atr14": [0.35]},
+            "5m": {
+                "ema20": [72.41],
+                "vwap20": [72.43],
+                "rsi6": [34.9, 25.4, 35.9, 60.7],
+                "rvol20": [1.71, 0.95, 1.24, 1.03],
+                "atr14": [0.18],
+            },
+        }
+        factors, reasons = assess(c, m, "UPTREND")
+        self.assertEqual(reasons, [])
+        self.assertEqual(factors["trend"], 1.0)
+        self.assertEqual(factors["momentum"], 1.0)
+        self.assertEqual(factors["participation"], 1.0)
+        self.assertEqual(factors["structure"], 1.0)
+
     def test_stop_clamps_between_0_8_and_2_percent(self):
         self.assertEqual(stop_distance("100", "99.5", "0.1"), Decimal("0.008"))
         self.assertEqual(stop_distance("100", "96", "1"), Decimal("0.01"))

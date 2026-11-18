@@ -235,6 +235,24 @@ class LiveShadowParityTests(unittest.TestCase):
         self.assertGreater(qty, Decimal("14"))
         self.assertEqual(DEFAULT_SLIPPAGE_RATE, Decimal("0.00075"))
 
+        # When custom min_order_usdt=1500 and free=1491.17 (>=90% of min_order_usdt & >=500), size cleanly to 1491.17
+        qty_buf, _ord_buf, notional_buf, err_buf = compute_live_order_size(
+            "R2",
+            "72.68",
+            "1491.17",
+            "2000",
+            "0.0091",
+            score="92",
+            min_order_usdt="1500",
+            max_order_usdt="1500",
+            is_custom_cfg=True,
+            step_size="0.001",
+            min_qty="0.001",
+        )
+        self.assertIsNone(err_buf)
+        self.assertEqual(notional_buf, Decimal("1491.17"))
+        self.assertGreater(qty_buf, Decimal("20.5"))
+
 
 class ShadowResetTests(unittest.TestCase):
     def _build_env(self, root: Path):
@@ -450,3 +468,107 @@ class ShadowResetTests(unittest.TestCase):
             self.assertTrue(r_ok.json()["ok"])
             fake_ops.reset_shadow_data.assert_called_once()
             fake_notif.reset_shadow_cursors.assert_called_once()
+
+    def test_audit_fixes_protective_sell_escalation_alerts_pagination_and_shadow_order_enrichment(self):
+        from solbot.p3_runtime import acquire_cross_shadow_entry_guard
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths = self._build_env(root)
+
+            # 1. DataReader.shadow_orders() enriches closed BUY orders with position_status='CLOSED', realized_pnl, pnl_pct
+            reader = DataReader(
+                paths={"shadow": paths["p3_read_db"], "r2_shadow": paths["r2_read_db"]},
+                clock=lambda: NOW + 1000,
+            )
+            orders = reader.shadow_orders()["items"]
+            o1 = next(item for item in orders if item["order_id"] == "o1")
+            self.assertEqual(o1["position_status"], "CLOSED")
+            self.assertEqual(o1["realized_pnl"], "42.5")
+            self.assertEqual(o1["pnl_pct"], "+3.04%")
+            self.assertEqual(o1["quote"], "1400")
+
+            # 2. DataReader._engine_view() keeps gates False when WARMUP:* or DATA_NOT_READY is present
+            warmup_view = reader._engine_view(
+                {
+                    "strategy_id": "T1",
+                    "regime": "DATA_NOT_READY",
+                    "score": 0.0,
+                    "accepted": False,
+                    "reasons": ["WARMUP:4h", "SCORE_BELOW_75"],
+                },
+                allowed=("T1", "T2", "R2"),
+                now_ms=NOW,
+            )
+            self.assertFalse(warmup_view["gates"]["regime_uptrend"])
+            self.assertFalse(warmup_view["gates"]["trend_4h_above_ema20"])
+            self.assertFalse(warmup_view["gates"]["rsi_recover_above_48"])
+            self.assertFalse(warmup_view["gates"]["rvol_ge_1_2"])
+            self.assertFalse(warmup_view["gates"]["vwap_reclaim"])
+            self.assertFalse(warmup_view["gates"]["breakout_1m"])
+
+            # 3. NotificationStore.alerts(after=0, limit=3) returns the LATEST 3 alerts in ascending sequence order
+            notif = NotificationStore(root / "notif_page.sqlite", clock=lambda: NOW)
+            for idx in range(1, 6):
+                notif.publish(f"evt-{idx}", "LIVE_ORDER", "SOLUSDT", NOW + idx * 1000, {"mode": "LIVE", "status": "NEW"})
+            latest_3 = notif.alerts(after=0, limit=3)
+            self.assertEqual([item["event_id"] for item in latest_3["items"]], ["evt-3", "evt-4", "evt-5"])
+            self.assertEqual(latest_3["next_cursor"], 5)
+
+            # 4. Stale shadow_entry_claims for EXPIRED unfilled shadow BUY orders are cleaned up automatically
+            p3_exp_db = root / "p3_exp.sqlite"
+            mkt_exp_db = root / "market_exp.sqlite"
+            mkt_exp_db.touch()
+            p3_exp = P3ShadowExecutor(p3_exp_db, rules=RULES, fee_rate="0.00075")
+            with p3_exp._transaction() as db:
+                db.execute(
+                    "INSERT INTO shadow_orders(order_id,request_key,fingerprint,account_id,symbol,strategy_id,signal_id,side,status,limit_price,quantity,notional,reserved,created_at,expires_at,candidate_json,executed_quantity) VALUES ('exp1','BUY:sig-exp-1','fp-exp','SOL-shadow','SOLUSDT','T1','sig-exp-1','BUY','EXPIRED','72.00','10','720','0',?,?,?,'0')",
+                    (NOW - 60_000, NOW - 1_000, "{}"),
+                )
+            guard_exp_db = root / "shadow-entry-guard.sqlite"
+            with closing(sqlite3.connect(guard_exp_db)) as gdb:
+                gdb.execute("DELETE FROM shadow_entry_claims")
+                gdb.execute("INSERT INTO shadow_entry_claims VALUES ('sig-exp-1','T1',?,?,'CLAIMED')", (NOW - 60_000, NOW - 60_000))
+                gdb.commit()
+            claimed_after_exp = acquire_cross_shadow_entry_guard(
+                p3_exp_db,
+                mkt_exp_db,
+                strategy_id="R2",
+                signal_id="sig-new-r2",
+                signal_time=NOW,
+                now_ms=NOW,
+                peer_shadow_db=root / "r2_exp_empty.sqlite",
+                guard_db=guard_exp_db,
+            )
+            self.assertTrue(claimed_after_exp)
+
+            # 5. P3ShadowExecutor._protection escalates unfilled protective SELL limit on gap-down
+            p3_gap = P3ShadowExecutor(root / "p3_gap.sqlite", rules=RULES, fee_rate="0.00075")
+            cand = {
+                "symbol": "SOLUSDT",
+                "strategy_id": "T1",
+                "strategy_version": "t1-v1",
+                "signal_id": "sig-gap-1",
+                "accepted": True,
+                "reasons": [],
+                "signal_time": NOW,
+                "expires_at": NOW + 60_000,
+                "entry_low": "100.00",
+                "entry_high": "100.20",
+                "stop_distance": "0.010",
+            }
+            p3_gap.submit_candidate(cand, notional="500", limit_price="100.00", now_ms=NOW)
+            f_fill = _ready_features(bid="99.88", ask="99.90", now_ms=NOW + 1000)
+            f_fill["update_id"] = 101
+            res_buy = p3_gap.process_market(f_fill, TrendEvidence(ready=True), now_ms=NOW + 1000)
+            self.assertEqual(len(res_buy["fills"]), 1)
+            # Stop is ~98.99; trigger protective exit at bid=98.80 (creates PENDING protective SELL)
+            f_trig = _ready_features(bid="98.80", ask="98.82", now_ms=NOW + 2000)
+            f_trig["update_id"] = 102
+            p3_gap.process_market(f_trig, TrendEvidence(ready=True), now_ms=NOW + 2000)
+            # Market gaps down to bid=97.50 -> protective SELL limit is repriced down and fills!
+            f_gap1 = _ready_features(bid="97.50", ask="97.52", now_ms=NOW + 7500)
+            f_gap1["update_id"] = 103
+            res_gap = p3_gap.process_market(f_gap1, TrendEvidence(ready=True), now_ms=NOW + 7500)
+            self.assertEqual(len(res_gap["fills"]), 1)
+            self.assertEqual(res_gap["fills"][0]["side"], "SELL")

@@ -5,9 +5,9 @@ After=network-online.target
 Type=simple
 User=solbot
 Group=solbot
-WorkingDirectory=/opt/sol-bot/p3
+WorkingDirectory=/opt/sol-bot/p5
 ExecStart=/opt/sol-bot/venv/bin/python -m solbot.market.depth_collector --symbol SUIUSDT --database /var/lib/sol-bot/database/sui-micro.sqlite --status-path /var/lib/sol-bot/sui-micro-status.json
-Environment=PYTHONPATH=/opt/sol-bot/p3/backend/src
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure

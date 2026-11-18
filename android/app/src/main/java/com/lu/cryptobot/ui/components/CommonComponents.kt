@@ -222,7 +222,7 @@ fun TopStatusBar(
     val bot = LocalBotColors.current
     val (badgeLabel, badgeBg, badgeFg, dotColor) = when (liveState) {
         "LIVE_ON" -> Quad("实盘 ON", bot.gainSoft, bot.gain, bot.gain)
-        "HARD_LOCK" -> Quad("熔断 LOCK", bot.lossSoft, bot.loss, bot.loss)
+        "HARD_LOCK", "HARD_LOCKED" -> Quad("熔断 LOCK", bot.lossSoft, bot.loss, bot.loss)
         "LIVE_OFF" -> Quad("只读 OFF", MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.outline)
         else -> Quad("离线", bot.warnSoft, bot.warn, bot.warn)
     }
@@ -528,76 +528,249 @@ fun OrderListItem(
     modifier: Modifier = Modifier,
 ) {
     val bot = LocalBotColors.current
-    val side = order.optString("side", "BUY").uppercase()
+    val orderKind = order.optCleanString("order_kind", "STRATEGY")
+    val side = order.optCleanString("side", "BUY").uppercase()
     val isBuy = side == "BUY"
-    val status = order.optString("status", "UNKNOWN")
-    val strategyId = order.optString("strategy_id")
-    val price = order.optString("price").ifBlank { order.optString("limit_price") }
-    val qty = order.optString("executed_qty").ifBlank { order.optString("quantity") }
-    val ts = order.optLong("filled_at", 0L).takeIf { it > 0L }
-        ?: order.optLong("time", 0L).takeIf { it > 0L }
-        ?: order.optLong("created_at", 0L)
+    val status = order.optCleanString("status", "UNKNOWN").uppercase()
+    val strategyId = order.optCleanString("strategy_id")
+    val stage = BotFormatters.stageLabel(order.optCleanString("stage"))
+    val price = order.optCleanString("price").ifBlank { order.optCleanString("limit_price") }
+    val exitPrice = order.optCleanString("exit_price")
+    val stopPrice = order.optCleanString("stop_price")
+    val highPrice = order.optCleanString("high_price")
+    val execQty = order.optCleanString("executed_qty")
+    val origQty = order.optCleanString("quantity")
+    val hasExecQty = (BotFormatters.parseBigDecimal(execQty)?.toDouble() ?: 0.0) > 0.0
+    val displayQty = if (hasExecQty) execQty else origQty
+    val quoteRaw = order.optCleanString("quote")
+    val quoteComputed = if (quoteRaw.isNotBlank() && (BotFormatters.parseBigDecimal(quoteRaw)?.toDouble() ?: 0.0) > 0.0) {
+        quoteRaw
+    } else {
+        val pBd = BotFormatters.parseBigDecimal(price)
+        val qBd = BotFormatters.parseBigDecimal(displayQty)
+        if (pBd != null && qBd != null) pBd.multiply(qBd).toPlainString() else ""
+    }
+    val realizedPnl = order.optCleanString("realized_pnl")
+    val pnlPct = order.optCleanString("pnl_pct")
+    val createdAt = order.optLong("created_at", 0L).takeIf { it > 0L } ?: order.optLong("time", 0L)
+    val filledAt = order.optLong("filled_at", 0L).takeIf { it > 0L } ?: createdAt
+    val closedAt = order.optLong("closed_at", 0L).takeIf { it > 0L }
 
     BotSurfaceCard(
         modifier = modifier,
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         onClick = onClick,
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        if (isBotOrder) {
+            val isCustodyExit = orderKind == "CUSTODY_EXIT" || strategyId == "APTS托管"
+            val posStatus = order.optCleanString("position_status").uppercase()
+            val isClosedRoundTrip = (status == "CLOSED" || (isBuy && posStatus == "CLOSED")) && !isCustodyExit
+            val isActiveHold = isBuy && status in setOf("FILLED", "EXIT_PENDING") && posStatus != "CLOSED" && !isCustodyExit
+            val hasPnl = realizedPnl.isNotBlank()
+            val isProfit = hasPnl && !BotFormatters.isNegative(realizedPnl)
+
+            val (leftLabel, leftBg, leftFg) = when {
+                isCustodyExit -> Triple("托管卖出", bot.infoSoft, bot.info)
+                !isBuy && status == "FILLED" -> Triple("保护卖出", bot.lossSoft, bot.loss)
+                !isBuy -> Triple("卖出委托", bot.lossSoft, bot.loss)
+                isClosedRoundTrip && hasPnl && isProfit -> Triple("止盈平仓", bot.gainSoft, bot.gain)
+                isClosedRoundTrip && hasPnl && !isProfit -> Triple("止损平仓", bot.lossSoft, bot.loss)
+                isClosedRoundTrip -> Triple("已平仓", bot.infoSoft, bot.info)
+                isActiveHold -> Triple("买入持仓", bot.gainSoft, bot.gain)
+                status in setOf("NEW", "PENDING") -> Triple("买入挂单", bot.infoSoft, bot.info)
+                else -> Triple("买入委托", MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
             Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f),
             ) {
-                StatusBadge(
-                    text = if (isBuy) "买入" else "卖出",
-                    containerColor = if (isBuy) bot.gainSoft else bot.lossSoft,
-                    contentColor = if (isBuy) bot.gain else bot.loss,
-                )
-                Column {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    StatusBadge(
+                        text = leftLabel,
+                        containerColor = leftBg,
+                        contentColor = leftFg,
+                    )
+                    Text(
+                        text = order.optCleanString("symbol", "SOLUSDT"),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    if (strategyId.isNotBlank()) {
+                        StatusBadge(
+                            text = strategyId,
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    if ((isClosedRoundTrip || isActiveHold) && stage.isNotBlank()) {
+                        val (stBg, stFg) = when (stage) {
+                            "S2" -> bot.gainSoft to bot.gain
+                            "S1" -> bot.infoSoft to bot.info
+                            else -> MaterialTheme.colorScheme.surfaceContainerHigh to MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        StatusBadge(text = stage, containerColor = stBg, contentColor = stFg)
+                    }
+                }
+
+                when {
+                    isClosedRoundTrip && hasPnl -> {
+                        val pnlColor = if (isProfit) bot.gain else bot.loss
                         Text(
-                            text = order.optString("symbol", "SOLUSDT"),
+                            text = "${BotFormatters.formatSignedUsdt(realizedPnl)}${if (pnlPct.isNotBlank()) " ($pnlPct)" else ""}",
+                            style = MaterialTheme.typography.titleSmall.tnum(),
+                            fontWeight = FontWeight.Bold,
+                            color = pnlColor,
+                        )
+                    }
+                    isCustodyExit -> {
+                        StatusBadge(
+                            text = "已触发平仓",
+                            containerColor = bot.gainSoft,
+                            contentColor = bot.gain,
+                        )
+                    }
+                    else -> {
+                        val (stText, stBg, stFg) = when {
+                            isClosedRoundTrip -> Triple("已平仓", bot.infoSoft, bot.info)
+                            status == "FILLED" -> Triple("已成交", bot.gainSoft, bot.gain)
+                            status == "EXIT_PENDING" -> Triple("平仓中", bot.warnSoft, bot.warn)
+                            status in setOf("NEW", "PENDING") -> Triple("挂单中", bot.infoSoft, bot.info)
+                            status == "PARTIALLY_FILLED" -> Triple("部分成交", bot.warnSoft, bot.warn)
+                            status == "EXPIRED" -> Triple("超时未成交", MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant)
+                            status in setOf("CANCELED", "CANCELLED") -> Triple("已撤单", MaterialTheme.colorScheme.surfaceContainerHigh, MaterialTheme.colorScheme.onSurfaceVariant)
+                            status == "CLOSED" -> Triple("已平仓", bot.infoSoft, bot.info)
+                            else -> Triple(status, bot.warnSoft, bot.warn)
+                        }
+                        StatusBadge(text = stText, containerColor = stBg, contentColor = stFg)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            val mainLine = when {
+                isCustodyExit -> {
+                    val amt = if (quoteComputed.isNotBlank()) " ($${BotFormatters.formatNumber(quoteComputed, 2)})" else ""
+                    "触发卖价 $${BotFormatters.formatCryptoPrice(price)} · 数量 ${BotFormatters.formatPlainAmount(displayQty)} SOL$amt"
+                }
+                !isBuy -> {
+                    val amt = if (quoteComputed.isNotBlank()) " ($${BotFormatters.formatNumber(quoteComputed, 2)})" else ""
+                    "卖出 $${BotFormatters.formatCryptoPrice(price)} · 数量 ${BotFormatters.formatPlainAmount(displayQty)} SOL$amt"
+                }
+                isClosedRoundTrip && exitPrice.isNotBlank() -> {
+                    "买入 $${BotFormatters.formatCryptoPrice(price)} → 卖出 $${BotFormatters.formatCryptoPrice(exitPrice)} · ${BotFormatters.formatPlainAmount(displayQty)} SOL"
+                }
+                status in setOf("EXPIRED", "CANCELED", "CANCELLED", "NEW", "PENDING") -> {
+                    val amt = if (quoteComputed.isNotBlank()) " ($${BotFormatters.formatNumber(quoteComputed, 2)})" else ""
+                    "委托价 $${BotFormatters.formatCryptoPrice(price)} · 委托量 ${BotFormatters.formatPlainAmount(displayQty)} SOL$amt"
+                }
+                else -> {
+                    val amt = if (quoteComputed.isNotBlank()) " ($${BotFormatters.formatNumber(quoteComputed, 2)})" else ""
+                    "买入 $${BotFormatters.formatCryptoPrice(price)} · 数量 ${BotFormatters.formatPlainAmount(displayQty)} SOL$amt"
+                }
+            }
+            Text(
+                text = mainLine,
+                style = MaterialTheme.typography.bodySmall.tnum(),
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+
+            Spacer(Modifier.height(3.dp))
+
+            val subLine = when {
+                isCustodyExit -> {
+                    val oid = order.optCleanString("order_id")
+                    buildString {
+                        append("成交 ${BotFormatters.formatEpoch(filledAt)}")
+                        if (oid.isNotBlank()) append(" · 币安单号 #$oid")
+                    }
+                }
+                isClosedRoundTrip -> {
+                    buildString {
+                        if (quoteComputed.isNotBlank()) append("金额 $${BotFormatters.formatNumber(quoteComputed, 2)} · ")
+                        append("建仓 ${BotFormatters.formatEpoch(filledAt)}")
+                        if (closedAt != null) append(" → 平仓 ${BotFormatters.formatEpoch(closedAt)}")
+                        else if (highPrice.isNotBlank()) append(" · 峰值 $${BotFormatters.formatCryptoPrice(highPrice)}")
+                    }
+                }
+                isActiveHold -> {
+                    buildString {
+                        if (stopPrice.isNotBlank()) append("APTS 止损 $${BotFormatters.formatCryptoPrice(stopPrice)} · ")
+                        append("建仓 ${BotFormatters.formatEpoch(filledAt)}")
+                    }
+                }
+                status in setOf("NEW", "PENDING") -> {
+                    "委托时间 ${BotFormatters.formatEpoch(createdAt)} · 等待盘口撮合成交"
+                }
+                else -> {
+                    "委托时间 ${BotFormatters.formatEpoch(createdAt)} · 超出价格保护带未成交自动释放"
+                }
+            }
+            Text(
+                text = subLine,
+                style = MaterialTheme.typography.labelSmall.tnum(),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        } else {
+            val ts = filledAt.takeIf { it > 0L } ?: createdAt
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    StatusBadge(
+                        text = if (isBuy) "买入" else "卖出",
+                        containerColor = if (isBuy) bot.gainSoft else bot.lossSoft,
+                        contentColor = if (isBuy) bot.gain else bot.loss,
+                    )
+                    Column {
+                        Text(
+                            text = order.optCleanString("symbol", "SOLUSDT"),
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                         )
-                        if (isBotOrder && strategyId.isNotBlank()) {
-                            StatusBadge(
-                                text = strategyId,
-                                containerColor = bot.infoSoft,
-                                contentColor = bot.info,
-                            )
-                        }
+                        val amt = if (quoteComputed.isNotBlank()) " ($${BotFormatters.formatNumber(quoteComputed, 2)})" else ""
+                        Text(
+                            text = "价格 $${BotFormatters.formatCryptoPrice(price)} · 数量 ${BotFormatters.formatPlainAmount(displayQty)} SOL$amt",
+                            style = MaterialTheme.typography.bodySmall.tnum(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    val (stText, stBg, stFg) = when (status) {
+                        "FILLED" -> Triple("已成交", bot.gainSoft, bot.gain)
+                        "NEW" -> Triple("挂单中", bot.infoSoft, bot.info)
+                        "PARTIALLY_FILLED" -> Triple("部分成交", bot.warnSoft, bot.warn)
+                        "CANCELED", "CANCELLED", "EXPIRED", "REJECTED" -> Triple("已撤单", bot.lossSoft, bot.loss)
+                        else -> Triple(status, bot.warnSoft, bot.warn)
+                    }
+                    StatusBadge(text = stText, containerColor = stBg, contentColor = stFg)
+                    Spacer(Modifier.height(3.dp))
                     Text(
-                        text = "价格 $${BotFormatters.formatCryptoPrice(price)} · 数量 ${BotFormatters.formatPlainAmount(qty)} SOL",
-                        style = MaterialTheme.typography.bodySmall.tnum(),
+                        text = BotFormatters.formatEpoch(ts),
+                        style = MaterialTheme.typography.labelSmall.tnum(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
                     )
                 }
-            }
-            Column(horizontalAlignment = Alignment.End) {
-                val (stBg, stFg) = when (status) {
-                    "FILLED" -> bot.gainSoft to bot.gain
-                    "CANCELED", "CANCELLED", "EXPIRED", "REJECTED" -> bot.lossSoft to bot.loss
-                    else -> bot.warnSoft to bot.warn
-                }
-                StatusBadge(text = status, containerColor = stBg, contentColor = stFg)
-                Spacer(Modifier.height(3.dp))
-                Text(
-                    text = BotFormatters.formatEpoch(ts),
-                    style = MaterialTheme.typography.labelSmall.tnum(),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
     }

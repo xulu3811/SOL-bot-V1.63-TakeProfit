@@ -5,8 +5,8 @@ After=local-fs.target
 Type=simple
 User=solbot
 Group=solbot
-WorkingDirectory=/opt/sol-bot/p4
-Environment=PYTHONPATH=/opt/sol-bot/p4/backend/src
+WorkingDirectory=/opt/sol-bot/p5
+Environment=PYTHONPATH=/opt/sol-bot/p5/backend/src
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/sol-bot/venv/bin/python -m solbot.p4_runtime --database /var/lib/sol-bot/database/sui-guardian-p4.sqlite --status-path /var/lib/sol-bot/guardian-status.json --live-control /var/lib/sol-bot/database/sui-live-control.sqlite
 Restart=on-failure

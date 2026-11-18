@@ -251,7 +251,7 @@ class AccountVault:
         if row is None:
             return {'configured': False, 'withdrawals_enabled': False, 'orders_enabled': False, 'spot_trading_enabled': False}
         orders_enabled = bool(row.get('orders_enabled'))
-        return {'configured': True, 'key_hint': row['key_hint'], 'saved_at': row['saved_at'],
+        return {'configured': True, 'key_hint': row['key_hint'], 'key_fingerprint': row['key_hint'], 'saved_at': row['saved_at'],
                 'last_sync_at': row['last_sync_at'], 'last_error': row['last_error'] or None,
                 'withdrawals_enabled': False, 'orders_enabled': orders_enabled, 'spot_trading_enabled': orders_enabled}
 
@@ -348,7 +348,7 @@ class AccountVault:
                 'updated_at': row[8], 'placed_at': row[9], 'stage': apts_info['stage'],
                 'hold_note': stage[1] if stage and len(stage) > 1 else '', 'apts': apts_info}
 
-    def bot_orders(self, limit=50, offset=0):
+    def bot_orders(self, limit=50, offset=0, include_custody=False):
         if not self.db_path.exists():
             return []
         with self._db() as db:
@@ -357,10 +357,20 @@ class AccountVault:
                 "b.stop_distance,b.stop_client_id,b.filled_at,b.high_price,b.exit_client_id,b.stop_price,b.stop_updated_at,b.exit_started_at,"
                 "b.strategy_id,b.expires_at,c.stage,c.note,c.state_json,b.exit_price,b.closed_at,b.realized_pnl "
                 "FROM bot_orders b LEFT JOIN custody_apts c ON c.intent_id=('bot:' || b.signal_id) "
-                "ORDER BY COALESCE(b.filled_at,b.created_at) DESC, b.signal_id DESC LIMIT ? OFFSET ?",
+                "ORDER BY COALESCE(b.closed_at,b.filled_at,b.created_at) DESC, b.signal_id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
+            custody_rows = (
+                db.execute(
+                    "SELECT client_order_id,exchange_order_id,price,stop_price,quantity,quote,status,created_at,filled_at "
+                    "FROM custody_fills ORDER BY COALESCE(filled_at,created_at) DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                if include_custody
+                else []
+            )
         items = []
+        used_exit_cids = set()
         for r in rows:
             parsed = {}
             if r[20]:
@@ -368,28 +378,70 @@ class AccountVault:
                     parsed = json.loads(r[20])
                 except (TypeError, ValueError):
                     parsed = {}
+            if r[9]:
+                used_exit_cids.add(str(r[9]))
+            if r[12]:
+                used_exit_cids.add(str(r[12]))
             entry_ms = int(parsed.get('entry_time_ms') or r[10] or r[7] or 0)
+            raw_stage = r[18] or parsed.get('stage') or 'S0'
+            if raw_stage in ('S0', 'S0_INITIAL_PROTECTION') and r[21] and r[3]:
+                try:
+                    ep_dec = Decimal(str(r[3]))
+                    xp_dec = Decimal(str(r[21]))
+                    hp_dec = Decimal(str(r[11] or r[21]))
+                    if ep_dec > 0 and xp_dec > ep_dec:
+                        gain_pct = (hp_dec - ep_dec) / ep_dec
+                        raw_stage = 'S2' if gain_pct >= Decimal('0.012') else 'S1'
+                except Exception:
+                    pass
+            stage_short = 'S1' if 'S1' in str(raw_stage) else ('S2' if 'S2' in str(raw_stage) else ('S3' if 'S3' in str(raw_stage) else 'S0'))
             apts_info = {
-                'stage': r[18] or 'S0',
+                'stage': stage_short,
                 'initial_stop_pct': str(r[8] or parsed.get('stop_distance') or '0.010'),
                 'stop_price': str(r[13] or parsed.get('stop_price') or ''),
-                'peak_price': str(r[11] or parsed.get('peak_price') or ''),
-                'reversal_hits': int(parsed.get('reversal_streak') or 0),
+                'peak_price': str(r[11] or parsed.get('high_price') or parsed.get('peak_price') or ''),
+                'reversal_hits': int(parsed.get('reversal_hits') or parsed.get('reversal_streak') or 0),
                 'max_reversal_hits': int(parsed.get('reversal_confirm_ticks') or 2),
                 'entry_time_ms': entry_ms or None,
                 'stagnation_deadline_ms': None,
             }
+            pnl_str = str(r[23] or '')
+            pnl_pct_str = ''
+            if pnl_str and r[5]:
+                try:
+                    q_dec = Decimal(str(r[5]))
+                    if q_dec > 0:
+                        pct_val = Decimal(pnl_str) / q_dec * Decimal('100')
+                        pnl_pct_str = f'{pct_val:+.2f}%'
+                except Exception:
+                    pass
             items.append({
-                'source': 'BOT', 'symbol': 'SOLUSDT', 'side': 'BUY',
-                'strategy_id': r[16] or parsed.get('strategy_id') or 'T1',
+                'source': 'BOT', 'order_kind': 'STRATEGY', 'symbol': 'SOLUSDT', 'side': 'BUY',
+                'strategy_id': r[16] or parsed.get('strategy_id') or (parsed.get('context') or {}).get('strategy_id') or 'T1',
                 'signal_id': r[0], 'order_id': r[2] or r[1], 'client_order_id': r[1],
                 'price': r[3], 'quantity': r[4], 'executed_qty': r[4] if r[6] in ('FILLED', 'EXIT_PENDING', 'CLOSED') else '0',
-                'quote': r[5], 'status': r[6], 'time': r[10] or r[7], 'created_at': r[7],
+                'quote': r[5], 'status': r[6], 'time': r[22] or r[10] or r[7], 'created_at': r[7],
                 'filled_at': r[10], 'expires_at': r[17], 'stop_distance': r[8] or '0.010', 'stop_client_id': r[9] or '',
                 'stop_price': r[13] or '', 'high_price': r[11] or '', 'exit_client_id': r[12] or '',
-                'exit_price': r[21] or '', 'closed_at': r[22], 'realized_pnl': r[23] or '',
-                'stage': apts_info['stage'], 'hold_note': r[19] or '', 'apts': apts_info,
+                'exit_price': r[21] or '', 'closed_at': r[22], 'realized_pnl': pnl_str, 'pnl_pct': pnl_pct_str,
+                'stage': stage_short, 'hold_note': r[19] or '', 'apts': apts_info,
             })
+        for cr in custody_rows:
+            cid, ex_oid, px, spx, qty, quote, st, c_at, f_at = cr
+            if str(cid) in used_exit_cids:
+                continue
+            items.append({
+                'source': 'BOT', 'order_kind': 'CUSTODY_EXIT', 'symbol': 'SOLUSDT', 'side': 'SELL',
+                'strategy_id': 'APTS托管', 'signal_id': f'custody:{cid}',
+                'order_id': ex_oid or cid, 'client_order_id': cid,
+                'price': px, 'quantity': qty, 'executed_qty': qty,
+                'quote': quote, 'status': st, 'time': f_at or c_at,
+                'created_at': c_at, 'filled_at': f_at, 'closed_at': f_at,
+                'stop_price': spx or px, 'exit_price': px, 'stage': 'APTS',
+            })
+        if include_custody and custody_rows:
+            items.sort(key=lambda x: int(x.get('time') or x.get('created_at') or 0), reverse=True)
+            items = items[:limit]
         return items
 
     @staticmethod
@@ -705,7 +757,12 @@ class AccountVault:
                     usdt_total = amount
                 elif row.get('asset') == 'SOL':
                     sol_total = amount
-            if free < min_order_usdt or price <= 0:
+            eff_min_order_usdt = (
+                min(min_order_usdt, free)
+                if (min_order_usdt > Decimal('500') and free >= Decimal('500') and free >= min_order_usdt * Decimal('0.90'))
+                else min_order_usdt
+            )
+            if free < eff_min_order_usdt or price <= 0:
                 return {'placed': False, 'reason': below_min_code, 'buy_orders': 0}
             ref_equity = max(Decimal('2000'), usdt_total + sol_total * bid_dec)
             rules = self._get_sol_rules(now)
@@ -1352,7 +1409,7 @@ class AccountVault:
             allowed = tuple(allowed_strategies)
         else:
             allowed = tuple(
-                item.strip() for item in os.environ.get('SOLBOT_LIVE_STRATEGIES', '').split(',') if item.strip()
+                item.strip().upper() for item in os.environ.get('SOLBOT_LIVE_STRATEGIES', '').split(',') if item.strip()
             ) or DEFAULT_LIVE_STRATEGIES
         mark_dec = Decimal(str(mark_price)) if mark_price is not None and Decimal(str(mark_price)) > 0 else self._current_mark_dec()
         with self._db() as db:
@@ -1372,7 +1429,7 @@ class AccountVault:
             recent_active = [
                 int(row[0] or 0)
                 for row in db.execute(
-                    "SELECT created_at,quantity,price,status FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING')"
+                    "SELECT created_at,quantity,price,status FROM bot_orders WHERE status IN ('NEW','PARTIALLY_FILLED','FILLED','EXIT_PENDING','CLOSED')"
                 )
                 if not self._is_dust_order(row[1], row[2], mark_dec, row[3])
             ]
@@ -1877,7 +1934,7 @@ class AccountVault:
         )
         state = self._load_state(intent_id)
         if state is not None and (
-            state.trigger_latched
+            (state.trigger_latched and intent_id == 'manual:SOL')
             or Decimal(str(state.entry_price)) != Decimal(str(entry))
             or (entry_time_ms and state.entry_time_ms and int(state.entry_time_ms) != int(entry_time_ms))
         ):
@@ -2050,6 +2107,8 @@ class AccountVault:
                 raise ValueError('BINANCE_REJECTED') from None
             balances.append((asset, free, locked, clock))
         manual = []
+        custody_filled = []
+        bot_Order_by_cid = {}
         active_prot = self.protection()
         active_prot_cid = str(active_prot.get('client_order_id') or '') if active_prot else ''
         for row in orders if isinstance(orders, list) else []:
@@ -2060,7 +2119,24 @@ class AccountVault:
                     db.execute('UPDATE protections SET status=?,updated_at=? WHERE intent_id=?', (new_status, clock, 'manual:SOL'))
                     db.execute('DELETE FROM custody_apts WHERE intent_id=?', ('manual:SOL',))
                 active_prot_cid = ''
-            if row.get('symbol') != 'SOLUSDT' or client_id.startswith(BOT_ORDER_PREFIXES):
+            if row.get('symbol') == 'SOLUSDT' and client_id.startswith(BOT_ORDER_PREFIXES):
+                bot_Order_by_cid[client_id] = row
+                if client_id.startswith(('cbotsl', 'cbotex')) and row.get('status') == 'FILLED':
+                    fill_px = self._fill_price(row)
+                    exec_q = str(row.get('executedQty') or row.get('origQty') or '0')
+                    quote_q = str(row.get('cummulativeQuoteQty') or '0')
+                    try:
+                        if Decimal(quote_q) <= 0 and Decimal(fill_px) > 0 and Decimal(exec_q) > 0:
+                            quote_q = format(Decimal(fill_px) * Decimal(exec_q), 'f')
+                    except Exception:
+                        pass
+                    custody_filled.append((
+                        client_id, str(row.get('orderId') or ''), fill_px,
+                        str(row.get('stopPrice') or fill_px), exec_q, quote_q,
+                        'FILLED', int(row.get('time') or clock), int(row.get('updateTime') or row.get('time') or clock)
+                    ))
+                continue
+            if row.get('symbol') != 'SOLUSDT':
                 continue
             if row.get('status') not in ('NEW', 'PARTIALLY_FILLED', 'FILLED'):
                 continue
@@ -2070,6 +2146,32 @@ class AccountVault:
         self._write_snapshot(balances, manual, clock)
         with self._db() as db:
             db.execute('UPDATE sync_state SET last_sync_at=?,last_error=?,orders_enabled=? WHERE singleton=1', (clock, '', int(bool(spot_enabled))))
+            for cf in custody_filled:
+                db.execute(
+                    'INSERT INTO custody_fills(client_order_id,exchange_order_id,price,stop_price,quantity,quote,status,created_at,filled_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(client_order_id) DO UPDATE SET '
+                    'exchange_order_id=excluded.exchange_order_id,price=excluded.price,stop_price=excluded.stop_price,'
+                    'quantity=excluded.quantity,quote=excluded.quote,status=excluded.status,filled_at=excluded.filled_at',
+                    cf,
+                )
+            if bot_Order_by_cid:
+                incomplete = db.execute(
+                    "SELECT signal_id,price,quantity,stop_client_id,exit_client_id,stop_price,stop_updated_at "
+                    "FROM bot_orders WHERE status='CLOSED' AND (exit_price IS NULL OR exit_price='')"
+                ).fetchall()
+                for sig_id, b_px, b_qty, s_cid, x_cid, s_px, s_upd in incomplete:
+                    matched = bot_Order_by_cid.get(str(x_cid or '')) or bot_Order_by_cid.get(str(s_cid or ''))
+                    if matched and matched.get('status') == 'FILLED':
+                        ex_px = self._fill_price(matched)
+                        cl_at = int(matched.get('updateTime') or matched.get('time') or s_upd or clock)
+                        try:
+                            pnl_val = format((Decimal(ex_px) - Decimal(str(b_px))) * Decimal(str(b_qty)), 'f')
+                        except Exception:
+                            pnl_val = None
+                        db.execute(
+                            'UPDATE bot_orders SET exit_price=?,closed_at=?,realized_pnl=?,exit_client_id=COALESCE(exit_client_id,?) WHERE signal_id=?',
+                            (ex_px, cl_at, pnl_val, str(matched.get('clientOrderId') or ''), sig_id),
+                        )
         return {'synced': True, 'balances': {asset: {'free': free, 'locked': locked} for asset, free, locked, _ in balances},
                 'manual_order_count': len(manual), 'orders_enabled': bool(spot_enabled), 'spot_trading_enabled': bool(spot_enabled), 'private_order_calls': 0}
 
@@ -2439,6 +2541,7 @@ class AccountVault:
         db.execute('CREATE TABLE IF NOT EXISTS user_live(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL, updated_at INTEGER NOT NULL, reason TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS trading_config(singleton INTEGER PRIMARY KEY CHECK(singleton=1), min_order_usdt TEXT NOT NULL, max_order_usdt TEXT NOT NULL, max_slots INTEGER NOT NULL, updated_at INTEGER NOT NULL)')
         db.execute("CREATE TABLE IF NOT EXISTS bot_orders(signal_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, exchange_order_id TEXT NOT NULL, price TEXT NOT NULL, quantity TEXT NOT NULL, quote TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS custody_fills(client_order_id TEXT PRIMARY KEY, exchange_order_id TEXT NOT NULL, price TEXT NOT NULL, stop_price TEXT, quantity TEXT NOT NULL, quote TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, filled_at INTEGER NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS bnb_refills(client_order_id TEXT PRIMARY KEY, exchange_order_id TEXT NOT NULL, quantity TEXT NOT NULL, price TEXT NOT NULL, quote TEXT NOT NULL, bnb_before_usdt TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL)")
         bot_columns = {row[1] for row in db.execute('PRAGMA table_info(bot_orders)')}
         for name, kind in (

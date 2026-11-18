@@ -157,7 +157,7 @@ def update_protection(state,context,bid,evidence,*,tick_size,quantity=None,nativ
         ex_s2=(stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION') and state.scheme=='APTS' and peak_gross>=S2_EXHAUSTION_TIGHTEN_TRIGGER and exhausted)
         wants_weakening_shrink=(stage in ('S2_ADAPTIVE_TRAILING','S3_TREND_EXHAUSTION') and state.scheme=='APTS' and regime=='WEAKENING')
         wants_tighten=ex_s1 or ex_s2 or wants_weakening_shrink
-        cur_bar_id=evidence.bar_time_ms if evidence.bar_time_ms>0 else (context.decision_time_ms//60_000)+1
+        cur_bar_id=evidence.bar_time_ms if evidence.bar_time_ms>0 else ((context.decision_time_ms//60_000)*60_000-1)
         exhaustion_hits=state.exhaustion_hits
         exhaustion_last_bar=state.exhaustion_last_bar_ms
         last_normal_distance=state.last_normal_distance

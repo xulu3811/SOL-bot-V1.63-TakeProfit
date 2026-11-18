@@ -315,8 +315,9 @@ class P3ShadowExecutor(ShadowExecutor):
                         stop_price=new_stop,
                         last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
                 else:
+                    new_stop = max(state.stop_price, initial_stop(position['entry_price'], self.rules.tick_size)) if changed else state.stop_price
                     state=replace(state,entry_price=D(position['entry_price']),quantity=D(position['quantity']),
-                        stop_price=max(state.stop_price,initial_stop(position['entry_price'],self.rules.tick_size)),
+                        stop_price=new_stop,
                         last_decision_time_ms=now_ms-1 if changed else state.last_decision_time_ms)
             else:
                 state=APTSState.create(context,position['entry_price'],position['quantity'],self.rules.tick_size,
@@ -354,6 +355,20 @@ class P3ShadowExecutor(ShadowExecutor):
                         (order_id,key,self._id(key),self.account_id,self.symbol,position['strategy_id'],position['signal_id'],
                          str(decision.limit_price),position['quantity'],str(decision.limit_price*D(position['quantity'])),
                          position['position_id'],now_ms,now_ms+86_400_000,json.dumps(decision.asdict(),sort_keys=True)))
+                else:
+                    cur_limit = D(pending['limit_price'])
+                    elapsed_ms = now_ms - int(pending['created_at'] or now_ms)
+                    target_limit = min(cur_limit, decision.limit_price)
+                    if elapsed_ms >= 5000:
+                        bid_floor = floor_step(D(features['bid'], positive=True) * (Decimal('1') - self.slippage_rate), self.rules.tick_size)
+                        if bid_floor > 0:
+                            target_limit = min(target_limit, bid_floor)
+                    if target_limit > 0 and target_limit < cur_limit:
+                        rem_qty = max(Decimal('0'), D(pending['quantity']) - D(pending['executed_quantity']))
+                        db.execute(
+                            'UPDATE shadow_orders SET limit_price=?,notional=? WHERE order_id=?',
+                            (str(target_limit), str(target_limit * rem_qty), pending['order_id']),
+                        )
         return outputs
 
     def _fill(self,db,order,quantity,price,now_ms,input_hash):

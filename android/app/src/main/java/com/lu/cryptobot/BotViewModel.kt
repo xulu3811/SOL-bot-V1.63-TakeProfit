@@ -2,18 +2,24 @@ package com.lu.cryptobot
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import javax.inject.Inject
+
+private val ALL_TIMEFRAMES = listOf("1m", "5m", "15m", "1h", "4h")
 
 data class ScreenState(
     val busy: Boolean = false,
     val live: String = "UNKNOWN",
     val error: String? = null,
     val values: Map<String, JSONObject> = emptyMap(),
-    val interval: String = "15m",
+    val interval: String = "5m",
     val alertsSeenAt: Long = 0L,
     val servAlertsSeenAt: Long = 0L,
     val deviceId: String = "",
@@ -129,7 +135,17 @@ internal object FrameSyncHelper {
     val repository: BotRepository,
     @param:dagger.hilt.android.qualifiers.ApplicationContext private val app: android.content.Context,
 ): ViewModel() {
-    private val mutable = MutableStateFlow(ScreenState())
+    private val initialInterval = repository.lastSelectedInterval
+    private val initialValues = repository.getInitialCachedValues(initialInterval)
+    private val mutable = MutableStateFlow(
+        ScreenState(
+            interval = initialInterval,
+            values = initialValues,
+            live = initialValues["live/status"]?.let {
+                RequestProtocol.authoritativeState(it.optString("state"), it.optBoolean("available", it.has("state")))
+            } ?: "UNKNOWN",
+        )
+    )
     val state = mutable.asStateFlow()
     val alerts = repository.database.alerts().watch()
 
@@ -142,12 +158,50 @@ internal object FrameSyncHelper {
             val ok = runCatching { repository.ensureSession() }.getOrDefault(false)
             syncSettingsSnapshot()
             if (ok) {
+                val activeInterval = mutable.value.interval
+                // 1. High-priority immediate K-line fetch so chart updates in ~100ms
+                launch { fetchMarketsFast(activeInterval) }
+                // 2. Pre-warm all other timeframes in parallel for 0ms timeframe switching
+                launch { prewarmTimeframes(exclude = activeInterval) }
+                // 3. Background service + remaining state sync
                 registerPush()
                 BotConnectionService.start(app)
-                syncAllSilently(mutable.value.interval)
+                syncAllSilently(activeInterval)
             }
             startRealtimeLoop()
         }
+    }
+
+    private suspend fun fetchMarketsFast(interval: String) {
+        try {
+            val markets = repository.get("markets?symbol=SOLUSDT&timeframe=$interval")
+            repository.putCachedMarket(interval, markets)
+            mutable.update { curr ->
+                if (curr.interval != interval) curr
+                else {
+                    val nextValues = curr.values + ("markets" to markets)
+                    repository.putCachedValues(nextValues)
+                    curr.copy(values = nextValues)
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private suspend fun prewarmTimeframes(exclude: String) = coroutineScope {
+        ALL_TIMEFRAMES.filter { it != exclude && repository.getCachedMarket(it) == null }.map { tf ->
+            async {
+                runCatching {
+                    val doc = repository.get("markets?symbol=SOLUSDT&timeframe=$tf")
+                    repository.putCachedMarket(tf, doc)
+                    mutable.update { curr ->
+                        if (curr.interval == tf) {
+                            curr.copy(values = curr.values + ("markets" to doc))
+                        } else curr
+                    }
+                }
+            }
+        }.awaitAll()
     }
 
     private fun startRealtimeLoop() {
@@ -160,38 +214,78 @@ internal object FrameSyncHelper {
                 val candlesArr = currentMarkets?.optJSONArray("candles")
                 val needsCandles = candlesArr == null || candlesArr.length() == 0 || currentMarkets.optString("timeframe") != currentInterval
                 val wsSilentMs = System.currentTimeMillis() - repository.lastFrameAt.get()
+                if (needsCandles) {
+                    fetchMarketsFast(currentInterval)
+                }
                 if (wsSilentMs > 2_800L) {
                     syncAllSilently(currentInterval)
-                } else if (needsCandles) {
-                    refreshCandles(currentInterval)
                 }
             }
         }
     }
 
-    private suspend fun syncAllSilently(interval: String = mutable.value.interval) {
-        val map = mutable.value.values.toMutableMap()
-        val currentInterval = interval
-        for (path in listOf("status", "markets?symbol=SOLUSDT&timeframe=$currentInterval", "strategies?symbol=SOLUSDT", "live/status", "live/orders", "live/positions", "live/risk", "binance/account", "trading/config", "shadow/status", "shadow/orders", "system/overview")) {
+    private suspend fun syncAllSilently(interval: String = mutable.value.interval) = coroutineScope {
+        // Fetch markets & strategies immediately in parallel first
+        val fastJobs = listOf(
+            async {
+                runCatching {
+                    val fetched = repository.get("markets?symbol=SOLUSDT&timeframe=$interval")
+                    repository.putCachedMarket(interval, fetched)
+                    mutable.update { curr ->
+                        if (curr.interval == interval) {
+                            curr.copy(values = curr.values + ("markets" to fetched))
+                        } else curr
+                    }
+                }
+            },
+            async {
+                runCatching {
+                    val fetched = repository.get("strategies?symbol=SOLUSDT")
+                    mutable.update { curr -> curr.copy(values = curr.values + ("strategies" to fetched)) }
+                }
+            },
+        )
+        fastJobs.awaitAll()
+
+        // Fetch remaining endpoints without clobbering concurrent market/timeframe updates
+        val otherPaths = listOf(
+            "status",
+            "live/status",
+            "live/orders",
+            "live/positions",
+            "live/risk",
+            "binance/account",
+            "trading/config",
+            "shadow/status",
+            "shadow/orders",
+            "system/overview",
+        )
+        val updates = mutableMapOf<String, JSONObject>()
+        for (path in otherPaths) {
             try {
                 val key = path.substringBefore('?')
-                val fetched = repository.get(path)
-                if (key == "markets" && mutable.value.interval != currentInterval) continue
-                map[key] = fetched
+                updates[key] = repository.get(path)
             } catch (_: Exception) {
             }
         }
-        val live = map["live/status"]
-        if (map.isNotEmpty()) {
-            val shown = mutable.value.error
-            val recovered = shown == "connection closed" || shown == "连接中断，请再拉一次刷新"
-            mutable.value = mutable.value.copy(
-                values = map,
-                live = if (live != null) RequestProtocol.authoritativeState(live.optString("state"), true) else mutable.value.live,
-                error = if (recovered) null else shown,
-            )
+        if (updates.isNotEmpty()) {
+            mutable.update { curr ->
+                val merged = curr.values.toMutableMap()
+                for ((k, v) in updates) {
+                    merged[k] = v
+                }
+                val live = merged["live/status"]
+                val shown = curr.error
+                val recovered = shown == "connection closed" || shown == "连接中断，请再拉一次刷新"
+                repository.putCachedValues(merged)
+                curr.copy(
+                    values = merged,
+                    live = if (live != null) RequestProtocol.authoritativeState(live.optString("state"), true) else curr.live,
+                    error = if (recovered) null else shown,
+                )
+            }
         }
-        if ("status" in map) runCatching { repository.syncAlerts() }
+        if ("status" in updates) runCatching { repository.syncAlerts() }
     }
 
     private suspend fun syncSettingsSnapshot() {
@@ -199,47 +293,72 @@ internal object FrameSyncHelper {
         val servSeen = repository.settings.get("serv_alerts_seen_ms").toLongOrNull() ?: 0L
         val dev = repository.settings.get("device")
         val base = repository.settings.get("base").ifBlank { "https://43.163.192.120/" }
-        mutable.value = mutable.value.copy(
-            alertsSeenAt = maxOf(mutable.value.alertsSeenAt, seen),
-            servAlertsSeenAt = maxOf(mutable.value.servAlertsSeenAt, servSeen),
-            deviceId = dev,
-            baseUrl = base,
-        )
+        mutable.update { curr ->
+            curr.copy(
+                alertsSeenAt = maxOf(curr.alertsSeenAt, seen),
+                servAlertsSeenAt = maxOf(curr.servAlertsSeenAt, servSeen),
+                deviceId = dev,
+                baseUrl = base,
+            )
+        }
     }
 
     private fun applyFrame(frame: JSONObject) {
-        val map = FrameSyncHelper.mergeFrame(mutable.value.values, frame)
-        val live = map["live/status"]
-        val shown = mutable.value.error
-        val recovered = shown == "connection closed" || shown == "连接中断，请再拉一次刷新"
-        mutable.value = mutable.value.copy(
-            values = map,
-            error = if (recovered) null else shown,
-            live = RequestProtocol.authoritativeState(
-                live?.optString("state"),
-                live != null && live.optBoolean("available", live.has("state")),
-            ),
-        )
+        mutable.update { curr ->
+            val seededValues = if (curr.values["markets"]?.optJSONArray("candles")?.length()?.let { it > 0 } == true &&
+                curr.values["markets"]?.optString("timeframe") == curr.interval
+            ) {
+                curr.values
+            } else {
+                val cachedTf = repository.getCachedMarket(curr.interval)
+                when {
+                    cachedTf != null -> curr.values + ("markets" to cachedTf)
+                    curr.values["markets"] == null -> curr.values + ("markets" to JSONObject().put("timeframe", curr.interval))
+                    else -> curr.values
+                }
+            }
+            val map = FrameSyncHelper.mergeFrame(seededValues, frame)
+            repository.putCachedValues(map)
+            val live = map["live/status"]
+            val shown = curr.error
+            val recovered = shown == "connection closed" || shown == "连接中断，请再拉一次刷新"
+            curr.copy(
+                values = map,
+                error = if (recovered) null else shown,
+                live = RequestProtocol.authoritativeState(
+                    live?.optString("state"),
+                    live != null && live.optBoolean("available", live.has("state")),
+                ),
+            )
+        }
     }
 
     fun refreshCandles(interval: String) {
-        mutable.value = mutable.value.copy(interval = interval)
+        repository.saveIntervalPreference(interval)
+        val cached = repository.getCachedMarket(interval)
+        mutable.update { curr ->
+            val nextValues = if (cached != null) {
+                // Preserve latest live micro/24h ticker stats when swapping cached timeframe candles
+                val currentMarket = curr.values["markets"]
+                val mergedCached = if (currentMarket != null) {
+                    val copy = JSONObject(cached.toString())
+                    for (k in listOf("micro", "change_24h", "high_24h", "low_24h", "volume_24h", "volume_24h_asset")) {
+                        if (currentMarket.has(k)) copy.put(k, currentMarket.get(k))
+                    }
+                    copy
+                } else cached
+                curr.values + ("markets" to mergedCached)
+            } else curr.values
+            curr.copy(interval = interval, values = nextValues)
+        }
         viewModelScope.launch {
-            try {
-                val markets = repository.get("markets?symbol=SOLUSDT&timeframe=$interval")
-                if (mutable.value.interval == interval) {
-                    val map = mutable.value.values.toMutableMap()
-                    map["markets"] = markets
-                    mutable.value = mutable.value.copy(values = map, interval = interval)
-                }
-            } catch (_: Exception) {
-            }
+            fetchMarketsFast(interval)
         }
     }
 
     fun markAlertsRead(latestReceivedAt: Long) {
         val next = maxOf(mutable.value.alertsSeenAt, latestReceivedAt)
-        mutable.value = mutable.value.copy(alertsSeenAt = next)
+        mutable.update { it.copy(alertsSeenAt = next) }
         viewModelScope.launch { repository.settings.put("alerts_seen_ms", next.toString()) }
     }
 
@@ -249,7 +368,7 @@ internal object FrameSyncHelper {
         } else {
             maxOf(mutable.value.servAlertsSeenAt, System.currentTimeMillis())
         }
-        mutable.value = mutable.value.copy(servAlertsSeenAt = next)
+        mutable.update { it.copy(servAlertsSeenAt = next) }
         viewModelScope.launch { repository.settings.put("serv_alerts_seen_ms", next.toString()) }
     }
 
@@ -267,20 +386,22 @@ internal object FrameSyncHelper {
     }
 
     fun refresh(interval: String = mutable.value.interval) = run {
-        mutable.value = mutable.value.copy(interval = interval)
+        repository.saveIntervalPreference(interval)
+        mutable.update { it.copy(interval = interval) }
         viewModelScope.launch {
+            fetchMarketsFast(interval)
             syncAllSilently(interval)
         }
     }
     private fun execute(block: suspend ()->Unit) { viewModelScope.launch {
-        mutable.value=mutable.value.copy(busy=true,error=null)
-        try { block() } catch (error: Exception) { mutable.value=mutable.value.copy(live="UNKNOWN",error=(error.message ?: error.javaClass.simpleName).take(180)) }
-        finally { mutable.value=mutable.value.copy(busy=false) }
+        mutable.update { it.copy(busy = true, error = null) }
+        try { block() } catch (error: Exception) { mutable.update { it.copy(live = "UNKNOWN", error = (error.message ?: error.javaClass.simpleName).take(180)) } }
+        finally { mutable.update { it.copy(busy = false) } }
     } }
     fun connect(base: String,code: String,interval: String) { execute {
         repository.configure(base); if(code.isNotBlank()) repository.pair(code) else repository.reconnect()
         syncSettingsSnapshot()
-        val value=repository.get("live/status");mutable.value=mutable.value.copy(live=RequestProtocol.authoritativeState(value.optString("state"),true),values=mutable.value.values+("live/status" to value))
+        val value=repository.get("live/status");mutable.update { it.copy(live=RequestProtocol.authoritativeState(value.optString("state"),true),values=it.values+("live/status" to value)) }
         com.google.firebase.messaging.FirebaseMessaging.getInstance().token.addOnSuccessListener { token->viewModelScope.launch { runCatching { repository.registerToken(token) } } }
         BotConnectionService.start(app)
         refresh(interval)
@@ -289,8 +410,8 @@ internal object FrameSyncHelper {
         val reply=repository.post(if(on) "live/request-enable" else "live/disable",if(on) JSONObject().put("risk_confirmed",true) else JSONObject())
         val snapshot=reply.optJSONObject("snapshot") ?: reply
         val code=if(!reply.optBoolean("accepted",false)) reply.optString("code",reply.optString("reason")) else ""
-        mutable.value=mutable.value.copy(live=RequestProtocol.authoritativeState(snapshot.optString("state"),true),error=if(code.isEmpty()) null else binanceMessage(IllegalStateException(code)))
-        val fresh=repository.get("live/status");mutable.value=mutable.value.copy(live=RequestProtocol.authoritativeState(fresh.optString("state"),true),values=mutable.value.values+("live/status" to fresh))
+        mutable.update { it.copy(live=RequestProtocol.authoritativeState(snapshot.optString("state"),true),error=if(code.isEmpty()) null else binanceMessage(IllegalStateException(code))) }
+        val fresh=repository.get("live/status");mutable.update { it.copy(live=RequestProtocol.authoritativeState(fresh.optString("state"),true),values=it.values+("live/status" to fresh)) }
     } }
     fun custody(position: JSONObject, on: Boolean) { execute { binance {
         val intent = position.optString("intent_id")
@@ -319,11 +440,11 @@ internal object FrameSyncHelper {
                 .put("max_order_usdt", maxOrderUsdt.trim().ifBlank { minOrderUsdt.trim() })
                 .put("max_slots", maxSlots)
         )
-        mutable.value = mutable.value.copy(values = mutable.value.values + ("trading/config" to reply))
+        mutable.update { it.copy(values = it.values + ("trading/config" to reply)) }
         refresh()
     } } }
     private suspend fun binance(block: suspend () -> Unit) {
-        try { block() } catch (error: Exception) { mutable.value = mutable.value.copy(error = binanceMessage(error)) }
+        try { block() } catch (error: Exception) { mutable.update { it.copy(error = binanceMessage(error)) } }
     }
     private fun binanceMessage(error: Exception) = when (error.message) {
         "WITHDRAWALS_ENABLED" -> "请先在币安关闭这个 API 的提现权限"
@@ -347,46 +468,46 @@ internal object FrameSyncHelper {
     fun refreshSystemOverview() {
         viewModelScope.launch {
             runCatching { repository.get("system/overview") }.onSuccess { doc ->
-                mutable.value = mutable.value.copy(values = mutable.value.values + ("system/overview" to doc))
+                mutable.update { it.copy(values = it.values + ("system/overview" to doc)) }
             }
         }
     }
 
     fun optimizeServerMemory() {
         viewModelScope.launch {
-            mutable.value = mutable.value.copy(opsBusy = true, opsMessage = null)
+            mutable.update { it.copy(opsBusy = true, opsMessage = null) }
             try {
                 val res = repository.post("system/optimize-memory", JSONObject())
                 val msg = res.optString("message").ifBlank {
                     if (res.optBoolean("ok", false)) "内存优化完成" else "内存优化未执行"
                 }
-                mutable.value = mutable.value.copy(opsMessage = msg)
+                mutable.update { it.copy(opsMessage = msg) }
                 refreshSystemOverview()
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(opsMessage = "内存优化失败：${(error.message ?: "网络异常").take(80)}")
+                mutable.update { it.copy(opsMessage = "内存优化失败：${(error.message ?: "网络异常").take(80)}") }
             } finally {
-                mutable.value = mutable.value.copy(opsBusy = false)
+                mutable.update { it.copy(opsBusy = false) }
             }
         }
     }
 
     fun previewCleanServerCache() {
         viewModelScope.launch {
-            mutable.value = mutable.value.copy(opsBusy = true, opsMessage = null)
+            mutable.update { it.copy(opsBusy = true, opsMessage = null) }
             try {
                 val res = repository.post("system/clean-cache", JSONObject().put("dry_run", true))
-                mutable.value = mutable.value.copy(cleanPreview = res)
+                mutable.update { it.copy(cleanPreview = res) }
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(opsMessage = "扫描缓存失败：${(error.message ?: "网络异常").take(80)}")
+                mutable.update { it.copy(opsMessage = "扫描缓存失败：${(error.message ?: "网络异常").take(80)}") }
             } finally {
-                mutable.value = mutable.value.copy(opsBusy = false)
+                mutable.update { it.copy(opsBusy = false) }
             }
         }
     }
 
     fun executeCleanServerCache() {
         viewModelScope.launch {
-            mutable.value = mutable.value.copy(opsBusy = true, cleanPreview = null, opsMessage = null)
+            mutable.update { it.copy(opsBusy = true, cleanPreview = null, opsMessage = null) }
             try {
                 val res = repository.post("system/clean-cache", JSONObject().put("dry_run", false))
                 val freedMb = res.optDouble("total_freed_mb", 0.0)
@@ -396,66 +517,72 @@ internal object FrameSyncHelper {
                 } else {
                     res.optString("message", "清理未执行")
                 }
-                mutable.value = mutable.value.copy(opsMessage = msg)
+                mutable.update { it.copy(opsMessage = msg) }
                 refreshSystemOverview()
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(opsMessage = "清理失败：${(error.message ?: "网络异常").take(80)}")
+                mutable.update { it.copy(opsMessage = "清理失败：${(error.message ?: "网络异常").take(80)}") }
             } finally {
-                mutable.value = mutable.value.copy(opsBusy = false)
+                mutable.update { it.copy(opsBusy = false) }
             }
         }
     }
 
     fun dismissCleanPreview() {
-        mutable.value = mutable.value.copy(cleanPreview = null)
+        mutable.update { it.copy(cleanPreview = null) }
     }
 
     fun clearOpsMessage() {
-        mutable.value = mutable.value.copy(opsMessage = null)
+        mutable.update { it.copy(opsMessage = null) }
     }
 
     fun resetShadowTradingData() {
         viewModelScope.launch {
-            mutable.value = mutable.value.copy(shadowResetBusy = true, shadowResetMessage = null)
+            mutable.update { it.copy(shadowResetBusy = true, shadowResetMessage = null) }
             try {
                 val res = repository.post("shadow/reset", JSONObject().put("confirm", true))
                 val updatedValues = mutable.value.values.toMutableMap()
                 runCatching { repository.get("shadow/status") }.onSuccess { updatedValues["shadow/status"] = it }
                 runCatching { repository.get("shadow/orders") }.onSuccess { updatedValues["shadow/orders"] = it }
-                mutable.value = mutable.value.copy(
-                    values = updatedValues,
-                    shadowResetMessage = res.optString("message", "Shadow 模拟盘交易数据已重置"),
-                )
+                mutable.update {
+                    it.copy(
+                        values = updatedValues,
+                        shadowResetMessage = res.optString("message", "Shadow 模拟盘交易数据已重置"),
+                    )
+                }
                 refresh()
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(
-                    shadowResetMessage = "重置失败：${(error.message ?: "网络异常").take(80)}"
-                )
+                mutable.update {
+                    it.copy(
+                        shadowResetMessage = "重置失败：${(error.message ?: "网络异常").take(80)}"
+                    )
+                }
             } finally {
-                mutable.value = mutable.value.copy(shadowResetBusy = false)
+                mutable.update { it.copy(shadowResetBusy = false) }
             }
         }
     }
 
     fun dismissShadowResetMessage() {
-        mutable.value = mutable.value.copy(shadowResetMessage = null)
+        mutable.update { it.copy(shadowResetMessage = null) }
     }
 
     fun loadSystemLogs(source: String = "auth", onlyAlerts: Boolean = false) {
         viewModelScope.launch {
-            mutable.value = mutable.value.copy(logsBusy = true)
+            mutable.update { it.copy(logsBusy = true) }
             try {
                 val res = repository.get("system/logs?source=$source&only_alerts=$onlyAlerts&limit=80")
-                mutable.value = mutable.value.copy(systemLogs = res)
+                mutable.update { it.copy(systemLogs = res) }
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(
-                    systemLogs = JSONObject()
-                        .put("ok", false)
-                        .put("source", source)
-                        .put("error", (error.message ?: "读取日志失败").take(100))
-                )
+                mutable.update {
+                    it.copy(
+                        systemLogs = JSONObject()
+                            .put("ok", false)
+                            .put("source", source)
+                            .put("error", (error.message ?: "读取日志失败").take(100))
+                    )
+                }
             } finally {
-                mutable.value = mutable.value.copy(logsBusy = false)
+                mutable.update { it.copy(logsBusy = false) }
             }
         }
     }

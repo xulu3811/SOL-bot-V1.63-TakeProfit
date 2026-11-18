@@ -81,9 +81,9 @@ class BotConnectionService : Service() {
                 }
                 tick++
                 // 1. Sync server alert stream (covers T1/T2/R2 signals, live orders, fills, stops, shadow trades)
-                runCatching { repository.syncAlerts() }
+                val alertsSynced = runCatching { repository.syncAlerts() }.isSuccess
 
-                // 2. Direct strategy decision check as secondary fast-path
+                // 2. Direct strategy decision check as secondary fallback when alert stream is unreachable
                 val value = repository.get("strategies?symbol=SOLUSDT")
                 val allowed = FrameSyncHelper.allowedLiveStrategies(value)
                 val items = value.optJSONArray("items")
@@ -94,7 +94,7 @@ class BotConnectionService : Service() {
                         val row = items.optJSONObject(i) ?: continue
                         val id = row.optLong("event_id", -1L)
                         if (id > newest) newest = id
-                        if (primed && id > cursor && row.optBoolean("accepted", false) && row.optString("strategy_id") in allowed) {
+                        if (!alertsSynced && primed && id > cursor && row.optBoolean("accepted", false) && row.optString("strategy_id") in allowed) {
                             fresh += row
                         }
                     }

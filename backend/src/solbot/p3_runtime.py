@@ -91,7 +91,7 @@ def _inspect_shadow_db_activity(db_path, now_ms):
                     if pos['opened_at']:
                         active_buy_times.append(int(pos['opened_at']))
             recent_buys = db.execute(
-                "SELECT created_at, quantity, limit_price, status FROM shadow_orders WHERE side='BUY' AND status IN ('PENDING','FILLED') ORDER BY created_at DESC LIMIT 10"
+                "SELECT signal_id, created_at, quantity, limit_price, status FROM shadow_orders WHERE side='BUY' AND status IN ('PENDING','FILLED') ORDER BY created_at DESC LIMIT 10"
             ).fetchall()
             for r in recent_buys:
                 ts = int(r['created_at'] or 0)
@@ -100,6 +100,26 @@ def _inspect_shadow_db_activity(db_path, now_ms):
             return len(slots), active_buy_times
     except Exception:
         return 0, []
+
+
+def _is_claim_expired_unfilled(claim_signal_id, *db_paths):
+    for raw_path in db_paths:
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        if not path.exists():
+            continue
+        try:
+            with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
+                row = db.execute(
+                    "SELECT status, COALESCE(executed_quantity, '0') FROM shadow_orders WHERE side='BUY' AND signal_id=? ORDER BY created_at DESC LIMIT 1",
+                    (str(claim_signal_id),),
+                ).fetchone()
+                if row and row[0] in ('EXPIRED', 'CANCELLED') and D(row[1] or '0') <= 0:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def _resolve_peer_shadow_db(own_shadow_db, market_db):
@@ -261,6 +281,9 @@ def acquire_cross_shadow_entry_guard(
                 (str(signal_id),),
             ).fetchall()
             for claim in claims:
+                if _is_claim_expired_unfilled(claim['signal_id'], own_path, peer_path):
+                    conn.execute("DELETE FROM shadow_entry_claims WHERE signal_id=?", (str(claim['signal_id']),))
+                    continue
                 c_at = int(claim['claimed_at'] or 0)
                 c_sig = int(claim['signal_time'] or 0)
                 if (c_at > 0 and 0 <= int(now_ms) - c_at < cooldown_ms) or (
@@ -599,7 +622,17 @@ def main():
                             result['order_rejected']={'code':exc.code,'message':str(exc)}
                     elif ledger and payload['accepted'] and live_deny:
                         result['order_rejected']={'code':live_deny,'message':f'blocked by live-aligned policy: {live_deny}'}
-                    audit.record(key,now,{'signal':normalized,'p2_original_payload':original,'features':features,'account':account},result)
+                    rej_code=(result.get('order_rejected') or {}).get('code')
+                    is_transient_reject=(
+                        ledger is not None
+                        and payload.get('accepted')
+                        and 'order' not in result
+                        and rej_code in ('CROSS_SHADOW_SLOTS_FULL','CROSS_STRATEGY_COOLDOWN','CHASE_EXCEEDED','DENY_MAX_SLOTS')
+                        and now<int(payload.get('expires_at') or 0)
+                    )
+                    audit_key=f"attempt:{key}:{now//60000}" if is_transient_reject else key
+                    if not audit.contains(audit_key):
+                        audit.record(audit_key,now,{'signal':normalized,'p2_original_payload':original,'features':features,'account':account},result)
             status.update(status='ready' if market_ready and features.get('ready') else 'protection_only',micro_ready=features.get('ready'),risk_policy=ledger.risk_policy if ledger else 'LIVE_DENIED')
         except Exception as exc:
             status['error']=f'{type(exc).__name__}: {exc}'[:240]

@@ -108,6 +108,12 @@ class R2Tests(unittest.TestCase):
         candles,metrics=inputs(BASE+60000,five_time=BASE,close='98')
         self.assertEqual(advance(state,candles,metrics,'DOWNTREND',BASE+60000)[0]['state'],'INVALIDATED')
 
+    def test_range_regime_accepts_standard_5m_oversold_into_watching(self):
+        candles, metrics = inputs(BASE, rsi=(24.0, 16.2))
+        state, intent = advance(None, candles, metrics, 'RANGE', BASE)
+        self.assertEqual(state['state'], 'WATCHING')
+        self.assertIsNone(intent)
+
     def test_snapshot_contains_wal_commits_and_is_standalone(self):
         with tempfile.TemporaryDirectory() as folder:
             source=Path(folder)/'source.sqlite';target=Path(folder)/'read.sqlite'

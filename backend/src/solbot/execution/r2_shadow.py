@@ -108,9 +108,10 @@ class R2ShadowExecutor(P3ShadowExecutor):
     def invalidate_pending(self, close, now):
         with self._transaction() as db:
             release = Decimal(0)
-            for row in db.execute("SELECT * FROM shadow_orders WHERE side='BUY' AND status='PENDING'").fetchall():
-                candidate = json.loads(row['candidate_json'])
-                if D(close) < D(candidate['candidate_low']):
+            for row in db.execute("SELECT * FROM shadow_orders WHERE side='BUY' AND status='PENDING' AND COALESCE(executed_quantity,'0')='0'").fetchall():
+                candidate = json.loads(row['candidate_json'] or '{}')
+                cand_low = candidate.get('candidate_low')
+                if cand_low not in (None, '') and D(close) < D(cand_low):
                     release += D(row['reserved'])
                     db.execute("UPDATE shadow_orders SET status='CANCELLED',reserved='0',close_reason='R2_LOW_BROKEN' WHERE order_id=?", (row['order_id'],))
             if release:

@@ -76,8 +76,24 @@ def advance(previous, candles, metrics, regime, now):
         cur_rvol = float(rvol_list[-1]) if rvol_list else 1.0
         rsi15_list = (metrics.get('15m') or {}).get('rsi6') or []
         mtf_entry = bool(rvol_list and cur_rsi5 <= 24.0 and cur_rvol >= 1.5 and rsi15_list and float(rsi15_list[-1]) <= 22.0)
+        m15 = metrics.get('15m') or {}
+        m1h = metrics.get('1h') or {}
+        m4h = metrics.get('4h') or {}
+        e20_15_list = m15.get('ema20') or []
+        e50_15_list = m15.get('ema50') or []
+        e20_1h_list = m1h.get('ema20') or []
+        adx_4h_list = m4h.get('adx14') or []
+        rows1h = candles.get('1h') or []
+        bull_range_ok = (
+            (not e20_15_list or not e50_15_list or float(e20_15_list[-1] or 0.0) > float(e50_15_list[-1] or 0.0))
+            and (not rows1h or not e20_1h_list or float(rows1h[-1].get('close') or 0.0) >= float(e20_1h_list[-1] or 0.0))
+            and (not adx_4h_list or adx_4h_list[-1] is None or float(adx_4h_list[-1]) >= 35.0)
+        )
         new_event = fresh_five and (cur_rsi5 <= PARAMETERS['oversold'] or mtf_entry)
-        if new_event and (regime in ('DOWNTREND', 'UNCERTAIN') or (mtf_entry and regime == 'RANGE')):
+        if new_event and (
+            regime in ('DOWNTREND', 'UNCERTAIN')
+            or (regime == 'RANGE' and (mtf_entry or bull_range_ok))
+        ):
             identity = f"{VERSION}:SOLUSDT:{bar['close_time']}"
             state.update(state='WATCHING', candidate_id=sha256(identity.encode()).hexdigest(),
                          origin_time=bar['close_time'], expires_at=bar['close_time'] + PARAMETERS['candidate_ms'],

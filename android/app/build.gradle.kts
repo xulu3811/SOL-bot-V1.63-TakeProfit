@@ -9,7 +9,7 @@ plugins {
 android {
     namespace = "com.lu.cryptobot"
     compileSdk = 36
-    defaultConfig { applicationId = "com.lu.cryptobot"; minSdk = 26; targetSdk = 36; versionCode = 157; versionName = "1.57"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    defaultConfig { applicationId = "com.lu.cryptobot"; minSdk = 26; targetSdk = 36; versionCode = 163; versionName = "1.63"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
     buildTypes {
         release {
             isMinifyEnabled = false
