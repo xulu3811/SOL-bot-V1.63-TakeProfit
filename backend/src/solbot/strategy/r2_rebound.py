@@ -10,6 +10,27 @@ PARAMETERS = {'candidate_ms': 7200000, 'recovery_ms': 1800000,
               'atr_buffer': '0.15', 'chase': '0.003', 'maximum_candidate_ms': 14400000}
 PARAMETER_HASH = sha256(json.dumps(PARAMETERS, sort_keys=True).encode()).hexdigest()
 TERMINAL = {'IDLE', 'INVALIDATED', 'EXPIRED', 'CONSUMED'}
+MAX_TRIGGER_RSI_5M = 68.0
+MAX_CLASSIC_TRIGGER_RSI_15M = 50.0
+MAX_CLASSIC_TRIGGER_RSI_1M = 82.0
+MAX_UNCERTAIN_CLASSIC_STOP_DISTANCE = Decimal('0.0085')
+
+
+def _is_overextended_bounce(metrics, climax_ready):
+    rsi5_list = (metrics.get('5m') or {}).get('rsi6') or []
+    cur_rsi5 = float(rsi5_list[-1]) if rsi5_list and rsi5_list[-1] is not None else 0.0
+    if cur_rsi5 > MAX_TRIGGER_RSI_5M:
+        return True
+    if not climax_ready:
+        rsi15_list = (metrics.get('15m') or {}).get('rsi6') or []
+        cur_rsi15 = float(rsi15_list[-1]) if rsi15_list and rsi15_list[-1] is not None else 0.0
+        if cur_rsi15 > MAX_CLASSIC_TRIGGER_RSI_15M:
+            return True
+        rsi1_list = (metrics.get('1m') or {}).get('rsi6') or []
+        cur_rsi1 = float(rsi1_list[-1]) if rsi1_list and rsi1_list[-1] is not None else 0.0
+        if cur_rsi1 > MAX_CLASSIC_TRIGGER_RSI_1M:
+            return True
+    return False
 
 
 def _climax_exhaustion(state, five, metrics):
@@ -152,6 +173,9 @@ def advance(previous, candles, metrics, regime, now):
         )
     )
     if classic_breakout or climax_breakout:
+        if _is_overextended_bounce(metrics, climax_ready):
+            state.update(state='WATCHING', reason='RSI_OVEREXTENDED')
+            return state, None
         price = Decimal(minute['close'])
         atr_buf = Decimal(PARAMETERS['atr_buffer']) * Decimal(str(metrics['5m']['atr14'][-1]))
         stop = low - atr_buf
@@ -163,12 +187,16 @@ def advance(previous, candles, metrics, regime, now):
         if stop <= 0 or stop >= price:
             state.update(state='INVALIDATED', reason='INVALID_STRUCTURE_STOP')
             return state, None
+        stop_dist = (price - stop) / price
+        if regime == 'UNCERTAIN' and not climax_ready and stop_dist > MAX_UNCERTAIN_CLASSIC_STOP_DISTANCE:
+            state.update(state='WATCHING', reason='STOP_DISTANCE_TOO_WIDE')
+            return state, None
         intent = {'symbol': 'SOLUSDT', 'strategy_id': 'R2', 'strategy_version': VERSION,
                   'parameter_hash': PARAMETER_HASH, 'candidate_id': state['candidate_id'],
                   'signal_id': state['candidate_id'], 'signal_time': now,
                   'expires_at': min(now + PARAMETERS['order_ms'], state['expires_at']),
                   'entry_low': str(price), 'entry_high': str(price * (1 + Decimal(PARAMETERS['chase']))),
-                  'stop_price': str(stop), 'stop_distance': str((price - stop) / price),
+                  'stop_price': str(stop), 'stop_distance': str(stop_dist),
                   'candidate_low': state['candidate_low'],
                   'accepted': True, 'reasons': [], 'regime': regime, 'side': 'BUY'}
         state.update(state='TRIGGERED', reason='INTENT_PENDING', trigger_time=now)

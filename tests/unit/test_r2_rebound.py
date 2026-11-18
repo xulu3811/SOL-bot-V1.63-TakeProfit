@@ -368,4 +368,66 @@ class R2Tests(unittest.TestCase):
                 r2_db, market_db, strategy_id='R2', signal_id='r2-d', signal_time=NOW, now_ms=NOW + 150, strategy_db=strat_db,
             ))
 
+    def test_overextended_bounce_rsi_and_uncertain_stop_distance_gates(self):
+        # 1. Enter WATCHING at 15:04:59 on 74.60 candidate_low
+        candles, metrics = inputs(BASE, low='74.60', rsi=(22.0, 13.2), close='74.71')
+        state, intent = advance(None, candles, metrics, 'UNCERTAIN', BASE)
+        self.assertEqual(state['state'], 'WATCHING')
+        self.assertIsNone(intent)
+
+        # 2. At +5m (15:09:59), RSI crosses 48 (45.7 -> 64.1), setting recovery_time; at +10m (15:14:59), 3rd bar closes at 75.24 above VWAP (74.98) with RSI(6)=74.1
+        state['recovery_time'] = BASE + 300_000
+        five_1514 = [
+            {'close_time': BASE, 'open': '74.68', 'high': '74.87', 'low': '74.60', 'close': '74.85'},
+            {'close_time': BASE + 300_000, 'open': '74.86', 'high': '75.07', 'low': '74.86', 'close': '75.05'},
+            {'close_time': BASE + 600_000, 'open': '75.06', 'high': '75.24', 'low': '75.04', 'close': '75.24'},
+        ]
+        one_1514 = [
+            {'close_time': BASE + 480_000, 'open': '75.10', 'high': '75.18', 'low': '75.08', 'close': '75.15'},
+            {'close_time': BASE + 540_000, 'open': '75.15', 'high': '75.20', 'low': '75.14', 'close': '75.19'},
+            {'close_time': BASE + 600_000, 'open': '75.19', 'high': '75.24', 'low': '75.18', 'close': '75.24'},
+        ]
+        m_1514 = {
+            '5m': {'rsi6': [45.7, 64.1, 74.1], 'vwap20': [74.979], 'atr14': [0.19]},
+            '15m': {'rsi6': [61.0]},
+            '1m': {'rsi6': [91.0]},
+        }
+        state, intent = advance(state, {'5m': five_1514, '1m': one_1514}, m_1514, 'UNCERTAIN', BASE + 600_000)
+        self.assertEqual(state['state'], 'ARMED')
+        self.assertIsNone(intent)
+
+        # 3. At 15:15:59 (+60s), 1m breaks out to 75.29 with 5m RSI=74.1 > 68.0 -> blocked by RSI_OVEREXTENDED
+        one_1515 = [
+            one_1514[1],
+            one_1514[2],
+            {'close_time': BASE + 660_000, 'open': '75.25', 'high': '75.32', 'low': '75.24', 'close': '75.29'},
+        ]
+        m_1515 = {
+            '5m': {'rsi6': [45.7, 64.1, 74.1], 'vwap20': [74.979], 'atr14': [0.19]},
+            '15m': {'rsi6': [61.0]},
+            '1m': {'rsi6': [94.7]},
+        }
+        state_over, intent_over = advance(state, {'5m': five_1514, '1m': one_1515}, m_1515, 'UNCERTAIN', BASE + 660_000)
+        self.assertIsNone(intent_over)
+        self.assertEqual(state_over['state'], 'WATCHING')
+        self.assertEqual(state_over['reason'], 'RSI_OVEREXTENDED')
+
+        # 4. Even if RSI is moderate (5m=59.0, 15m=45.0, 1m=75.0), classic breakout in UNCERTAIN with stop_dist=0.95% > 0.85% is blocked
+        m_wide = {
+            '5m': {'rsi6': [45.7, 59.0], 'vwap20': [74.979], 'atr14': [0.19]},
+            '15m': {'rsi6': [45.0]},
+            '1m': {'rsi6': [75.0]},
+        }
+        state_wide, intent_wide = advance(state, {'5m': five_1514, '1m': one_1515}, m_wide, 'UNCERTAIN', BASE + 660_000)
+        self.assertIsNone(intent_wide)
+        self.assertEqual(state_wide['state'], 'WATCHING')
+        self.assertEqual(state_wide['reason'], 'STOP_DISTANCE_TOO_WIDE')
+
+        # 5. Tight classic breakout in UNCERTAIN (candidate_low=74.75 -> stop_dist ~0.76% <= 0.85%) with moderate RSI triggers cleanly
+        state_tight_in = dict(state, candidate_low='74.75')
+        state_tight, intent_tight = advance(state_tight_in, {'5m': five_1514, '1m': one_1515}, m_wide, 'UNCERTAIN', BASE + 660_000)
+        self.assertIsNotNone(intent_tight)
+        self.assertEqual(state_tight['state'], 'TRIGGERED')
+
+
 

@@ -435,7 +435,13 @@ class DataReader:
                 'breakout_1m': False,
             }
             factors = self._r2_active_factors(effective_stage, regime, gates, max_rvol, accepted=False)
-            active_reasons = {'WAITING_FOR_FLOOR', 'WAITING_FOR_RECOVERY_FLOOR_VWAP', 'WAITING_FOR_BREAKOUT'}
+            active_reasons = {
+                'WAITING_FOR_FLOOR',
+                'WAITING_FOR_RECOVERY_FLOOR_VWAP',
+                'WAITING_FOR_BREAKOUT',
+                'RSI_OVEREXTENDED',
+                'STOP_DISTANCE_TOO_WIDE',
+            }
             default_reason = 'WAITING_FOR_BREAKOUT' if effective_stage == 'ARMED' else 'WAITING_FOR_RECOVERY_FLOOR_VWAP'
             reasons = [reason if reason in active_reasons else default_reason]
             stop_distance = str(st.get('stop_distance') or '0.012')
