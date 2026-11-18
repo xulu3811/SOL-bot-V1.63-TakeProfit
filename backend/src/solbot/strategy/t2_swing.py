@@ -20,7 +20,10 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     m15 = metrics.get("15m") or {}
     m1h = metrics.get("1h") or {}
 
+    one_rows = candles.get("1m") or []
     c5 = float(rows5[-1]["close"]) if rows5 else 0.0
+    c1 = float(one_rows[-1]["close"]) if one_rows and "close" in one_rows[-1] else c5
+    eff_c5 = max(c5, c1)
     c15 = float(rows15[-1]["close"]) if rows15 else c5
     c1h = float(rows1h[-1]["close"]) if rows1h else c5
     e20_15 = float((m15.get("ema20") or [0.0])[-1] or 0.0)
@@ -81,7 +84,7 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     )
     reclaimed = (
         c15 >= e20_15
-        or (recovery_trend and c5 >= e20_15 and c5 >= e20_5m and c5 >= vwap_5m)
+        or (recovery_trend and eff_c5 >= e20_15 and eff_c5 >= e20_5m and eff_c5 >= vwap_5m)
     )
     participated = (
         float(m15["rvol20"][-1]) >= 1.0

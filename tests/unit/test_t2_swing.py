@@ -64,7 +64,7 @@ class T2RuleTests(unittest.TestCase):
             "15m": [{"low": "96", "close": "98.8"}],
             "1m": [
                 {"open_time": 1_620, "close_time": 1_680, "open": "97.2", "high": "97.6", "low": "96.8", "close": "97.4"},
-                {"open_time": 1_680, "close_time": 1_740, "open": "97.4", "high": "98.0", "low": "97.1", "close": "97.9"},
+                {"open_time": 1_680, "close_time": 1_740, "open": "97.4", "high": "98.9", "low": "97.1", "close": "97.9"},
                 {"open_time": 1_740, "close_time": 1_800, "open": "97.9", "high": "99.0", "low": "97.5", "close": "98.8"},
             ],
         }
@@ -74,11 +74,11 @@ class T2RuleTests(unittest.TestCase):
             "15m": {"ema20": [100.0], "rsi6": [18.0, 21.0, 25.0], "rvol20": [1.5, 1.3, 1.1]},
             "5m": {"rsi6": [12.0, 20.0, 26.0], "rvol20": [2.0, 1.5, 1.3], "atr14": [0.5]},
         }
-        # On the 5m close bar itself, confirm_1m is still False -> must reject with ONE_MINUTE_BREAKOUT_UNCONFIRMED.
+        # When 1m close (98.8) has not yet cleared prior 1m high (98.9), confirm_1m is False -> must reject.
         factors_unconf, reasons_unconf = assess(c, m, "DOWNTREND")
         self.assertEqual(reasons_unconf, ["ONE_MINUTE_BREAKOUT_UNCONFIRMED"])
         self.assertLess(factors_unconf["structure"], 1.0)
-        # Once subsequent 1m breakout confirms past 5m close_time (1_800), extreme reversal is accepted.
+        # Once 1m breakout confirms above prior 1m highs, extreme reversal is accepted.
         c["1m"].append({"open_time": 1_800, "close_time": 1_860, "open": "98.8", "high": "99.4", "low": "98.5", "close": "99.3"})
         factors_ok, reasons_ok = assess(c, m, "DOWNTREND")
         self.assertEqual(reasons_ok, [])

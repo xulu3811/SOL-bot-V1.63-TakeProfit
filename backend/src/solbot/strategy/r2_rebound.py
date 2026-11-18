@@ -139,7 +139,7 @@ def advance(previous, candles, metrics, regime, now):
                          recovery_time=None, climax_turn_time=None, reason='NEW_LOW_WAITING_FOR_FLOOR')
             return state, intent
         rsi = metrics['5m']['rsi6']
-        if rsi[-2] <= PARAMETERS['recovery'] < rsi[-1]:
+        if rsi[-2] <= PARAMETERS['recovery'] < rsi[-1] or (state.get('recovery_time') is None and rsi[-1] > PARAMETERS['recovery']):
             state['recovery_time'] = bar['close_time']
         if _climax_exhaustion(state, five, metrics):
             state['climax_turn_time'] = bar['close_time']
@@ -147,7 +147,7 @@ def advance(previous, candles, metrics, regime, now):
     recovered = recovery is not None and 0 <= now - recovery < PARAMETERS['recovery_ms']
     floor = all(row['close_time'] > state['origin_time'] and Decimal(row['low']) > low
                 for row in five[-2:])
-    reclaim = Decimal(bar['close']) >= Decimal(str(metrics['5m']['vwap20'][-1]))
+    reclaim = max(Decimal(str(bar['close'])), Decimal(str(minute['close']))) >= Decimal(str(metrics['5m']['vwap20'][-1]))
     climax_time = state.get('climax_turn_time')
     climax_ready = (
         climax_time is not None
@@ -160,7 +160,7 @@ def advance(previous, candles, metrics, regime, now):
     state.update(state='ARMED', reason='WAITING_FOR_BREAKOUT')
     classic_breakout = (Decimal(minute['close']) > max(Decimal(row['high']) for row in one[-3:-1])
                         and Decimal(minute['close']) > Decimal(minute['open'])
-                        and minute['close_time'] > bar['close_time'])
+                        and minute['close_time'] >= bar['close_time'])
     climax_breakout = (
         climax_ready
         and Decimal(str(minute['low'])) >= low

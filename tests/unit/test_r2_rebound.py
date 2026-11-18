@@ -384,7 +384,7 @@ class R2Tests(unittest.TestCase):
         ]
         one_1514 = [
             {'close_time': BASE + 480_000, 'open': '75.10', 'high': '75.18', 'low': '75.08', 'close': '75.15'},
-            {'close_time': BASE + 540_000, 'open': '75.15', 'high': '75.20', 'low': '75.14', 'close': '75.19'},
+            {'close_time': BASE + 540_000, 'open': '75.15', 'high': '75.25', 'low': '75.14', 'close': '75.19'},
             {'close_time': BASE + 600_000, 'open': '75.19', 'high': '75.24', 'low': '75.18', 'close': '75.24'},
         ]
         m_1514 = {
@@ -428,6 +428,59 @@ class R2Tests(unittest.TestCase):
         state_tight, intent_tight = advance(state_tight_in, {'5m': five_1514, '1m': one_1515}, m_wide, 'UNCERTAIN', BASE + 660_000)
         self.assertIsNotNone(intent_tight)
         self.assertEqual(state_tight['state'], 'TRIGGERED')
+
+    def test_r2_intra_5m_vwap_reclaim_and_5m_boundary_breakout_and_v_recovery(self):
+        # 1. Enter WATCHING at BASE
+        candles, metrics = inputs(BASE, low='74.00', rsi=(22.0, 15.0), close='74.10')
+        state, intent = advance(None, candles, metrics, 'DOWNTREND', BASE)
+        self.assertEqual(state['state'], 'WATCHING')
+
+        # 2. At BASE + 600_000 (20:05), 2nd 5m bar after origin has RSI already above 48 (e.g. V-bounce 50->55),
+        #    so Improvement #3 records recovery_time even when rsi[-2] > 48; close=74.40 is still below vwap20=74.50.
+        five_2005 = [
+            {'close_time': BASE, 'open': '74.20', 'high': '74.25', 'low': '74.00', 'close': '74.10'},
+            {'close_time': BASE + 300_000, 'open': '74.10', 'high': '74.35', 'low': '74.08', 'close': '74.30'},
+            {'close_time': BASE + 600_000, 'open': '74.30', 'high': '74.45', 'low': '74.25', 'close': '74.40'},
+        ]
+        one_2005 = [
+            {'close_time': BASE + 480_000, 'open': '74.30', 'high': '74.36', 'low': '74.28', 'close': '74.34'},
+            {'close_time': BASE + 540_000, 'open': '74.34', 'high': '74.42', 'low': '74.32', 'close': '74.38'},
+            {'close_time': BASE + 600_000, 'open': '74.38', 'high': '74.45', 'low': '74.36', 'close': '74.40'},
+        ]
+        m_2005 = {'5m': {'rsi6': [50.0, 55.0], 'vwap20': [74.50], 'atr14': [0.20]}}
+        state, intent = advance(state, {'5m': five_2005, '1m': one_2005}, m_2005, 'DOWNTREND', BASE + 600_000)
+        self.assertIsNotNone(state['recovery_time'])
+        self.assertEqual(state['state'], 'WATCHING')
+        self.assertIsNone(intent)
+
+        # 3. Improvement #1: At BASE + 720_000 (20:07, intra-5m), 1m close=74.55 reclaims vwap20=74.50 AND breaks out -> triggers immediately at 20:07!
+        one_2007 = [
+            {'close_time': BASE + 600_000, 'open': '74.38', 'high': '74.45', 'low': '74.36', 'close': '74.40'},
+            {'close_time': BASE + 660_000, 'open': '74.40', 'high': '74.49', 'low': '74.39', 'close': '74.47'},
+            {'close_time': BASE + 720_000, 'open': '74.47', 'high': '74.58', 'low': '74.46', 'close': '74.55'},
+        ]
+        state_2007, intent_2007 = advance(state, {'5m': five_2005, '1m': one_2007}, m_2005, 'DOWNTREND', BASE + 720_000)
+        self.assertEqual(state_2007['state'], 'TRIGGERED')
+        self.assertIsNotNone(intent_2007)
+        self.assertEqual(intent_2007['entry_low'], '74.55')
+
+        # 4. Improvement #2: If 5m close itself (now == bar['close_time']) already reclaims vwap20 AND breaks prior two 1m highs, triggers on 5m close without +1m wait
+        one_boundary_break = [
+            {'close_time': BASE + 480_000, 'open': '74.30', 'high': '74.36', 'low': '74.28', 'close': '74.34'},
+            {'close_time': BASE + 540_000, 'open': '74.34', 'high': '74.42', 'low': '74.32', 'close': '74.38'},
+            {'close_time': BASE + 600_000, 'open': '74.38', 'high': '74.56', 'low': '74.36', 'close': '74.52'},
+        ]
+        five_boundary_break = [
+            five_2005[0],
+            five_2005[1],
+            {'close_time': BASE + 600_000, 'open': '74.30', 'high': '74.56', 'low': '74.25', 'close': '74.52'},
+        ]
+        state_init, _ = advance(None, candles, metrics, 'DOWNTREND', BASE)
+        state_b, intent_b = advance(state_init, {'5m': five_boundary_break, '1m': one_boundary_break}, m_2005, 'DOWNTREND', BASE + 600_000)
+        self.assertEqual(state_b['state'], 'TRIGGERED')
+        self.assertIsNotNone(intent_b)
+        self.assertEqual(intent_b['entry_low'], '74.52')
+
 
 
 

@@ -3,7 +3,7 @@
 
 def confirm_1m(rows: list[dict], candidate_time: int) -> bool:
     a, b, c = rows[-3:]
-    return (c["close_time"] > candidate_time
+    return (c["close_time"] >= candidate_time
             and float(b["low"]) > float(a["low"])
             and float(c["low"]) >= float(b["low"])
             and float(c["close"]) > max(float(a["high"]), float(b["high"]))
@@ -38,15 +38,16 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     )
     recovery = pullback_recovery or coil_breakout
     participation = cur_rvol5 >= 1.2 or (eff_rvol5 >= 1.2 and cur_rvol5 >= 1.0 and buy_ratio >= 0.52)
-    reclaim = (close_5m >= m["vwap20"][-1]
+    eff_close = max(close_5m, close_1m)
+    reclaim = (eff_close >= m["vwap20"][-1]
                or (float(last["low"]) >= min(float(row["low"]) for row in rows[-5:-1])
-                   and close_5m > float(previous["high"])))
+                   and eff_close > float(previous["high"])))
     one_rows = candles.get("1m") or []
     confirmed_classic = confirm_1m(one_rows, last["close_time"])
     confirmed_coil = (
         coil_breakout
         and len(one_rows) >= 2
-        and one_rows[-1]["close_time"] > last["close_time"]
+        and one_rows[-1]["close_time"] >= last["close_time"]
         and float(one_rows[-1]["low"]) >= float(last["open"])
         and close_1m >= close_5m
         and float(one_rows[-1]["close"]) > float(one_rows[-1]["open"])
