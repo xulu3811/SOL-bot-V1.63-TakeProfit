@@ -54,7 +54,6 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     )
     confirmed = confirmed_classic or confirmed_coil
     chase_1m = (close_1m - close_5m) / close_5m if close_5m > 0 else 0.0
-    no_chase_1m = -0.006 <= chase_1m <= 0.006
     h4_close = float(candles["4h"][-1]["close"])
     h4_ema20 = float(metrics["4h"]["ema20"][-1])
     h1_adx = float(metrics["1h"]["adx14"][-1])
@@ -79,6 +78,13 @@ def assess(candles: dict, metrics: dict, regime: str) -> tuple[dict, list[str]]:
     )
     h1_rising = len(e20_1h_list) >= 4 and e20_1h >= float(e20_1h_list[-4] or 0.0) * 0.9995
     h4_metrics = metrics.get("4h") or {}
+    h4_ema50_list = h4_metrics.get("ema50") or []
+    h4_ema50 = float(h4_ema50_list[-1] or 0.0) if h4_ema50_list else 0.0
+    h4_bull = h4_ema50 > 0.0 and h4_ema20 > h4_ema50
+    ext_1h = (close_1m - e20_1h) / e20_1h if e20_1h > 0.0 else 0.0
+    # V1 anti-chase guard: in non-4h-golden-cross recovery markets, block >1.9% overextension above 1h EMA20.
+    no_chase_1h = h4_bull or e20_1h <= 0.0 or ext_1h <= 0.019
+    no_chase_1m = (-0.006 <= chase_1m <= 0.006) and no_chase_1h
     adx_4h_list = h4_metrics.get("adx14") or []
     rsi_4h_list = h4_metrics.get("rsi6") or []
     vwap_1h_list = h1_metrics.get("vwap20") or []

@@ -304,6 +304,18 @@ class StrategyTests(unittest.TestCase):
         scored = score(factors)
         self.assertGreaterEqual(scored["score"], 75.0)
 
+        # V1 anti-chase guard: when 4h is not golden cross (ema20 < ema50) and 1m price is >1.9% stretched above 1h EMA20, reject
+        stretched_metrics = deepcopy(metrics)
+        stretched_metrics["1h"]["ema20"] = [70.85, 70.90, 70.95, 71.00]  # (72.54 - 71.00)/71.00 = +2.17% > 1.9%
+        _, stretched_reasons = t1_pullback.assess(candles, stretched_metrics, regime)
+        self.assertIn("ONE_MINUTE_CHASE_EXCEEDED", stretched_reasons)
+
+        # When 4h IS golden cross (ema20 > ema50), 1h extension guard does not block strong macro uptrends
+        bull4_metrics = deepcopy(stretched_metrics)
+        bull4_metrics["4h"]["ema50"] = [72.00]  # ema20=73.40 > ema50=72.00
+        _, bull4_reasons = t1_pullback.assess(candles, bull4_metrics, regime)
+        self.assertNotIn("ONE_MINUTE_CHASE_EXCEEDED", bull4_reasons)
+
 
 if __name__ == "__main__":
     unittest.main()
